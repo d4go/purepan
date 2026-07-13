@@ -1,0 +1,46 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "PurePan",
+  "version": "2.1.2",
+  "identifier": "com.d4go.PurePan",
+  "build": {
+    "beforeDevCommand": "npm --prefix frontend run dev",
+    "devUrl": "http://localhost:5173",
+    "beforeBuildCommand": "npm --prefix frontend run build",
+    "frontendDist": "../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "PurePan",
+        "visible": false,
+        "width": 400,
+        "height": 600,
+        "center": true,
+        "decorations": false,
+        "transparent": false,
+        "shadow": true,
+        "resizable": false,
+        "maximizable": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "plugins": {
+    "shell": {
+      "open": "^.*$"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/256x256.png",
+      "icons/icon.png",
+      "icons/icon.ico"
+    ]
+  }
+}

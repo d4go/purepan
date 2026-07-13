@@ -1,0 +1,38 @@
+[package]
+name = "PurePan"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.87"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-shell = "2"
+purepan-backend = { path = "../backend" }
+tokio = { version = "1", features = ["full"] }
+# IPC 代理层依赖：HTTP 代理 + WebSocket 桥接
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = { version = "0.24", features = ["connect"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+# Pin time to 0.3.44 — time 0.3.52 breaking change in Parsable::parse()
+# (added required `defaults` parameter) breaks cookie 0.18.1 (used by tauri/wry)
+time = "=0.3.44"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.build-override]
+debug = 0
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true
