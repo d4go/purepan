@@ -1,0 +1,129 @@
+[server]
+host = "127.0.0.1"
+port = 18888
+cors_origins = ["*"]
+
+[download]
+download_dir = 'D:\code\rust\BaiduNet-Rust\src-tauri\downloads'
+ask_each_time = true
+max_global_threads = 15
+chunk_size_mb = 5
+max_concurrent_tasks = 5
+max_retries = 3
+
+[download.cdn_refresh]
+enabled = true
+refresh_interval_minutes = 10
+min_refresh_interval_secs = 30
+speed_drop_threshold_percent = 50
+speed_drop_duration_secs = 10
+baseline_establish_secs = 30
+stagnation_threshold_kbps = 10
+stagnation_ratio_percent = 80
+min_threads_for_detection = 3
+startup_delay_secs = 10
+
+[upload]
+max_global_threads = 10
+chunk_size_mb = 4
+max_concurrent_tasks = 5
+max_retries = 3
+skip_hidden_files = false
+
+[transfer]
+default_behavior = "transfer_only"
+
+[filesystem]
+allowed_paths = []
+show_hidden = false
+follow_symlinks = false
+enforce_allowlist_on_followed_symlinks = false
+
+[persistence]
+wal_dir = "wal"
+db_path = "config/baidu-pcs.db"
+wal_flush_interval_ms = 200
+auto_recover_tasks = true
+wal_retention_days = 7
+history_archive_hour = 2
+history_archive_minute = 0
+history_retention_days = 30
+
+[log]
+enabled = true
+log_dir = "logs"
+retention_days = 7
+level = "info"
+max_file_size = 52428800
+
+[autobackup]
+enabled = true
+max_concurrent_scans = 2
+max_concurrent_encrypts = 2
+max_concurrent_backup_tasks = 3
+change_aggregation_window_secs = 5
+temp_dir = "config/temp"
+config_path = "config/autobackup_configs.json"
+
+[autobackup.upload_trigger]
+watch_enabled = true
+watch_debounce_ms = 3000
+watch_recursive = true
+fallback_interval_enabled = true
+fallback_interval_minutes = 30
+fallback_scheduled_enabled = true
+fallback_scheduled_hour = 2
+fallback_scheduled_minute = 0
+
+[autobackup.download_trigger]
+poll_mode = "scheduled"
+poll_interval_minutes = 60
+poll_scheduled_hour = 2
+poll_scheduled_minute = 0
+
+[web_auth]
+enabled = false
+mode = "none"
+
+[share_direct_download]
+temp_dir = "/.bpr_share_temp/"
+auto_cleanup = true
+cleanup_on_failure = true
+cleanup_orphaned_on_startup = false
+
+[network.proxy]
+proxy_type = "none"
+host = ""
+port = 0
+allow_fallback = true
+
+[scan]
+batch_size = 1000
+max_pending_tasks = 5000
+progress_interval = 500
+
+[conflict_strategy]
+default_upload_strategy = "smart_dedup"
+default_download_strategy = "overwrite"
+
+[multi_account_budget]
+download_machine_budget = "auto"
+upload_machine_budget = "auto"
+weight_normal = 1
+weight_vip = 3
+weight_svip = 5
+
+[multi_account_vip_recommended.normal]
+threads = 1
+chunk_size_mb = 4
+max_concurrent_tasks = 1
+
+[multi_account_vip_recommended.vip]
+threads = 10
+chunk_size_mb = 4
+max_concurrent_tasks = 3
+
+[multi_account_vip_recommended.svip]
+threads = 15
+chunk_size_mb = 5
+max_concurrent_tasks = 5
