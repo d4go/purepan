@@ -44,8 +44,6 @@ fn main() {
             });
 
             // 读取配置
-            let close_behavior = read_close_behavior();
-
             // 创建托盘菜单
             let show_item = MenuItemBuilder::new("显示主窗口").id("show").build(app)?;
             let quit_item = MenuItemBuilder::new("退出程序").id("quit").build(app)?;
@@ -86,18 +84,20 @@ fn main() {
                 .build(app)?;
 
             // 监听窗口关闭事件
-            if close_behavior == "minimize_to_tray" {
-                if let Some(window) = app.get_webview_window("main") {
-                    let app_handle = app.handle().clone();
-                    window.on_window_event(move |event| {
-                        if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+            if let Some(window) = app.get_webview_window("main") {
+                let app_handle = app.handle().clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        // Re-read the setting for every close request so a change
+                        // saved from Settings takes effect without an app restart.
+                        if read_close_behavior() == "minimize_to_tray" {
                             api.prevent_close();
                             if let Some(window) = app_handle.get_webview_window("main") {
                                 let _ = window.hide();
                             }
                         }
-                    });
-                }
+                    }
+                });
             }
 
             Ok(())
