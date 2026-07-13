@@ -168,7 +168,7 @@
 
       <!-- 底部 -->
       <div class="login-footer">
-        <span>v0.1.0</span>
+        <span>v0.1.2</span>
       </div>
     </div>
   </div>
