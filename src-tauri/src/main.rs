@@ -28,6 +28,11 @@ fn frontend_ready(app: tauri::AppHandle) -> Result<(), String> {
 
 fn main() {
     tauri::Builder::default()
+        // This plugin must be registered first so a repeated launch exits before
+        // any other application services or windows are initialized.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main_window(app);
+        }))
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![frontend_ready])
         .setup(|app| {
