@@ -864,7 +864,7 @@
                   <div class="about-content">
                     <div class="about-item">
                       <span class="label">项目名称:</span>
-                      <span class="value">百度网盘 Rust 客户端</span>
+                      <span class="value">PurePan</span>
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
@@ -872,17 +872,17 @@
                     </div>
                     <div class="about-item">
                       <span class="label">许可证:</span>
-                      <span class="value">MIT License</span>
+                      <span class="value">Apache 2.0</span>
                     </div>
                     <div class="about-item">
                       <span class="label">项目仓库:</span>
                       <a
                           class="value repo-link"
-                          href="https://gitee.com/daigoSun/baidunetdisk-rust"
+                          href="https://github.com/d4go/purepan"
                           target="_blank"
                           rel="noopener noreferrer"
                       >
-                        https://gitee.com/daigoSun/baidunetdisk-rust
+                        https://github.com/d4go/purepan
                       </a>
                     </div>
                   </div>

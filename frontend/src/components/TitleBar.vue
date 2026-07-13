@@ -91,13 +91,10 @@ async function handleToggleMaximize() {
 }
 
 async function handleClose() {
-  if (props.closeMinimizes) {
-    const win = await getWin()
-    if (win) await win.hide()
-  } else {
-    const win = await getWin()
-    if (win) await win.close()
-  }
+  const win = await getWin()
+  // Always emit a native close request. Tauri applies the latest saved setting
+  // and either closes the application or hides the window to the tray.
+  if (win) await win.close()
 }
 
 onMounted(async () => {
