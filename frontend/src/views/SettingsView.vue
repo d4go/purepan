@@ -868,7 +868,7 @@
                     </div>
                     <div class="about-item">
                       <span class="label">版本:</span>
-                      <span class="value">v0.1.2</span>
+                      <span class="value">v0.1.3</span>
                     </div>
                     <div class="about-item">
                       <span class="label">许可证:</span>

@@ -55,9 +55,11 @@ async function revealMainWindow(): Promise<void> {
 }
 
 async function start(): Promise<void> {
-  // 两者都在首帧后启动：业务初始化不会阻塞 Vue 的首次绘制。
-  await afterPaint()
+  // macOS 可能暂停隐藏 WebView 的 requestAnimationFrame。先等待 Vue 提交启动页，
+  // 再显示窗口并等待首帧，避免“等待绘制才显示、等待显示才绘制”的死锁。
+  await nextTick()
   await revealMainWindow()
+  await afterPaint()
 
   const [{ initializeInBackground }, application] = await Promise.all([
     import('./startup/bootstrap'),
