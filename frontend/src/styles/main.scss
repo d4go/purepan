@@ -1,0 +1,124 @@
+// 全局样式
+@use './theme.scss';
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  font-family: 'MiSans', 'HarmonyOS Sans', 'PingFang SC', -apple-system, BlinkMacSystemFont,
+    'Helvetica Neue', 'Microsoft YaHei', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  // 桌面端禁止文本选中（输入框等可交互元素除外）
+  user-select: none;
+  background: var(--app-bg);
+  color: var(--app-text-primary);
+  transition: background-color 0.2s ease, color 0.2s ease;
+}
+
+#app {
+  width: 100%;
+  height: 100%;
+}
+
+.startup-window {
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--app-surface);
+}
+
+.startup-shell {
+  width: 100%;
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 14px;
+  background:
+    radial-gradient(circle at 25% 10%, color-mix(in srgb, var(--app-accent) 16%, transparent), transparent 38%),
+    var(--app-surface);
+
+  &__icon {
+    width: 96px;
+    height: 96px;
+    display: block;
+    object-fit: contain;
+    filter: drop-shadow(0 16px 24px color-mix(in srgb, var(--app-accent) 22%, transparent));
+  }
+
+  h1 { font-size: 24px; font-weight: 650; }
+  p { color: var(--app-text-secondary); font-size: 13px; }
+
+  &__loader {
+    width: 148px;
+    height: 3px;
+    margin-top: 4px;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--app-accent) 13%, transparent);
+
+    &::after {
+      content: '';
+      display: block;
+      width: 44%;
+      height: 100%;
+      border-radius: inherit;
+      background: var(--app-accent);
+      animation: startup-loading 1.1s ease-in-out infinite;
+    }
+  }
+}
+
+@keyframes startup-loading {
+  from { transform: translateX(-110%); }
+  to { transform: translateX(340%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .startup-shell__loader::after {
+    width: 100%;
+    animation: none;
+  }
+}
+
+// 输入框、文本域等允许选中
+input,
+textarea,
+[contenteditable] {
+  user-select: text;
+}
+
+// 滚动条样式（Apple 风格 + 暗色适配）
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: var(--app-scrollbar-thumb);
+  border-radius: 4px;
+  transition: background-color 0.2s;
+
+  &:hover {
+    background-color: var(--app-scrollbar-thumb-hover);
+  }
+}
+
+::-webkit-scrollbar-track {
+  background-color: var(--app-scrollbar-track);
+}
+
+// 全局过渡曲线工具类
+.app-transition {
+  transition: all 0.2s ease;
+}

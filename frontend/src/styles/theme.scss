@@ -1,0 +1,739 @@
+// ============================================================
+// Apple-Style Theme System for BaiduNet-Rust
+// Light/Dark mode following system preference (prefers-color-scheme)
+// Element Plus deep variable overrides + custom app tokens
+// ============================================================
+
+// ---- App Semantic Tokens (Light Mode Defaults) ----
+:root {
+  // Backgrounds
+  --app-bg: #F6F8FC;
+  --app-surface: #FFFFFF;
+  --app-surface-elevated: #FFFFFF;
+  --app-surface-hover: #F5F7FB;
+  --app-surface-active: #FAFBFD;
+
+  // Text
+  --app-text-primary: #1F2937;
+  --app-text-secondary: #6B7280;
+  --app-text-tertiary: #9CA3AF;
+  --app-text-on-accent: #ffffff;
+
+  // Borders & Dividers
+  --app-border: #E8EBF2;
+  --app-border-light: #F1F3F6;
+  --app-divider: #ECEFF5;
+
+  // Accent (Blue)
+  --app-accent: #2563EB;
+  --app-accent-hover: #3B82F6;
+  --app-accent-active: #1D4ED8;
+  --app-accent-bg: #EAF2FF;
+  --app-accent-bg-hover: #DBEAFE;
+
+  // Semantic Colors
+  --app-success: #22C55E;
+  --app-success-bg: rgba(34, 197, 94, 0.1);
+  --app-warning: #F59E0B;
+  --app-warning-bg: rgba(245, 158, 11, 0.1);
+  --app-error: #EF4444;
+  --app-error-bg: rgba(239, 68, 68, 0.1);
+  --app-info: #3B82F6;
+  --app-info-bg: rgba(59, 130, 246, 0.1);
+
+  // File list specific
+  --app-file-hover: #F7FAFF;
+  --app-row-divider: #F1F3F6;
+
+  // Shadows - single card shadow per design spec
+  --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04);
+  --app-shadow-md: 0 4px 18px rgba(0, 0, 0, 0.05);
+  --app-shadow-lg: 0 4px 18px rgba(0, 0, 0, 0.05);
+  --app-shadow-card: 0 4px 18px rgba(0, 0, 0, 0.05);
+
+  // Radii
+  --app-radius-sm: 10px;
+  --app-radius-md: 12px;
+  --app-radius-lg: 16px;
+
+  // Vibrancy
+  --app-glass-bg: rgba(255, 255, 255, 0.72);
+  --app-glass-border: rgba(255, 255, 255, 0.5);
+  --app-sidebar-bg: #FFFFFF;
+
+  // Scrollbar
+  --app-scrollbar-thumb: rgba(0, 0, 0, 0.15);
+  --app-scrollbar-thumb-hover: rgba(0, 0, 0, 0.25);
+  --app-scrollbar-track: transparent;
+
+  // ---- Element Plus Variable Overrides ----
+  --el-color-primary: #2563EB;
+  --el-color-primary-light-3: #60A5FA;
+  --el-color-primary-light-5: #93C5FD;
+  --el-color-primary-light-7: #BFDBFE;
+  --el-color-primary-light-8: #DBEAFE;
+  --el-color-primary-light-9: #EFF6FF;
+  --el-color-primary-dark-2: #1D4ED8;
+
+  --el-color-success: #22C55E;
+  --el-color-warning: #F59E0B;
+  --el-color-danger: #EF4444;
+  --el-color-error: #EF4444;
+  --el-color-info: #6B7280;
+
+  --el-bg-color: #ffffff;
+  --el-bg-color-page: #F6F8FC;
+  --el-bg-color-overlay: #ffffff;
+
+  --el-text-color-primary: #1F2937;
+  --el-text-color-regular: #374151;
+  --el-text-color-secondary: #6B7280;
+  --el-text-color-placeholder: #9CA3AF;
+  --el-text-color-disabled: #D1D5DB;
+
+  --el-border-color: #E8EBF2;
+  --el-border-color-light: #F1F3F6;
+  --el-border-color-lighter: #F9FAFB;
+  --el-border-color-extra-light: #FBFCFD;
+  --el-border-color-disabled: #E5E7EB;
+  --el-border-color-dark: #D1D5DB;
+
+  --el-fill-color: #F5F7FB;
+  --el-fill-color-light: #FAFBFD;
+  --el-fill-color-lighter: #FDFDFE;
+  --el-fill-color-blank: #ffffff;
+  --el-fill-color-dark: #ECEFF5;
+
+  --el-mask-color: rgba(0, 0, 0, 0.4);
+  --el-box-shadow: 0 4px 18px rgba(0, 0, 0, 0.05);
+  --el-box-shadow-light: 0 1px 3px rgba(0, 0, 0, 0.04);
+
+  --el-border-radius-base: 10px;
+  --el-border-radius-small: 8px;
+  --el-border-radius-round: 20px;
+  --el-border-radius-circle: 100%;
+
+  --el-font-size-base: 14px;
+  --el-transition-duration: 0.2s;
+  --el-transition: all var(--el-transition-duration) ease;
+}
+
+// ---- Dark Mode (follows system) ----
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    // Backgrounds
+    --app-bg: #0F172A;
+    --app-surface: #1E293B;
+    --app-surface-elevated: #334155;
+    --app-surface-hover: #334155;
+    --app-surface-active: #475569;
+
+    // Text
+    --app-text-primary: #F1F5F9;
+    --app-text-secondary: #94A3B8;
+    --app-text-tertiary: #64748B;
+    --app-text-on-accent: #ffffff;
+
+    // Borders & Dividers
+    --app-border: #334155;
+    --app-border-light: #1E293B;
+    --app-divider: #334155;
+
+    // Accent
+    --app-accent: #3B82F6;
+    --app-accent-hover: #60A5FA;
+    --app-accent-active: #2563EB;
+    --app-accent-bg: rgba(59, 130, 246, 0.15);
+    --app-accent-bg-hover: rgba(59, 130, 246, 0.22);
+
+    // Semantic
+    --app-success: #4ADE80;
+    --app-success-bg: rgba(74, 222, 128, 0.15);
+    --app-warning: #FBBF24;
+    --app-warning-bg: rgba(251, 191, 36, 0.15);
+    --app-error: #F87171;
+    --app-error-bg: rgba(248, 113, 113, 0.15);
+    --app-info: #60A5FA;
+    --app-info-bg: rgba(96, 165, 250, 0.15);
+
+    // File list specific
+    --app-file-hover: rgba(59, 130, 246, 0.08);
+    --app-row-divider: #334155;
+
+    // Shadows
+    --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+    --app-shadow-md: 0 4px 18px rgba(0, 0, 0, 0.3);
+    --app-shadow-lg: 0 4px 18px rgba(0, 0, 0, 0.3);
+    --app-shadow-card: 0 4px 18px rgba(0, 0, 0, 0.3);
+
+    // Vibrancy
+    --app-glass-bg: rgba(30, 41, 59, 0.72);
+    --app-glass-border: rgba(255, 255, 255, 0.08);
+    --app-sidebar-bg: #1E293B;
+
+    // Scrollbar
+    --app-scrollbar-thumb: rgba(255, 255, 255, 0.2);
+    --app-scrollbar-thumb-hover: rgba(255, 255, 255, 0.35);
+
+    // Element Plus Dark Overrides
+    --el-color-primary: #3B82F6;
+    --el-color-primary-light-3: #60A5FA;
+    --el-color-primary-light-5: #93C5FD;
+    --el-color-primary-light-7: #1E40AF;
+    --el-color-primary-light-8: #1E3A8A;
+    --el-color-primary-light-9: #172554;
+    --el-color-primary-dark-2: #60A5FA;
+
+    --el-color-success: #4ADE80;
+    --el-color-warning: #FBBF24;
+    --el-color-danger: #F87171;
+    --el-color-error: #F87171;
+    --el-color-info: #94A3B8;
+
+    --el-bg-color: #1E293B;
+    --el-bg-color-page: #0F172A;
+    --el-bg-color-overlay: #334155;
+
+    --el-text-color-primary: #F1F5F9;
+    --el-text-color-regular: #CBD5E1;
+    --el-text-color-secondary: #94A3B8;
+    --el-text-color-placeholder: #64748B;
+    --el-text-color-disabled: #475569;
+
+    --el-border-color: #334155;
+    --el-border-color-light: #1E293B;
+    --el-border-color-lighter: #0F172A;
+    --el-border-color-extra-light: #0F172A;
+    --el-border-color-disabled: #1E293B;
+    --el-border-color-dark: #475569;
+
+    --el-fill-color: #334155;
+    --el-fill-color-light: #1E293B;
+    --el-fill-color-lighter: #0F172A;
+    --el-fill-color-blank: #1E293B;
+    --el-fill-color-dark: #475569;
+
+    --el-mask-color: rgba(0, 0, 0, 0.6);
+    --el-box-shadow: 0 4px 18px rgba(0, 0, 0, 0.3);
+    --el-box-shadow-light: 0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+}
+
+// ---- Manual dark mode (for explicit .dark class) ----
+:root.dark {
+  --app-bg: #0F172A;
+  --app-surface: #1E293B;
+  --app-surface-elevated: #334155;
+  --app-surface-hover: #334155;
+  --app-surface-active: #475569;
+  --app-text-primary: #F1F5F9;
+  --app-text-secondary: #94A3B8;
+  --app-text-tertiary: #64748B;
+  --app-text-on-accent: #ffffff;
+  --app-border: #334155;
+  --app-border-light: #1E293B;
+  --app-divider: #334155;
+  --app-accent: #3B82F6;
+  --app-accent-hover: #60A5FA;
+  --app-accent-active: #2563EB;
+  --app-accent-bg: rgba(59, 130, 246, 0.15);
+  --app-accent-bg-hover: rgba(59, 130, 246, 0.22);
+  --app-success: #4ADE80;
+  --app-success-bg: rgba(74, 222, 128, 0.15);
+  --app-warning: #FBBF24;
+  --app-warning-bg: rgba(251, 191, 36, 0.15);
+  --app-error: #F87171;
+  --app-error-bg: rgba(248, 113, 113, 0.15);
+  --app-info: #60A5FA;
+  --app-info-bg: rgba(96, 165, 250, 0.15);
+  --app-file-hover: rgba(59, 130, 246, 0.08);
+  --app-row-divider: #334155;
+  --app-shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --app-shadow-md: 0 4px 18px rgba(0, 0, 0, 0.3);
+  --app-shadow-lg: 0 4px 18px rgba(0, 0, 0, 0.3);
+  --app-shadow-card: 0 4px 18px rgba(0, 0, 0, 0.3);
+  --app-glass-bg: rgba(30, 41, 59, 0.72);
+  --app-glass-border: rgba(255, 255, 255, 0.08);
+  --app-sidebar-bg: #1E293B;
+  --app-scrollbar-thumb: rgba(255, 255, 255, 0.2);
+  --app-scrollbar-thumb-hover: rgba(255, 255, 255, 0.35);
+}
+
+// ---- Vibrancy Utility Classes ----
+.glass-sidebar {
+  background: var(--app-sidebar-bg);
+  border-right: 1px solid var(--app-divider);
+}
+
+.glass-header {
+  background: var(--app-glass-bg);
+  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(20px);
+  border-bottom: 1px solid var(--app-divider);
+
+  @media (prefers-reduced-transparency: reduce) {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: var(--app-surface);
+  }
+}
+
+// ============================================================
+// Element Plus Component Deep Overrides
+// ============================================================
+
+// ---- Buttons: rounded, no harsh shadows ----
+.el-button {
+  border-radius: var(--app-radius-sm);
+  font-weight: 500;
+  transition: all 0.2s ease;
+
+  &:active {
+    transform: scale(0.97);
+  }
+
+  // Primary button: Apple Blue, clean
+  &.el-button--primary {
+    --el-button-bg-color: var(--app-accent);
+    --el-button-border-color: var(--app-accent);
+    --el-button-hover-bg-color: var(--app-accent-hover);
+    --el-button-hover-border-color: var(--app-accent-hover);
+    --el-button-active-bg-color: var(--app-accent-active);
+    --el-button-active-border-color: var(--app-accent-active);
+    box-shadow: none;
+
+    // Plain variant: transparent background with colored text/border
+    &.is-plain {
+      --el-button-text-color: var(--app-accent);
+      --el-button-bg-color: var(--app-accent-bg);
+      --el-button-border-color: var(--app-accent);
+      --el-button-hover-text-color: var(--app-text-on-accent);
+      --el-button-hover-bg-color: var(--app-accent);
+      --el-button-hover-border-color: var(--app-accent);
+      --el-button-active-text-color: var(--app-text-on-accent);
+      --el-button-active-bg-color: var(--app-accent-active);
+      --el-button-active-border-color: var(--app-accent-active);
+    }
+  }
+
+  // Remove colorful type variants - use neutral + accent only
+  &.el-button--success {
+    --el-button-bg-color: var(--app-success);
+    --el-button-border-color: var(--app-success);
+    --el-button-hover-bg-color: color-mix(in srgb, var(--app-success) 85%, black);
+    --el-button-hover-border-color: color-mix(in srgb, var(--app-success) 85%, black);
+    box-shadow: none;
+
+    &.is-plain {
+      --el-button-text-color: var(--app-success);
+      --el-button-bg-color: var(--app-success-bg);
+      --el-button-border-color: var(--app-success);
+      --el-button-hover-text-color: var(--app-text-on-accent);
+      --el-button-hover-bg-color: var(--app-success);
+      --el-button-hover-border-color: var(--app-success);
+    }
+  }
+
+  &.el-button--warning {
+    --el-button-bg-color: var(--app-warning);
+    --el-button-border-color: var(--app-warning);
+    --el-button-hover-bg-color: color-mix(in srgb, var(--app-warning) 85%, black);
+    --el-button-hover-border-color: color-mix(in srgb, var(--app-warning) 85%, black);
+    box-shadow: none;
+
+    &.is-plain {
+      --el-button-text-color: var(--app-warning);
+      --el-button-bg-color: var(--app-warning-bg);
+      --el-button-border-color: var(--app-warning);
+      --el-button-hover-text-color: var(--app-text-on-accent);
+      --el-button-hover-bg-color: var(--app-warning);
+      --el-button-hover-border-color: var(--app-warning);
+    }
+  }
+
+  &.el-button--danger {
+    --el-button-bg-color: var(--app-error);
+    --el-button-border-color: var(--app-error);
+    --el-button-hover-bg-color: color-mix(in srgb, var(--app-error) 85%, black);
+    --el-button-hover-border-color: color-mix(in srgb, var(--app-error) 85%, black);
+    box-shadow: none;
+
+    &.is-plain {
+      --el-button-text-color: var(--app-error);
+      --el-button-bg-color: var(--app-error-bg);
+      --el-button-border-color: var(--app-error);
+      --el-button-hover-text-color: var(--app-text-on-accent);
+      --el-button-hover-bg-color: var(--app-error);
+      --el-button-hover-border-color: var(--app-error);
+    }
+  }
+
+  // Default/text buttons: subtle
+  &.el-button--default {
+    --el-button-bg-color: var(--app-surface);
+    --el-button-border-color: var(--app-border);
+    --el-button-text-color: var(--app-text-primary);
+    --el-button-hover-bg-color: var(--app-surface-hover);
+    --el-button-hover-border-color: var(--app-border);
+    --el-button-hover-text-color: var(--app-text-primary);
+    box-shadow: var(--app-shadow-sm);
+  }
+
+  &.is-text,
+  &.is-link {
+    box-shadow: none;
+  }
+}
+
+// ---- Cards: 12px radius, subtle shadow ----
+.el-card {
+  border-radius: var(--app-radius-md);
+  border: 1px solid var(--app-border-light);
+  box-shadow: var(--app-shadow-card);
+  transition: box-shadow 0.2s ease;
+
+  &.is-hover-shadow:hover,
+  &.is-always-shadow {
+    box-shadow: var(--app-shadow-md);
+  }
+
+  .el-card__header {
+    border-bottom: 1px solid var(--app-divider);
+    padding: 16px 20px;
+  }
+
+  .el-card__body {
+    padding: 20px;
+  }
+}
+
+// ---- Tables: transparent header, hover tint ----
+.el-table {
+  --el-table-border-color: var(--app-divider);
+  --el-table-header-bg-color: transparent;
+  --el-table-header-text-color: var(--app-text-secondary);
+  --el-table-row-hover-bg-color: var(--app-surface-hover);
+  --el-table-current-row-bg-color: var(--app-accent-bg);
+  --el-table-bg-color: transparent;
+  --el-table-tr-bg-color: transparent;
+  --el-table-expanded-cells-bg-color: var(--app-surface);
+  background: transparent;
+
+  .el-table__header-wrapper {
+    th {
+      font-weight: 600;
+      font-size: 13px;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+  }
+
+  .el-table__row {
+    transition: background-color 0.15s ease;
+  }
+}
+
+// ---- Inputs: focus ring ----
+.el-input__wrapper {
+  border-radius: var(--app-radius-sm);
+  box-shadow: 0 0 0 1px var(--app-border) inset;
+  background: var(--app-surface);
+  transition: box-shadow 0.2s ease;
+
+  &:hover {
+    box-shadow: 0 0 0 1px var(--app-border) inset;
+  }
+
+  &.is-focus {
+    box-shadow: 0 0 0 2px var(--app-accent) inset;
+  }
+}
+
+.el-textarea__inner {
+  border-radius: var(--app-radius-sm);
+  box-shadow: 0 0 0 1px var(--app-border) inset;
+  background: var(--app-surface);
+  transition: box-shadow 0.2s ease;
+
+  &:focus {
+    box-shadow: 0 0 0 2px var(--app-accent) inset;
+  }
+}
+
+// ---- Select ----
+.el-select__wrapper {
+  border-radius: var(--app-radius-sm);
+  box-shadow: 0 0 0 1px var(--app-border) inset;
+  background: var(--app-surface);
+
+  &.is-focused {
+    box-shadow: 0 0 0 2px var(--app-accent) inset;
+  }
+}
+
+// ---- Dialogs: 14px radius, clean ----
+.el-dialog {
+  --el-dialog-border-radius: 14px;
+  border-radius: 14px;
+  box-shadow: var(--app-shadow-lg);
+
+  .el-dialog__header {
+    padding: 20px 24px 12px;
+    margin-right: 0;
+  }
+
+  .el-dialog__title {
+    font-size: 17px;
+    font-weight: 600;
+    color: var(--app-text-primary);
+  }
+
+  .el-dialog__body {
+    padding: 12px 24px 20px;
+    color: var(--app-text-primary);
+  }
+
+  .el-dialog__footer {
+    padding: 12px 24px 20px;
+  }
+}
+
+// Overlay backdrop
+.el-overlay {
+  background: var(--el-mask-color);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+}
+
+// ---- Menu (sidebar): active pill ----
+.el-menu {
+  border-right: none;
+  background: transparent;
+
+  .el-menu-item {
+    border-radius: var(--app-radius-sm);
+    margin: 2px 8px;
+    height: 44px;
+    line-height: 44px;
+    transition: all 0.2s ease;
+
+    &:hover {
+      background: var(--app-surface-hover);
+    }
+
+    &.is-active {
+      background: var(--app-accent-bg);
+      color: var(--app-accent);
+      font-weight: 500;
+    }
+  }
+}
+
+// ---- Dropdown ----
+.el-dropdown__popper.el-popper {
+  border-radius: 10px;
+  box-shadow: var(--app-shadow-lg);
+
+  .el-dropdown-menu {
+    padding: 4px;
+    border-radius: 10px;
+
+    .el-dropdown-menu__item {
+      border-radius: 6px;
+      margin: 2px 0;
+      padding: 8px 14px;
+      transition: background 0.15s ease;
+
+      &:hover {
+        background: var(--app-surface-hover);
+      }
+    }
+  }
+}
+
+// ---- Tags: Apple-style pills ----
+.el-tag {
+  border-radius: 8px;
+  font-weight: 500;
+  border: none;
+  padding: 0 10px;
+}
+
+// ---- Switch: Apple toggle ----
+.el-switch {
+  --el-switch-on-color: var(--app-success);
+
+  .el-switch__core {
+    border-radius: 999px;
+  }
+}
+
+// ---- Alert: Apple-style banners ----
+.el-alert {
+  border-radius: 10px;
+  border: none;
+  padding: 12px 16px;
+
+  &.el-alert--info {
+    background: var(--app-info-bg);
+    .el-alert__title { color: var(--app-info); }
+  }
+  &.el-alert--success {
+    background: var(--app-success-bg);
+    .el-alert__title { color: var(--app-success); }
+  }
+  &.el-alert--warning {
+    background: var(--app-warning-bg);
+    .el-alert__title { color: var(--app-warning); }
+  }
+  &.el-alert--error {
+    background: var(--app-error-bg);
+    .el-alert__title { color: var(--app-error); }
+  }
+}
+
+// ---- Message Box: Apple-style ----
+.el-message-box {
+  border-radius: 14px;
+  box-shadow: var(--app-shadow-lg);
+  padding: 4px;
+
+  .el-message-box__header {
+    padding: 16px 24px 8px;
+  }
+
+  .el-message-box__title {
+    font-size: 17px;
+    font-weight: 600;
+  }
+
+  .el-message-box__content {
+    padding: 8px 24px 16px;
+  }
+
+  .el-message-box__btns {
+    padding: 8px 24px 16px;
+  }
+}
+
+// ---- Message (toast): Apple-style ----
+.el-message {
+  border-radius: 12px;
+  box-shadow: var(--app-shadow-md);
+  border: none;
+  padding: 10px 16px;
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+}
+
+// ---- Breadcrumb: subtle separators ----
+.el-breadcrumb {
+  .el-breadcrumb__item {
+    .el-breadcrumb__inner {
+      color: var(--app-text-secondary);
+      font-weight: 400;
+    }
+
+    &:last-child .el-breadcrumb__inner {
+      color: var(--app-text-primary);
+      font-weight: 500;
+    }
+  }
+
+  .el-breadcrumb__separator {
+    color: var(--app-text-tertiary);
+  }
+}
+
+// ---- Empty state: clean ----
+.el-empty {
+  .el-empty__description {
+    color: var(--app-text-secondary);
+  }
+}
+
+// ---- Skeleton: subtle shimmer ----
+.el-skeleton {
+  .el-skeleton__item {
+    border-radius: 8px;
+  }
+}
+
+// ---- Form: Apple-style labels ----
+.el-form-item {
+  .el-form-item__label {
+    color: var(--app-text-secondary);
+    font-weight: 500;
+  }
+}
+
+// ---- Loading directive ----
+.el-loading-mask {
+  background: var(--app-glass-bg);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border-radius: inherit;
+}
+
+// ---- Tooltip ----
+.el-popper.is-dark {
+  background: var(--app-text-primary);
+  color: var(--app-surface);
+  border-radius: 8px;
+  font-size: 12px;
+  padding: 6px 10px;
+}
+
+// ---- Progress bar: Apple-style ----
+.el-progress-bar {
+  .el-progress-bar__outer {
+    border-radius: 999px;
+    background: var(--app-surface-active);
+  }
+  .el-progress-bar__inner {
+    border-radius: 999px;
+  }
+}
+
+// ---- Divider ----
+.el-divider {
+  border-color: var(--app-divider);
+}
+
+// ---- Radio & Checkbox ----
+.el-radio__label,
+.el-checkbox__label {
+  color: var(--app-text-primary);
+}
+
+.el-radio__input.is-checked .el-radio__inner,
+.el-checkbox__input.is-checked .el-checkbox__inner {
+  background: var(--app-accent);
+  border-color: var(--app-accent);
+}
+
+// ---- InputNumber ----
+.el-input-number {
+  .el-input__wrapper {
+    border-radius: 8px;
+  }
+}
+
+// ---- Tabs ----
+.el-tabs {
+  .el-tabs__item {
+    font-weight: 500;
+    color: var(--app-text-secondary);
+    transition: color 0.2s ease;
+
+    &.is-active {
+      color: var(--app-accent);
+    }
+  }
+
+  .el-tabs__active-bar {
+    background: var(--app-accent);
+    border-radius: 999px;
+    height: 3px;
+  }
+}

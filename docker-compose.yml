@@ -1,0 +1,52 @@
+version: '3.8'
+
+services:
+  baidu-netdisk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: PurePan
+    image: PurePan:latest
+    ports:
+      - "18888:18888"
+    volumes:
+      # 配置文件挂载
+      - ./config:/app/config
+      # 下载目录挂载
+      - ./downloads:/app/downloads
+      # 会话数据挂载
+      - ./data:/app/data
+      # 日志目录挂载（新增）
+      - ./logs:/app/logs
+      # WAL 目录挂载（新增）
+      - ./wal:/app/wal
+    environment:
+      - RUST_LOG=info
+      - RUST_BACKTRACE=1
+    restart: unless-stopped
+    networks:
+      - baidu-network
+    healthcheck:
+      # start_period: 30s - 给 Rust 应用足够的启动时间（初始化 AppState、加载会话等）
+      # timeout: 5s - 增加超时时间，避免启动阶段的慢响应导致失败
+      test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # 资源限制
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+networks:
+  baidu-network:
+    driver: bridge
+
+# volumes 声明已移除：生产环境使用 bind mount，无需 named volumes
+

@@ -1,0 +1,113 @@
+[package]
+name = "purepan-backend"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.87"
+
+[dependencies]
+# Web框架（启用 WebSocket 支持）
+axum = { version = "0.7", features = ["ws"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
+
+# 异步运行时
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tokio-tungstenite = "0.21"
+
+# HTTP客户端
+# 使用 rustls-tls 替代 native-tls，避免 OpenSSL 依赖问题（特别是交叉编译）
+reqwest = { version = "0.11", default-features = false, features = ["json", "cookies", "stream", "rustls-tls", "multipart", "socks"] }
+
+# 序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 加密
+sha1 = "0.10"
+sha2 = "0.10"
+md5 = "0.7"
+hex = "0.4"
+base64 = "0.21"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+argon2 = "0.5"
+
+# JWT
+jsonwebtoken = "9.3"
+
+# 文件系统监听
+notify = "6.0"
+walkdir = "2.4"
+
+# 数据库
+rusqlite = { version = "0.31", features = ["bundled"] }
+r2d2 = "0.8"
+r2d2_sqlite = "0.24"
+
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "chrono"] }
+tracing-appender = "0.2"
+
+# 错误处理
+anyhow = "1.0"
+thiserror = "1.0"
+
+# 时间处理
+chrono = { version = "0.4", features = ["serde"] }
+
+# v2 阶段 6:share-sync 全局风控限速器 — production-grade leaky bucket,
+# 自带 cancel-safe 与 jitter,避免并行 4 worker 撞百度风控(errno=132)
+governor = "0.6"
+
+# 二维码
+qrcode = "0.13"
+image = "0.24"
+totp-rs = { version = "5.5", features = ["qr", "gen_secret"] }
+
+# UUID
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
+# 配置文件
+toml = "0.8"
+
+# 并发控制
+futures = "0.3"
+async-trait = "0.1"
+async-recursion = "1.0"
+dashmap = "5.5"
+
+# 持久化相关
+bit-set = "0.5"
+parking_lot = "0.12"
+
+# URL编码
+urlencoding = "2.1"
+regex = "1.12.2"
+
+# 系统信息（内存监控）
+sysinfo = "0.30"
+
+# ZIP 打包
+zip = "0.6"
+
+# Windows 路径规范化
+dunce = "1.0"
+
+# Unix 系统调用（获取 uid/gid、faccessat 权限检测）
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# 测试工具
+tempfile = "3.8"
+proptest = "1.4"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.build-override]
+debug = 0

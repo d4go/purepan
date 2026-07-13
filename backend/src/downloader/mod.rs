@@ -1,0 +1,22 @@
+pub mod budget_scheduler;
+pub mod chunk;
+pub mod engine;
+pub mod folder;
+pub mod folder_manager;
+pub mod manager;
+pub mod priority_semaphore;
+pub mod progress;
+pub mod scheduler;
+pub mod task;
+
+pub use chunk::{Chunk, ChunkFailureAction, ChunkManager};
+pub use engine::{ChunkDownloadFailure, DownloadEngine, UrlHealthManager};
+pub use folder::{FolderDownload, FolderStatus, PendingFile};
+pub use folder_manager::FolderDownloadManager;
+pub use manager::DownloadManager;
+pub use progress::SpeedCalculator;
+pub use scheduler::{calculate_task_max_chunks, ChunkScheduler, TaskScheduleInfo};
+pub use task::{DownloadTask, TaskStatus};
+
+// Re-export conflict strategy from uploader module for convenience
+pub use crate::uploader::conflict::DownloadConflictStrategy;

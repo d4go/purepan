@@ -1,0 +1,68 @@
+version: '3.8'
+
+services:
+  backend:
+    image: rust:1.87-slim
+    container_name: baidu-netdisk-backend-dev
+    working_dir: /app
+    ports:
+      - "18888:18888"
+    volumes:
+      # 源代码挂载（实现热重载）
+      - ./backend:/app
+      # 配置文件挂载
+      - ./config:/app/config
+      # 下载目录挂载
+      - ./downloads:/app/downloads
+      # 会话数据挂载
+      - ./data:/app/data
+      # 日志目录挂载
+      - ./logs:/app/logs
+      # WAL 目录挂载
+      - ./wal:/app/wal
+      # Cargo registry 缓存
+      - backend-cargo-cache:/usr/local/cargo/registry
+      # 编译目标缓存（避免重复编译）
+      - backend-target-cache:/app/target
+    environment:
+      - RUST_LOG=debug
+      - RUST_BACKTRACE=1
+    # 安装必要依赖后启动 cargo-watch 实现热重载
+    command: >
+      sh -c "apt-get update && apt-get install -y curl pkg-config libssl-dev &&
+      (command -v cargo-watch >/dev/null 2>&1 || cargo install cargo-watch) &&
+      cargo watch -x run"
+    networks:
+      - baidu-network-dev
+    healthcheck:
+      # start_period: 60s - 给 Rust 应用足够的启动时间（安装依赖、初始化 AppState、加载会话等）
+      # timeout: 5s - 增加超时时间，避免启动阶段的慢响应导致失败
+      test: ["CMD", "curl", "-f", "http://localhost:18888/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  frontend:
+    image: node:18-alpine
+    container_name: baidu-netdisk-frontend-dev
+    working_dir: /app
+    ports:
+      - "5173:5173"
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    environment:
+      - NODE_ENV=development
+    command: >
+      sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    networks:
+      - baidu-network-dev
+
+networks:
+  baidu-network-dev:
+    driver: bridge
+
+volumes:
+  backend-cargo-cache:
+  backend-target-cache:

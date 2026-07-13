@@ -1,0 +1,49 @@
+[package]
+name = "decrypt-cli"
+version = "0.1.0"
+edition = "2021"
+description = "独立的命令行解密工具，用于解密 BaiduPCS-Rust 加密的文件"
+authors = ["BaiduPCS-Rust Team"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/example/BaiduPCS-Rust"
+keywords = ["decrypt", "cli", "encryption", "aes", "chacha20"]
+categories = ["command-line-utilities", "cryptography"]
+
+[dependencies]
+# CLI 参数解析
+clap = { version = "4.4", features = ["derive"] }
+
+# 序列化/反序列化
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 错误处理
+thiserror = "1.0"
+
+# 加密算法
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+
+# Base64 编解码
+base64 = "0.21"
+
+[dev-dependencies]
+# 属性测试
+proptest = "1.4"
+# 临时文件
+tempfile = "3.10"
+# ZIP 处理
+zip = { version = "0.6", default-features = false, features = ["deflate"] }
+# 正则表达式
+regex = "1.10"
+
+[[bin]]
+name = "decrypt-cli"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
