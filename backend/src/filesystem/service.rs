@@ -1,0 +1,851 @@
+// 文件系统服务
+//
+// 提供目录列表、路径校验等核心功能
+
+use std::fs::{self, DirEntry};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
+
+use chrono::{DateTime, Utc};
+
+#[cfg(not(target_os = "windows"))]
+use crate::config::{EnvDetector, MountDetector};
+
+use super::guard::PathGuard;
+use super::types::*;
+
+/// 通过内核判断有效用户(effective uid/gid)是否对路径有写权限。
+/// 使用 faccessat + AT_EACCESS，自动覆盖 root、附加组(supplementary groups)、ACL 等情况，
+/// 避免手动解析权限位带来的误判。
+#[cfg(not(target_os = "windows"))]
+fn can_write_path(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let c_path = match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    unsafe { libc::faccessat(libc::AT_FDCWD, c_path.as_ptr(), libc::W_OK, libc::AT_EACCESS) == 0 }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn get_unix_permission_info(path: &Path) -> PermissionInfo {
+    use std::os::unix::fs::MetadataExt;
+
+    let euid = unsafe { libc::geteuid() };
+    let egid = unsafe { libc::getegid() };
+
+    let metadata = fs::metadata(path);
+    let meta = metadata.as_ref();
+
+    let dir_uid = meta.map(|m| m.uid()).unwrap_or(0);
+    let dir_gid = meta.map(|m| m.gid()).unwrap_or(0);
+
+    let dir_owner = lookup_user_name(dir_uid);
+    let dir_group = lookup_group_name(dir_gid);
+    let process_user = lookup_user_name(euid);
+    let process_group = lookup_group_name(egid);
+
+    let can_write = can_write_path(path);
+
+    PermissionInfo {
+        dir_owner,
+        dir_group,
+        process_user,
+        process_group,
+        can_write,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lookup_user_name(uid: u32) -> String {
+    let mut buf = [0i8; 256];
+    let mut pwd = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getpwuid_r(uid, &mut pwd, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+    };
+    if ret == 0 && !result.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(pwd.pw_name).to_string_lossy().to_string() }
+    } else {
+        uid.to_string()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn lookup_group_name(gid: u32) -> String {
+    let mut buf = [0i8; 256];
+    let mut grp = unsafe { std::mem::zeroed::<libc::group>() };
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    let ret = unsafe {
+        libc::getgrgid_r(gid, &mut grp, buf.as_mut_ptr() as *mut libc::c_char, buf.len(), &mut result)
+    };
+    if ret == 0 && !result.is_null() {
+        unsafe { std::ffi::CStr::from_ptr(grp.gr_name).to_string_lossy().to_string() }
+    } else {
+        gid.to_string()
+    }
+}
+
+/// 文件系统服务
+pub struct FilesystemService {
+    guard: PathGuard,
+}
+
+impl FilesystemService {
+    /// 创建新的文件系统服务
+    pub fn new(config: FilesystemConfig) -> Self {
+        Self {
+            guard: PathGuard::new(config),
+        }
+    }
+
+    /// 列出目录内容（支持分页）
+    pub fn list_directory(&self, req: &ListRequest) -> Result<ListResponse, FsError> {
+        let path = self.guard.normalize(&req.path)?;
+
+        // 检查是否为目录
+        if !path.is_dir() {
+            return Err(FsError::new(FsErrorCode::NotADirectory).with_path(req.path.clone()));
+        }
+
+        // 读取目录
+        let read_dir = fs::read_dir(&path).map_err(|e| {
+            tracing::error!("读取目录失败: {:?}, 错误: {}", path, e);
+            FsError::new(FsErrorCode::DirectoryReadFailed)
+                .with_path(path.to_string_lossy().to_string())
+                .with_message(format!("读取目录失败: {}", e))
+        })?;
+
+        // 搜索关键词（小写化，用于大小写不敏感匹配）
+        let keyword_lower = req.keyword.as_ref()
+            .map(|k| k.trim().to_lowercase())
+            .filter(|k| !k.is_empty());
+
+        // 收集并过滤条目
+        let mut entries: Vec<FileEntry> = read_dir
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                let entry_path = entry.path();
+                // 过滤隐藏文件
+                if self.guard.is_hidden(&entry_path) {
+                    return false;
+                }
+                // 过滤符号链接
+                if self.guard.should_skip_symlink(&entry_path) {
+                    return false;
+                }
+                // 按关键词过滤文件名
+                if let Some(ref kw) = keyword_lower {
+                    let name = entry.file_name().to_string_lossy().to_lowercase();
+                    if !name.contains(kw) {
+                        return false;
+                    }
+                }
+                true
+            })
+            .filter_map(|entry| self.to_file_entry(&entry).ok())
+            .collect();
+
+        let total = entries.len();
+
+        // 排序
+        self.sort_entries(&mut entries, &req.sort_field, &req.sort_order);
+
+        // 分页
+        let offset = req.page * req.page_size;
+        let paginated: Vec<FileEntry> = entries
+            .into_iter()
+            .skip(offset)
+            .take(req.page_size)
+            .collect();
+
+        // 计算父目录
+        // 当白名单启用且当前目录恰好是白名单根目录时，parent_path 设为 None
+        // 这样前端会将其视为逻辑根，点"上级"时回到根列表而非真实父目录
+        let parent_path = if self.guard.is_allowed_root(&path) {
+            None
+        } else {
+            path.parent()
+                .and_then(|p| {
+                    #[cfg(target_os = "windows")]
+                    {
+                        if p.as_os_str().is_empty() {
+                            return None;
+                        }
+                        Some(p.to_string_lossy().to_string())
+                    }
+                    #[cfg(not(target_os = "windows"))]
+                    {
+                        Some(p.to_string_lossy().to_string())
+                    }
+                })
+        };
+
+        #[cfg(not(target_os = "windows"))]
+        let permission_info = Some(get_unix_permission_info(&path));
+        #[cfg(target_os = "windows")]
+        let permission_info: Option<PermissionInfo> = None;
+
+        Ok(ListResponse {
+            entries: paginated,
+            current_path: path.to_string_lossy().to_string(),
+            parent_path,
+            total,
+            page: req.page,
+            page_size: req.page_size,
+            has_more: offset + req.page_size < total,
+            permission_info,
+        })
+    }
+
+    /// 路径跳转（直达路径）
+    pub fn goto_path(&self, req: &GotoRequest) -> GotoResponse {
+        // 1. 规范化路径
+        let resolved = match self.guard.normalize(&req.path) {
+            Ok(p) => p,
+            Err(e) => {
+                return GotoResponse {
+                    valid: false,
+                    resolved_path: req.path.clone(),
+                    entry_type: None,
+                    message: Some(e.to_string()),
+                };
+            }
+        };
+
+        // 2. 检查路径是否存在
+        if !resolved.exists() {
+            return GotoResponse {
+                valid: false,
+                resolved_path: resolved.to_string_lossy().to_string(),
+                entry_type: None,
+                message: Some("路径不存在".to_string()),
+            };
+        }
+
+        // 3. 返回成功结果
+        let entry_type = if resolved.is_dir() {
+            Some(EntryType::Directory)
+        } else {
+            Some(EntryType::File)
+        };
+
+        GotoResponse {
+            valid: true,
+            resolved_path: resolved.to_string_lossy().to_string(),
+            entry_type,
+            message: None,
+        }
+    }
+
+    /// 校验路径有效性
+    pub fn validate_path(&self, req: &ValidateRequest) -> ValidateResponse {
+        // 尝试规范化路径
+        let normalized = match self.guard.normalize(&req.path) {
+            Ok(p) => p,
+            Err(e) => {
+                return ValidateResponse {
+                    valid: false,
+                    exists: false,
+                    entry_type: None,
+                    message: Some(e.to_string()),
+                };
+            }
+        };
+
+        let exists = normalized.exists();
+        let actual_type = if normalized.is_dir() {
+            Some(EntryType::Directory)
+        } else if normalized.is_file() {
+            Some(EntryType::File)
+        } else {
+            None
+        };
+
+        // 检查类型匹配
+        let type_matches = match (&req.entry_type, &actual_type) {
+            (Some(expected), Some(actual)) => expected == actual,
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+
+        if !type_matches {
+            let expected_str = match &req.entry_type {
+                Some(EntryType::File) => "文件",
+                Some(EntryType::Directory) => "目录",
+                None => "未知",
+            };
+            return ValidateResponse {
+                valid: false,
+                exists,
+                entry_type: actual_type,
+                message: Some(format!("期望类型为{}，但实际不是", expected_str)),
+            };
+        }
+
+        ValidateResponse {
+            valid: exists,
+            exists,
+            entry_type: actual_type,
+            message: None,
+        }
+    }
+
+    /// 获取单个文件/文件夹信息
+    pub fn get_entry_info(&self, path: &str) -> Result<FileEntry, FsError> {
+        let normalized = self.guard.normalize(path)?;
+
+        let metadata = fs::metadata(&normalized)
+            .map_err(|_| FsError::new(FsErrorCode::FileNotFound).with_path(path))?;
+
+        let name = normalized
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| normalized.to_string_lossy().to_string());
+
+        let entry_type = if metadata.is_dir() {
+            EntryType::Directory
+        } else {
+            EntryType::File
+        };
+
+        let size = if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        };
+
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let icon = get_icon_for_extension(&normalized);
+
+        Ok(FileEntry {
+            id: self.path_to_id(&normalized),
+            name,
+            entry_type,
+            size,
+            created_at,
+            updated_at: modified_at,
+            icon,
+            path: normalized.to_string_lossy().to_string(),
+        })
+    }
+
+    /// 获取根目录列表（Windows 驱动器列表 / Unix 根目录 / 白名单目录）
+    pub fn get_roots(&self) -> Result<Vec<FileEntry>, FsError> {
+        if self.guard.has_allowed_paths() {
+            return self.get_allowed_roots();
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            self.get_windows_drives()
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            self.get_unix_roots()
+        }
+    }
+
+    /// 获取根目录列表及默认目录路径
+    pub fn get_roots_with_default(&self) -> Result<RootsResponse, FsError> {
+        let roots = self.get_roots()?;
+        let default_path = self
+            .guard
+            .resolve_default_directory()?
+            .map(|p| p.to_string_lossy().to_string());
+        Ok(RootsResponse {
+            roots,
+            default_path,
+        })
+    }
+
+    fn get_allowed_roots(&self) -> Result<Vec<FileEntry>, FsError> {
+        let paths = self.guard.resolve_allowed_roots()?;
+
+        // 检测同名根目录：收集所有 basename，找出重复的
+        let basenames: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .filter(|n| !n.is_empty())
+                    .unwrap_or_else(|| p.to_string_lossy().to_string())
+            })
+            .collect();
+
+        let mut name_count = std::collections::HashMap::new();
+        for name in &basenames {
+            *name_count.entry(name.as_str()).or_insert(0usize) += 1;
+        }
+
+        paths
+            .into_iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let basename = &basenames[i];
+                if name_count.get(basename.as_str()).copied().unwrap_or(0) > 1 {
+                    // 同名冲突：使用完整路径作为显示名
+                    let display_name = format!(
+                        "{} ({})",
+                        basename,
+                        path.to_string_lossy()
+                    );
+                    self.create_directory_entry(&path, display_name)
+                } else {
+                    self.create_root_entry(&path)
+                }
+            })
+            .collect()
+    }
+
+    /// Windows: 获取驱动器列表
+    #[cfg(target_os = "windows")]
+    fn get_windows_drives(&self) -> Result<Vec<FileEntry>, FsError> {
+        let mut drives = Vec::new();
+
+        // 遍历 A-Z 驱动器
+        for letter in 'A'..='Z' {
+            let drive_path = format!("{}:\\", letter);
+            let path = PathBuf::from(&drive_path);
+
+            if path.exists() {
+                drives.push(FileEntry {
+                    id: self.path_to_id(&path),
+                    name: format!("本地磁盘 ({}:)", letter),
+                    entry_type: EntryType::Directory,
+                    size: None,
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    icon: Some("drive".to_string()),
+                    path: drive_path,
+                });
+            }
+        }
+
+        Ok(drives)
+    }
+
+    /// Unix: 获取根目录
+    /// 在 Docker 环境下返回挂载目录列表
+    #[cfg(not(target_os = "windows"))]
+    fn get_unix_roots(&self) -> Result<Vec<FileEntry>, FsError> {
+        // 检测是否在 Docker 环境中
+        let env_info = EnvDetector::get_env_info();
+
+        if env_info.is_docker {
+            // Docker 环境：返回挂载目录列表
+            return self.get_docker_mount_points();
+        }
+
+        // 非 Docker 环境：返回根目录
+        let root = PathBuf::from("/");
+
+        if !root.exists() {
+            return Err(FsError::new(FsErrorCode::DirectoryNotFound).with_path("/"));
+        }
+
+        let metadata = fs::metadata(&root)
+            .map_err(|_| FsError::new(FsErrorCode::DirectoryReadFailed).with_path("/"))?;
+
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        Ok(vec![FileEntry {
+            id: self.path_to_id(&root),
+            name: "/".to_string(),
+            entry_type: EntryType::Directory,
+            size: None,
+            created_at,
+            updated_at: modified_at,
+            icon: Some("drive".to_string()),
+            path: "/".to_string(),
+        }])
+    }
+
+    /// Docker 环境：获取挂载目录列表
+    #[cfg(not(target_os = "windows"))]
+    fn get_docker_mount_points(&self) -> Result<Vec<FileEntry>, FsError> {
+        let mount_points = MountDetector::get_mount_points();
+
+        // 如果没有检测到挂载点，至少返回 /app（常见的 Docker 工作目录）
+        if mount_points.is_empty() {
+            let app_path = PathBuf::from("/app");
+            if app_path.exists() {
+                return Ok(vec![self.create_mount_entry(&app_path, "应用目录")?]);
+            }
+            // 如果 /app 也不存在，返回根目录
+            return Ok(vec![self.create_mount_entry(&PathBuf::from("/"), "根目录")?]);
+        }
+
+        // 转换挂载点为 FileEntry
+        let mut entries: Vec<FileEntry> = Vec::new();
+        for mount in mount_points {
+            let path = PathBuf::from(&mount.path);
+            if path.exists() {
+                if let Ok(entry) = self.create_mount_entry(&path, &mount.path) {
+                    entries.push(entry);
+                }
+            }
+        }
+
+        // 按路径排序
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+
+        Ok(entries)
+    }
+
+    /// 创建根目录/挂载点条目
+    fn create_root_entry(&self, path: &Path) -> Result<FileEntry, FsError> {
+        let name = path
+            .file_name()
+            .map(|value| value.to_string_lossy().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| path.to_string_lossy().to_string());
+
+        self.create_directory_entry(path, name)
+    }
+
+    fn create_directory_entry(
+        &self,
+        path: &Path,
+        name: impl Into<String>,
+    ) -> Result<FileEntry, FsError> {
+        let metadata = fs::metadata(path).map_err(|_| {
+            FsError::new(FsErrorCode::DirectoryReadFailed)
+                .with_path(path.to_string_lossy().to_string())
+        })?;
+
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        Ok(FileEntry {
+            id: self.path_to_id(path),
+            name: name.into(),
+            entry_type: EntryType::Directory,
+            size: None,
+            created_at,
+            updated_at: modified_at,
+            icon: Some("drive".to_string()),
+            path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    /// 创建挂载点条目
+    #[cfg(not(target_os = "windows"))]
+    fn create_mount_entry(&self, path: &PathBuf, display_name: &str) -> Result<FileEntry, FsError> {
+        self.create_directory_entry(path, display_name.to_string())
+    }
+
+    /// 将 DirEntry 转换为 FileEntry
+    fn to_file_entry(&self, entry: &DirEntry) -> Result<FileEntry, FsError> {
+        let path = entry.path();
+        let metadata = entry.metadata().map_err(|_| {
+            FsError::new(FsErrorCode::PermissionDenied)
+                .with_path(path.to_string_lossy().to_string())
+        })?;
+
+        let name = entry.file_name().to_string_lossy().to_string();
+
+        let entry_type = if metadata.is_dir() {
+            EntryType::Directory
+        } else {
+            EntryType::File
+        };
+
+        let size = if metadata.is_file() {
+            Some(metadata.len())
+        } else {
+            None
+        };
+
+        let created_at = metadata
+            .created()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|t| self.system_time_to_iso8601(t))
+            .unwrap_or_default();
+
+        let icon = get_icon_for_extension(&path);
+
+        Ok(FileEntry {
+            id: self.path_to_id(&path),
+            name,
+            entry_type,
+            size,
+            created_at,
+            updated_at: modified_at,
+            icon,
+            path: path.to_string_lossy().to_string(),
+        })
+    }
+
+    /// 对条目进行排序
+    fn sort_entries(&self, entries: &mut [FileEntry], field: &SortField, order: &SortOrder) {
+        entries.sort_by(|a, b| {
+            // 文件夹始终排在前面
+            let dir_cmp = match (&a.entry_type, &b.entry_type) {
+                (EntryType::Directory, EntryType::File) => return std::cmp::Ordering::Less,
+                (EntryType::File, EntryType::Directory) => return std::cmp::Ordering::Greater,
+                _ => std::cmp::Ordering::Equal,
+            };
+
+            if dir_cmp != std::cmp::Ordering::Equal {
+                return dir_cmp;
+            }
+
+            // 按字段排序
+            let cmp = match field {
+                SortField::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortField::Size => {
+                    let a_size = a.size.unwrap_or(0);
+                    let b_size = b.size.unwrap_or(0);
+                    a_size.cmp(&b_size)
+                }
+                SortField::CreatedAt => a.created_at.cmp(&b.created_at),
+                SortField::UpdatedAt => a.updated_at.cmp(&b.updated_at),
+            };
+
+            // 应用排序顺序
+            match order {
+                SortOrder::Asc => cmp,
+                SortOrder::Desc => cmp.reverse(),
+            }
+        });
+    }
+
+    /// 将路径转换为唯一 ID（使用哈希）
+    fn path_to_id(&self, path: &Path) -> String {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let mut hasher = DefaultHasher::new();
+        path.to_string_lossy().hash(&mut hasher);
+        format!("{:016x}", hasher.finish())
+    }
+
+    /// 将 SystemTime 转换为 ISO8601 字符串
+    fn system_time_to_iso8601(&self, time: SystemTime) -> Option<String> {
+        let datetime: DateTime<Utc> = time.into();
+        Some(datetime.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// canonicalize() 在 Windows 上返回 \\?\ 前缀，但我们的代码会剥离它。
+    /// 测试中也需要剥离后再比较。
+    fn expected_path(p: &std::path::Path) -> String {
+        let canonical = p.canonicalize().unwrap();
+        let s = canonical.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{}", rest)
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.to_string()
+        }
+    }
+
+    #[test]
+    fn test_service_new() {
+        let _service = FilesystemService::new(FilesystemConfig::default());
+        // 确保服务可以创建
+        assert!(true);
+    }
+
+    #[test]
+    fn test_get_roots() {
+        let service = FilesystemService::new(FilesystemConfig::default());
+        let roots = service.get_roots().unwrap();
+
+        #[cfg(target_os = "windows")]
+        {
+            // Windows 上至少有一个驱动器（C:）
+            assert!(!roots.is_empty());
+            assert!(roots.iter().any(|r| r.path.contains("C:\\")));
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            // Unix 上有根目录
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].path, "/");
+        }
+    }
+
+    #[test]
+    fn test_get_roots_uses_allowed_paths_and_prioritizes_default_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let alpha = temp_dir.path().join("alpha");
+        let beta = temp_dir.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![
+                alpha.to_string_lossy().to_string(),
+                beta.to_string_lossy().to_string(),
+            ],
+            default_path: Some(beta.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let roots = service.get_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+        assert_eq!(roots[0].path, expected_path(&beta));
+        assert_eq!(roots[1].path, expected_path(&alpha));
+    }
+
+    #[test]
+    fn test_list_current_directory() {
+        let service = FilesystemService::new(FilesystemConfig::default());
+        let current_dir = std::env::current_dir().unwrap();
+
+        let req = ListRequest {
+            path: current_dir.to_string_lossy().to_string(),
+            page: 0,
+            page_size: 100,
+            sort_field: SortField::Name,
+            sort_order: SortOrder::Asc,
+            keyword: None,
+        };
+
+        let response = service.list_directory(&req);
+        assert!(response.is_ok());
+
+        let list = response.unwrap();
+        assert_eq!(list.page, 0);
+        // total 是 usize 类型，验证列表返回成功即可
+        let _ = list.total;
+    }
+
+    #[test]
+    fn test_allowed_root_has_no_parent_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root = temp_dir.path().join("myroot");
+        let child = root.join("child");
+        std::fs::create_dir_all(&child).unwrap();
+        std::fs::write(child.join("file.txt"), "test").unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![root.to_string_lossy().to_string()],
+            ..Default::default()
+        });
+
+        // 在白名单根目录列出内容时，parent_path 应为 None
+        let req = ListRequest {
+            path: root.to_string_lossy().to_string(),
+            page: 0,
+            page_size: 100,
+            sort_field: SortField::Name,
+            sort_order: SortOrder::Asc,
+            keyword: None,
+        };
+        let resp = service.list_directory(&req).unwrap();
+        assert!(
+            resp.parent_path.is_none(),
+            "白名单根目录的 parent_path 应为 None，实际: {:?}",
+            resp.parent_path
+        );
+
+        // 子目录应有 parent_path
+        let req2 = ListRequest {
+            path: child.to_string_lossy().to_string(),
+            page: 0,
+            page_size: 100,
+            sort_field: SortField::Name,
+            sort_order: SortOrder::Asc,
+            keyword: None,
+        };
+        let resp2 = service.list_directory(&req2).unwrap();
+        assert!(
+            resp2.parent_path.is_some(),
+            "子目录的 parent_path 不应为 None"
+        );
+    }
+
+    #[test]
+    fn test_same_name_roots_are_disambiguated() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dir_a = temp_dir.path().join("a").join("projects");
+        let dir_b = temp_dir.path().join("b").join("projects");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![
+                dir_a.to_string_lossy().to_string(),
+                dir_b.to_string_lossy().to_string(),
+            ],
+            ..Default::default()
+        });
+
+        let roots = service.get_roots().unwrap();
+        assert_eq!(roots.len(), 2);
+
+        // 两个同名目录的 name 应该不同（包含路径信息）
+        assert_ne!(
+            roots[0].name, roots[1].name,
+            "同名白名单根目录应当被消歧：{} vs {}",
+            roots[0].name, roots[1].name
+        );
+        // 名称中应包含 "projects"
+        assert!(roots[0].name.contains("projects"));
+        assert!(roots[1].name.contains("projects"));
+    }
+
+    #[test]
+    fn test_get_roots_with_default_returns_default_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let alpha = temp_dir.path().join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+
+        let service = FilesystemService::new(FilesystemConfig {
+            allowed_paths: vec![alpha.to_string_lossy().to_string()],
+            default_path: Some(alpha.to_string_lossy().to_string()),
+            ..Default::default()
+        });
+
+        let resp = service.get_roots_with_default().unwrap();
+        assert!(resp.default_path.is_some());
+        assert_eq!(resp.default_path.unwrap(), expected_path(&alpha));
+    }
+}

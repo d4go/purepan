@@ -1,0 +1,31 @@
+# Git
+.git
+.gitignore
+
+# 前端依赖与构建产物
+frontend/node_modules
+frontend/dist
+
+# Rust 编译产物
+backend/target
+target
+
+# 运行时数据目录
+downloads
+logs
+wal
+data
+
+# 配置文件（保留示例）
+config/app.toml
+config/*.json
+
+# 数据库文件
+*.db
+*-shm
+*-wal
+
+# 其他
+.qoder
+.DS_Store
+*.log

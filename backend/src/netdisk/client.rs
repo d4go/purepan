@@ -1,0 +1,5639 @@
+// 网盘客户端实现
+
+use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
+use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
+use crate::auth::UserAuth;
+use crate::common::ProxyConfig;
+use crate::netdisk::{
+    CreateFileResponse, FileListResponse, FileManagerResponse, FileManagerTaskQueryResponse,
+    FileOperationErrorPayload, FileOperationItem, FileOperationOutcome, FileOperationSuccess,
+    LocateDownloadResponse, PrecreateResponse, RapidUploadResponse, RenameItem,
+    UploadChunkResponse, UploadErrorKind,
+};
+use crate::sign::LocateSign;
+use anyhow::{Context, Result};
+use reqwest::cookie::CookieStore;
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::multipart;
+use reqwest::Client;
+use serde_json::Value;
+use tokio::sync::Mutex;
+use tracing::{debug, error, info, warn};
+
+/// 分块删除时单次删除请求最多包含的文件数。
+///
+/// 删除大目录会按内部递归文件总数计费,超过阈值会触发百度二次安全验证(errno=132)。
+/// 这里取较保守的默认值以尽量避免触发;可用环境变量 `BAIDUPCS_DELETE_CHUNK_SIZE` 覆盖。
+const DELETE_CHUNK_SIZE: usize = 100;
+
+/// 分块删除每批之间的基础间隔（毫秒）。配合 ±`DELETE_BATCH_JITTER_RATIO` 抖动,
+/// 降低「连续高频删除」被频率风控的概率。可用 `BAIDUPCS_DELETE_BATCH_DELAY_MS` 覆盖。
+const DELETE_BATCH_DELAY_MS: u64 = 400;
+
+/// 分块删除批次间隔的抖动比例（±比例）。可用 `BAIDUPCS_DELETE_BATCH_JITTER_RATIO` 覆盖。
+const DELETE_BATCH_JITTER_RATIO: f64 = 0.5;
+
+/// 单批删除命中 errno=132 时的退避重试次数（不含首次）。
+/// 重试用指数退避 + 抖动等待,给账号的瞬时风控一个缓冲;耗尽仍 132 才上报需人工验证。
+/// 可用 `BAIDUPCS_DELETE_RISK_RETRIES` 覆盖（设 0 关闭重试）。
+const DELETE_RISK_RETRIES: u32 = 3;
+
+/// errno=132 退避重试的基础等待（毫秒）,第 n 次等待 ≈ base × 2^n ± 抖动。
+/// 可用 `BAIDUPCS_DELETE_RISK_BACKOFF_MS` 覆盖。
+const DELETE_RISK_BACKOFF_MS: u64 = 1500;
+
+/// 百度网盘客户端
+#[derive(Debug, Clone)]
+pub struct NetdiskClient {
+    /// HTTP客户端
+    client: Client,
+    /// Cookie Jar (用于调试和检查 Cookie 状态)
+    cookie_jar: std::sync::Arc<reqwest::cookie::Jar>,
+    /// 用户认证信息
+    user_auth: UserAuth,
+    /// Android 端 User-Agent（用于 Locate/下载等接口）
+    mobile_user_agent: String,
+    /// Web 端 User-Agent（PCS/浏览器接口需要）
+    web_user_agent: String,
+    /// Web 会话是否已预热（保留供将来使用）
+    #[allow(dead_code)]
+    web_session_ready: std::sync::Arc<Mutex<bool>>,
+    /// PANPSC Cookie 值（从预热过程中提取）
+    panpsc_cookie: std::sync::Arc<Mutex<Option<String>>>,
+    /// bdstoken（/api/loginStatus 或 /api/gettemplatevariable 返回）
+    bdstoken: std::sync::Arc<Mutex<Option<String>>>,
+    /// 代理配置（用于临时客户端创建）
+    proxy_config: Option<ProxyConfig>,
+    /// 代理故障回退管理器
+    pub(crate) fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
+}
+
+impl NetdiskClient {
+    /// 创建新的网盘客户端
+    ///
+    /// # 参数
+    /// * `user_auth` - 用户认证信息（包含BDUSS）
+    pub fn new(user_auth: UserAuth) -> Result<Self> {
+        Self::new_with_proxy(user_auth, None, None)
+    }
+
+    /// 创建新的网盘客户端（支持代理配置）
+    ///
+    /// # 参数
+    /// * `user_auth` - 用户认证信息（包含BDUSS）
+    /// * `proxy_config` - 可选的代理配置
+    /// * `fallback_mgr` - 可选的代理故障回退管理器
+    pub fn new_with_proxy(
+        user_auth: UserAuth,
+        proxy_config: Option<&ProxyConfig>,
+        fallback_mgr: Option<std::sync::Arc<crate::common::ProxyFallbackManager>>,
+    ) -> Result<Self> {
+        use reqwest::cookie::Jar;
+        use std::sync::Arc;
+
+        // 1. 先创建启用了自动 Cookie 管理的客户端
+        info!("初始化网盘客户端,启用自动 Cookie 管理");
+
+        let jar = Arc::new(Jar::default());
+        let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+
+        // 2. 如果有保存的 Cookie,手动初始化到 Cookie Jar
+        // 这些 Cookie 来自之前的登录会话 (从 session.json 加载)
+        // 如果没有保存的 cookies,至少要添加 BDUSS/PTOKEN
+        info!("手动添加 BDUSS/PTOKEN");
+        let bduss_cookie = format!("BDUSS={}; Domain=.baidu.com; Path=/", user_auth.bduss);
+        jar.add_cookie_str(&bduss_cookie, &url);
+
+        if let Some(ref ptoken) = user_auth.ptoken {
+            let ptoken_cookie = format!("PTOKEN={}; Domain=.baidu.com; Path=/", ptoken);
+            jar.add_cookie_str(&ptoken_cookie, &url);
+        }
+        if let Some(ref stoken) = user_auth.stoken {
+            let stoken_cookie = format!("STOKEN={}; Domain=.baidu.com; Path=/", stoken);
+            jar.add_cookie_str(&stoken_cookie, &url);
+        }
+        if let Some(ref baiduid) = user_auth.baiduid {
+            let baiduid_cookie = format!("BAIDUID={}; Domain=.baidu.com; Path=/", baiduid);
+            jar.add_cookie_str(&baiduid_cookie, &url);
+        }
+        if let Some(ref passid) = user_auth.passid {
+            let passid_cookie = format!("PASSID={}; Domain=.baidu.com; Path=/", passid);
+            jar.add_cookie_str(&passid_cookie, &url);
+        }
+
+        // 加载预热后的 Cookie (如果有的话)
+        if let Some(ref panpsc) = user_auth.panpsc {
+            let panpsc_cookie = format!("PANPSC={}; Domain=.baidu.com; Path=/", panpsc);
+            jar.add_cookie_str(&panpsc_cookie, &url);
+        }
+        if let Some(ref csrf_token) = user_auth.csrf_token {
+            let csrf_cookie = format!("csrfToken={}; Domain=.baidu.com; Path=/", csrf_token);
+            jar.add_cookie_str(&csrf_cookie, &url);
+        }
+
+        // 打印初始化后的 Cookie（调试）
+        info!("初始化后的 Cookie:");
+        let init_cookies = jar.cookies(&url);
+        if let Some(cookie_header) = init_cookies {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                for cookie in cookie_str.split("; ") {
+                    let name = cookie.split('=').next().unwrap_or("");
+                    info!("  已添加: {}", name);
+                }
+            }
+        }
+
+        // 3. 创建客户端,使用 cookie_provider 自动管理 Cookie
+        // 后续请求会自动收集服务器返回的 Set-Cookie
+        // 注意: 不要禁用重定向 (Policy::none())，否则 Cookie Jar 可能无法正确携带 Cookie
+        let mut builder = Client::builder()
+            .cookie_provider(Arc::clone(&jar))
+            .timeout(std::time::Duration::from_secs(60))
+            .redirect(reqwest::redirect::Policy::limited(10)); // 允许最多 10 次重定向
+
+        // 应用代理配置
+        if let Some(proxy) = proxy_config {
+            builder = proxy.apply_to_builder(builder)?;
+        }
+
+        let client = builder
+            .build()
+            .context("Failed to create HTTP client")?;
+
+        info!(
+            "初始化网盘客户端成功, UID={}, PTOKEN={}",
+            user_auth.uid,
+            if user_auth.ptoken.is_some() {
+                "已设置"
+            } else {
+                "未设置"
+            }
+        );
+
+        // 初始化预热相关字段
+        let panpsc_cookie = std::sync::Arc::new(Mutex::new(user_auth.panpsc.clone()));
+        let bdstoken = std::sync::Arc::new(Mutex::new(user_auth.bdstoken.clone()));
+        let web_session_ready = std::sync::Arc::new(Mutex::new(
+            // 如果已有预热 Cookie,标记为已预热
+            user_auth.panpsc.is_some()
+                && user_auth.csrf_token.is_some()
+                && user_auth.bdstoken.is_some(),
+        ));
+
+        Ok(Self {
+            client,
+            cookie_jar: jar,
+            user_auth,
+            mobile_user_agent: Self::default_mobile_user_agent(),
+            web_user_agent: Self::default_web_user_agent(),
+            web_session_ready,
+            panpsc_cookie,
+            bdstoken,
+            proxy_config: proxy_config.cloned(),
+            fallback_mgr,
+        })
+    }
+
+    /// 创建带代理配置的临时客户端（禁用 cookie_store，手动控制 Cookie）
+    fn build_temp_client_with_proxy(&self) -> Result<Client> {
+        let mut builder = Client::builder()
+            .cookie_store(false)
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(30));
+        if let Some(ref proxy) = self.proxy_config {
+            builder = proxy.apply_to_builder(builder)?;
+        }
+        Ok(builder.build()?)
+    }
+
+    /// 记录 API 请求结果到代理回退管理器
+    ///
+    /// 成功时重置连续失败计数，失败时（仅代理/连接错误）递增失败计数。
+    /// 仅在使用代理且未回退到直连时生效。
+    fn record_proxy_result(&self, result: &Result<(), &anyhow::Error>) {
+        if let Some(ref mgr) = self.fallback_mgr {
+            if mgr.is_fallen_back() {
+                return; // 已回退到直连，不记录
+            }
+            match result {
+                Ok(()) => {
+                    mgr.record_success();
+                }
+                Err(e) => {
+                    if crate::common::proxy_fallback::is_proxy_or_connection_error(e) {
+                        let should_fallback = mgr.record_failure();
+                        if should_fallback {
+                            warn!("NetdiskClient: 代理连续失败达到阈值，触发回退到直连");
+                            // 执行完整回退流程：标记状态 + 热更新 + 启动探测任务
+                            let mgr_clone = std::sync::Arc::clone(mgr);
+                            tokio::spawn(async move {
+                                let allow = mgr_clone.user_proxy_config().await
+                                    .map(|c| c.allow_fallback)
+                                    .unwrap_or(true);
+                                if allow {
+                                    mgr_clone.execute_fallback().await;
+                                }
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 记录 API 请求成功到代理回退管理器（简化版，用于请求成功后调用）
+    fn record_proxy_success(&self) {
+        self.record_proxy_result(&Ok(()));
+    }
+
+    /// 记录 API 请求失败到代理回退管理器（简化版，用于请求失败后调用）
+    fn record_proxy_failure(&self, error: &anyhow::Error) {
+        self.record_proxy_result(&Err(error));
+    }
+
+    /// 打印 Cookie Jar 中的 Cookie（用于调试）
+    fn debug_print_cookies(&self, context: &str) {
+        let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+        let cookies = self.cookie_jar.cookies(&url);
+
+        if let Some(cookie_header) = cookies {
+            if let Ok(cookie_str) = cookie_header.to_str() {
+                info!("Cookie Jar 内容 [{}]:", context);
+                // 按分号分割并打印每个 Cookie
+                for cookie in cookie_str.split("; ") {
+                    if cookie.split_once('=').is_some() {
+                        // 对于敏感 Cookie，只显示名称和值的前几个字符
+                        if cookie.len() > 50 {
+                            info!("  {}...", &cookie[..50]);
+                        } else {
+                            info!("  {}", cookie);
+                        }
+                    }
+                }
+                info!("  总共 {} 个 Cookie", cookie_str.split("; ").count());
+            }
+        } else {
+            warn!("Cookie Jar 为空 [{}]", context);
+        }
+    }
+
+    /// 默认移动端 User-Agent（模拟网盘 Android 客户端）
+    /// Locate 下载 API 需要此 UA
+    fn default_mobile_user_agent() -> String {
+        "netdisk;P2SP;3.0.0.8;netdisk;11.12.3;ANG-AN00;android-android;10.0;JSbridge4.4.0;jointBridge;1.1.0;".to_string()
+    }
+
+    /// 默认 Web 端 User-Agent（模拟 PC 浏览器）
+    /// 注意: 必须与登录时的 UA 完全一致 (复用 auth/constants.rs 的 USER_AGENT)
+    fn default_web_user_agent() -> String {
+        WEB_USER_AGENT.to_string()
+    }
+
+    /// 确保 Web 会话已预热（用于获取 BAIDUID / PANPSC 等 Cookie）
+    #[allow(dead_code)]
+    async fn ensure_web_session(&self) -> Result<()> {
+        {
+            let ready = self.web_session_ready.lock().await;
+            if *ready {
+                return Ok(());
+            }
+        }
+
+        self.perform_web_warmup().await?;
+
+        let mut ready = self.web_session_ready.lock().await;
+        *ready = true;
+        Ok(())
+    }
+
+    /// 访问若干 pan/yun 页面，触发服务端下发 Web 所需 Cookie
+    pub async fn perform_web_warmup(&self) -> Result<()> {
+        info!("======== 开始 Web 预热，准备获取 PAN/PCS 所需 Cookie ========");
+
+        // 统一的 UA 和 Referer
+        let ua = &self.web_user_agent;
+        let referer_home = "https://pan.baidu.com/disk/home";
+
+        //--------------------------------------------------------------
+        // 提供一个统一的执行器：发送请求 + 检查重定向 + 写 Cookie + 检查登录
+        // 注意：使用正常客户端（允许重定向），检查最终 URL 而不是 Location header
+        //--------------------------------------------------------------
+        async fn exec_request(
+            _client: &reqwest::Client,
+            req: reqwest::RequestBuilder,
+            step: &str,
+            panpsc_storage: &std::sync::Arc<Mutex<Option<String>>>,
+        ) -> Result<String> {
+            if let Some(cloned_builder) = req.try_clone() {
+                if let Ok(debug_req) = cloned_builder.build() {
+                    let url = debug_req.url().clone();
+                    let ua = debug_req
+                        .headers()
+                        .get("User-Agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<missing>");
+                    let referer = debug_req
+                        .headers()
+                        .get("Referer")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or("<missing>");
+                    if step.contains("/disk/home") {
+                        info!(
+                            "{}: 请求头快照 -> UA={}, Referer={}, Cookie={}...",
+                            step,
+                            ua,
+                            referer,
+                            debug_req
+                                .headers()
+                                .get("Cookie")
+                                .and_then(|v| v.to_str().ok())
+                                .map(|v| v.chars().take(120).collect::<String>())
+                                .unwrap_or_else(|| "<missing>".to_string())
+                        );
+                    } else {
+                        debug!("{}: 请求头快照 -> UA={}, Referer={}", step, ua, referer);
+                    }
+                    debug!("{}: 最终请求 URL = {}", step, url);
+                }
+            }
+
+            let resp = req.send().await.context(format!("{} 请求失败", step))?;
+
+            let status = resp.status();
+            let final_url = resp.url().to_string();
+
+            // 检查 Location header（重定向目标）
+            let location = resp.headers().get("location");
+            if let Some(loc) = location {
+                if let Ok(loc_str) = loc.to_str() {
+                    info!("{}: Location header: {}", step, loc_str);
+                    // 如果 Location 指向登录页，说明 BDUSS 失效
+                    if loc_str.contains("passport.baidu.com")
+                        || loc_str.contains("wappass.baidu.com")
+                        || loc_str == "/"
+                    {
+                        anyhow::bail!(
+                            "BDUSS 已失效 ({} Location header 指向登录页: {})",
+                            step,
+                            loc_str
+                        );
+                    }
+                }
+            }
+
+            info!("{}: status={}, final_url={}", step, status, final_url);
+
+            // 检查最终 URL 是否重定向到登录页（代表 BDUSS 失效）
+            // 对于 /disk/home，如果最终 URL 是登录页，说明有问题
+            if step.contains("/disk/home")
+                && (final_url.contains("passport.baidu.com")
+                || final_url.contains("wappass.baidu.com")
+                || final_url.contains("pan.baidu.com/login"))
+            {
+                anyhow::bail!(
+                        "BDUSS 已失效或请求参数错误 ({} 最终重定向到 {})",
+                        step,
+                        final_url
+                    );
+            }
+
+            // 打印 Set-Cookie 并提取 PANPSC
+            let mut count = 0;
+            for ck in resp.headers().get_all("set-cookie") {
+                if let Ok(s) = ck.to_str() {
+                    let mut parts = s.split(';');
+                    let kv = parts.next().unwrap_or("unknown");
+                    let (name, value_preview) = if let Some((n, v)) = kv.split_once('=') {
+                        (
+                            n,
+                            if v.len() > 60 {
+                                format!("{}...", &v[..60])
+                            } else {
+                                v.to_string()
+                            },
+                        )
+                    } else {
+                        (kv, "<no-value>".to_string())
+                    };
+
+                    let mut domain = "<none>";
+                    let mut path = "<none>";
+                    let mut expires = "<none>";
+                    for attr in parts.clone() {
+                        let attr_trim = attr.trim();
+                        let lower = attr_trim.to_lowercase();
+                        if lower.starts_with("domain=") {
+                            domain = &attr_trim[7..];
+                        } else if lower.starts_with("path=") {
+                            path = &attr_trim[5..];
+                        } else if lower.starts_with("expires=") {
+                            expires = &attr_trim[8..];
+                        } else if lower.starts_with("max-age=") {
+                            expires = attr_trim;
+                        }
+                    }
+
+                    count += 1;
+                    info!(
+                        "{}: Set-Cookie[{}] {}={} (domain={}, path={}, expires={})",
+                        step, count, name, value_preview, domain, path, expires
+                    );
+
+                    if name.eq_ignore_ascii_case("BDUSS") && value_preview.trim().is_empty() {
+                        warn!("{}: 收到清空 BDUSS 的 Set-Cookie！完整内容: {}", step, s);
+                    }
+
+                    if name == "PANPSC" {
+                        if let Some((_, full_value)) = kv.split_once('=') {
+                            if full_value.is_empty() {
+                                warn!("{}: PANPSC Cookie 值为空！完整 Set-Cookie: {}", step, s);
+                            } else {
+                                let mut panpsc = panpsc_storage.lock().await;
+                                *panpsc = Some(full_value.to_string());
+                                info!(
+                                    "{}: 提取到 PANPSC Cookie 值 (长度={}): {}...",
+                                    step,
+                                    full_value.len(),
+                                    &full_value[..full_value.len().min(20)]
+                                );
+                            }
+                        } else {
+                            warn!("{}: PANPSC Set-Cookie 格式错误，未找到 '=': {}", step, s);
+                        }
+                    }
+                }
+            }
+            info!("{}: 本次收到 {} 个 Cookie", step, count);
+
+            let body = resp
+                .text()
+                .await
+                .context(format!("{}: 读取响应失败", step))?;
+
+            // 打印响应体长度（用于调试）
+            info!("{}: 响应体长度: {} 字节", step, body.len());
+
+            // 打印 /api/loginStatus 的完整响应
+            if step.contains("/api/loginStatus") {
+                info!("{}: 完整响应内容: {}", step, body);
+            }
+
+            // 若返回登录页则说明 BDUSS 失效
+            if body.contains("passport.baidu.com") && body.contains("登录") {
+                anyhow::bail!("BDUSS 已失效（{} 响应出现登录页）", step);
+            }
+
+            Ok(body)
+        }
+
+        // 使用正常的带 CookieJar 的 Client（允许重定向）
+        let client = &self.client;
+
+        //--------------------------------------------------------------
+        // STEP 1: /disk/home
+        //--------------------------------------------------------------
+        info!("步骤 1/4：访问 /disk/home");
+        let home_url = "https://pan.baidu.com/disk/home";
+        self.debug_print_cookies("步骤 1/4 前 Cookie 状态");
+
+        let simple_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+        let _body1 = exec_request(
+            client,
+            client.get(home_url).header("User-Agent", simple_ua),
+            "步骤 1/4 (/disk/home)",
+            &self.panpsc_cookie,
+        )
+            .await?;
+
+        self.debug_print_cookies("步骤 1/4 后 Cookie 状态");
+
+        //--------------------------------------------------------------
+        // STEP 2: /api/loginStatus
+        //--------------------------------------------------------------
+        info!("步骤 2/4：访问 /api/loginStatus");
+
+        let login_status_url = format!(
+            "https://pan.baidu.com/api/loginStatus?clienttype=0&app_id={}&web=1",
+            BAIDU_APP_ID
+        );
+        self.debug_print_cookies("步骤 2/4 前 Cookie 状态");
+
+        let body2 = exec_request(
+            client,
+            client
+                .get(&login_status_url)
+                .header("User-Agent", ua)
+                .header("Referer", referer_home),
+            "步骤 2/4 (/api/loginStatus)",
+            &self.panpsc_cookie,
+        )
+            .await?;
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
+            if let Some(bdstoken) = json["login_info"]["bdstoken"].as_str() {
+                info!("步骤 2/4: loginStatus 返回 bdstoken = {}", bdstoken);
+                let mut cached = self.bdstoken.lock().await;
+                *cached = Some(bdstoken.to_string());
+            } else {
+                warn!("步骤 2/4: loginStatus 响应缺少 bdstoken 字段");
+            }
+        } else {
+            warn!("步骤 2/4: loginStatus 响应 JSON 解析失败，无法提取 bdstoken");
+        }
+
+        self.debug_print_cookies("步骤 2/4 后 Cookie 状态");
+
+        //--------------------------------------------------------------
+        // STEP 3: /api/gettemplatevariable
+        //--------------------------------------------------------------
+        info!("步骤 3/4：访问 /api/gettemplatevariable");
+
+        let bdstoken_url = format!(
+            r#"https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id={}&web=1&fields=["bdstoken"]"#,
+            BAIDU_APP_ID
+        );
+        self.debug_print_cookies("步骤 3/4 前 Cookie 状态");
+
+        let body3 = exec_request(
+            client,
+            client
+                .get(&bdstoken_url)
+                .header("User-Agent", ua)
+                .header("Referer", referer_home),
+            "步骤 3/4 (/api/gettemplatevariable)",
+            &self.panpsc_cookie,
+        )
+            .await?;
+
+        // 提取 bdstoken
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body3) {
+            if let Some(bdstoken) = json["result"]["bdstoken"].as_str() {
+                info!("步骤 3/4: 成功获取 bdstoken = {}", bdstoken);
+                let mut cached = self.bdstoken.lock().await;
+                *cached = Some(bdstoken.to_string());
+            } else {
+                warn!("步骤 3/4: gettemplatevariable 响应缺少 bdstoken");
+            }
+        } else {
+            warn!("步骤 3/4: gettemplatevariable 响应 JSON 解析失败");
+        }
+
+        self.debug_print_cookies("步骤 3/4 后 Cookie 状态");
+
+        //--------------------------------------------------------------
+        // STEP 4: /pcloud/user/getinfo
+        //--------------------------------------------------------------
+        info!("步骤 4/4：访问 /pcloud/user/getinfo");
+
+        let userinfo_url = format!(
+            "https://pan.baidu.com/pcloud/user/getinfo?method=userinfo&clienttype=0&app_id={}&web=1&query_uk={}",
+            BAIDU_APP_ID,
+            self.user_auth.uid
+        );
+        self.debug_print_cookies("步骤 4/4 前 Cookie 状态");
+
+        let _body4 = exec_request(
+            client,
+            client
+                .get(&userinfo_url)
+                .header("User-Agent", ua)
+                .header("Referer", referer_home),
+            "步骤 4/4 (/pcloud/user/getinfo)",
+            &self.panpsc_cookie,
+        )
+            .await?;
+
+        self.debug_print_cookies("步骤 4/4 后 Cookie 状态");
+
+        //--------------------------------------------------------------
+        // FINAL OK
+        //--------------------------------------------------------------
+        info!("======== Web 预热完成，所有 Cookie 已准备就绪！ ========");
+        info!("Cookie Jar 应包含:");
+        info!("- BDUSS, STOKEN, PTOKEN");
+        info!("- PANPSC, ndut (步骤 1)");
+        info!("- pcsett (步骤 2)");
+        info!("- bdstoken (步骤 3 Body)");
+
+        self.debug_print_cookies("预热完成 - 最终状态");
+
+        Ok(())
+    }
+
+    /// 执行预热并返回预热后的 Cookie 数据
+    ///
+    /// 返回: (panpsc, csrf_token, bdstoken, stoken)
+    ///
+    /// 包含重试机制：最多 3 次，间隔指数退避（1秒、3秒、5秒）
+    /// 预热前会先验证 BDUSS 是否有效，重试前会恢复被清空的 Cookie
+    pub async fn warmup_and_get_cookies(
+        &self,
+    ) -> Result<(
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> {
+        const MAX_RETRIES: u32 = 3;
+        const RETRY_DELAYS: [u64; 3] = [1, 3, 5]; // 指数退避：1秒、3秒、5秒
+
+        // 如果没有 PTOKEN，检查是否有 PANPSC（从浏览器 Cookie 直接粘贴时可能已有）
+        if self.user_auth.ptoken.is_none() {
+            if self.user_auth.panpsc.is_some() {
+                info!("PTOKEN 为空，但检测到已有 PANPSC，尝试快捷路径直接获取 bdstoken...");
+                match self.fetch_bdstoken_with_panpsc().await {
+                    Ok(Some(bdstoken)) => {
+                        info!("✅ 快捷路径成功：通过 PANPSC 获取到 bdstoken");
+                        let panpsc = self.user_auth.panpsc.clone();
+                        let stoken = self.user_auth.stoken.clone();
+                        return Ok((panpsc, None, Some(bdstoken), stoken));
+                    }
+                    Ok(None) => {
+                        warn!("快捷路径：PANPSC 已有但 bdstoken 未能提取，跳过预热");
+                    }
+                    Err(e) => {
+                        warn!("快捷路径失败: {}，跳过预热", e);
+                    }
+                }
+            } else {
+                info!("PTOKEN 为空且无 PANPSC，跳过预热");
+            }
+            return Ok((None, None, None, None));
+        }
+
+        // 预热前先验证 BDUSS 是否有效
+        if !self.verify_bduss().await {
+            return Err(anyhow::anyhow!("BDUSS 已失效，请重新登录"));
+        }
+
+        let mut last_error: Option<anyhow::Error> = None;
+
+        for attempt in 0..MAX_RETRIES {
+            if attempt > 0 {
+                let delay_secs = RETRY_DELAYS.get(attempt as usize - 1).copied().unwrap_or(5);
+                warn!(
+                    "预热失败，{}秒后进行第 {}/{} 次重试...",
+                    delay_secs,
+                    attempt + 1,
+                    MAX_RETRIES
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(delay_secs)).await;
+
+                // 重试前恢复被清空的 Cookie（防止重定向导致 BDUSS 被删除）
+                self.restore_essential_cookies();
+            }
+
+            match self.perform_web_warmup().await {
+                Ok(()) => {
+                    self.record_proxy_success();
+                    if attempt > 0 {
+                        info!("预热重试成功（第 {} 次尝试）", attempt + 1);
+                    }
+
+                    // 提取预热后的 Cookie
+                    let panpsc = self.panpsc_cookie.lock().await.clone();
+                    let bdstoken = self.bdstoken.lock().await.clone();
+
+                    // 从 Cookie Jar 提取 csrfToken 和 STOKEN
+                    let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+                    let cookies = self.cookie_jar.cookies(&url);
+                    let mut csrf_token = None;
+                    let mut stoken = None;
+
+                    if let Some(cookie_header) = cookies {
+                        if let Ok(cookie_str) = cookie_header.to_str() {
+                            for cookie in cookie_str.split("; ") {
+                                if let Some((name, value)) = cookie.split_once('=') {
+                                    match name {
+                                        "csrfToken" => csrf_token = Some(value.to_string()),
+                                        "STOKEN" => stoken = Some(value.to_string()),
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    info!(
+                        "预热完成,提取到 Cookie: PANPSC={}, csrfToken={}, bdstoken={}, STOKEN={}",
+                        panpsc.is_some(),
+                        csrf_token.is_some(),
+                        bdstoken.is_some(),
+                        stoken.is_some()
+                    );
+
+                    return Ok((panpsc, csrf_token, bdstoken, stoken));
+                }
+                Err(e) => {
+                    self.record_proxy_failure(&e);
+                    warn!("预热第 {} 次尝试失败: {}", attempt + 1, e);
+                    last_error = Some(e);
+                }
+            }
+        }
+
+        // 所有重试都失败
+        error!("预热失败，已达到最大重试次数 ({})", MAX_RETRIES);
+        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("预热失败，未知错误")))
+    }
+
+    /// 恢复必要的 Cookie 到 Cookie Jar（用于重试时恢复被清空的 Cookie）
+    ///
+    /// 当百度服务器返回 `Set-Cookie: BDUSS=;` 时，Cookie Jar 会自动覆盖原有值，
+    /// 导致后续请求失败。此方法用于在重试前重新添加必要的 Cookie。
+    fn restore_essential_cookies(&self) {
+        let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+
+        // 重新添加 BDUSS
+        let bduss_cookie = format!("BDUSS={}; Domain=.baidu.com; Path=/", self.user_auth.bduss);
+        self.cookie_jar.add_cookie_str(&bduss_cookie, &url);
+
+        // 重新添加 STOKEN
+        if let Some(ref stoken) = self.user_auth.stoken {
+            let stoken_cookie = format!("STOKEN={}; Domain=.baidu.com; Path=/", stoken);
+            self.cookie_jar.add_cookie_str(&stoken_cookie, &url);
+        }
+
+        // 重新添加 PTOKEN
+        if let Some(ref ptoken) = self.user_auth.ptoken {
+            let ptoken_cookie = format!("PTOKEN={}; Domain=.baidu.com; Path=/", ptoken);
+            self.cookie_jar.add_cookie_str(&ptoken_cookie, &url);
+        }
+
+        info!("已恢复 BDUSS/STOKEN/PTOKEN 到 Cookie Jar");
+    }
+
+    /// 在已有 PANPSC 的情况下，直接请求 /api/loginStatus 获取 bdstoken
+    ///
+    /// 当用户从浏览器粘贴了包含 PANPSC 但不含 PTOKEN 的 Cookie 时使用。
+    /// PANPSC 已由 new_with_proxy 加入 cookie jar，直接发起请求即可。
+    /// 返回 `Ok(Some(bdstoken))` 表示成功，`Ok(None)` 表示响应中没有 bdstoken。
+    async fn fetch_bdstoken_with_panpsc(&self) -> anyhow::Result<Option<String>> {
+        info!("fetch_bdstoken_with_panpsc: 使用已有 PANPSC 请求 bdstoken...");
+
+        let ua = &self.web_user_agent;
+        let referer = "https://pan.baidu.com/disk/home";
+
+        // 1. 先尝试 /api/loginStatus（同预热步骤 2）
+        let login_status_url = format!(
+            "https://pan.baidu.com/api/loginStatus?clienttype=0&app_id={}&web=1",
+            BAIDU_APP_ID
+        );
+
+        let resp = self
+            .client
+            .get(&login_status_url)
+            .header("User-Agent", ua)
+            .header("Referer", referer)
+            .send()
+            .await
+            .context("fetch_bdstoken: /api/loginStatus 请求失败")?;
+
+        let body = resp
+            .text()
+            .await
+            .context("fetch_bdstoken: 读取响应失败")?;
+
+        info!("fetch_bdstoken: /api/loginStatus 响应 = {}", body);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(token) = json["login_info"]["bdstoken"].as_str() {
+                if !token.is_empty() {
+                    info!("fetch_bdstoken: 从 loginStatus 获取到 bdstoken（长度={}）", token.len());
+                    let mut cached = self.bdstoken.lock().await;
+                    *cached = Some(token.to_string());
+                    return Ok(Some(token.to_string()));
+                }
+            }
+        }
+
+        // 2. 回退到 /api/gettemplatevariable（同预热步骤 3）
+        let tmpl_url = format!(
+            r#"https://pan.baidu.com/api/gettemplatevariable?clienttype=0&app_id={}&web=1&fields=["bdstoken"]"#,
+            BAIDU_APP_ID
+        );
+
+        let resp2 = self
+            .client
+            .get(&tmpl_url)
+            .header("User-Agent", ua)
+            .header("Referer", referer)
+            .send()
+            .await
+            .context("fetch_bdstoken: /api/gettemplatevariable 请求失败")?;
+
+        let body2 = resp2
+            .text()
+            .await
+            .context("fetch_bdstoken: 读取 gettemplatevariable 响应失败")?;
+
+        info!("fetch_bdstoken: /api/gettemplatevariable 响应 = {}", body2);
+
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body2) {
+            if let Some(token) = json["result"]["bdstoken"].as_str() {
+                if !token.is_empty() {
+                    info!("fetch_bdstoken: 从 gettemplatevariable 获取到 bdstoken（长度={}）", token.len());
+                    let mut cached = self.bdstoken.lock().await;
+                    *cached = Some(token.to_string());
+                    return Ok(Some(token.to_string()));
+                }
+            }
+        }
+
+        warn!("fetch_bdstoken: 两个接口均未返回有效 bdstoken，PANPSC 可能已失效");
+        Ok(None)
+    }
+
+    /// 验证 BDUSS 是否有效
+    ///
+    /// 通过调用网盘用户信息接口来验证 BDUSS
+    /// 复用 QRCodeAuth::verify_bduss 相同的 API 逻辑
+    async fn verify_bduss(&self) -> bool {
+        info!("验证 BDUSS 是否有效...");
+
+        let url = format!(
+            "{}?method=query&clienttype={}&app_id={}&web=1",
+            API_USER_INFO, CLIENT_TYPE, BAIDU_APP_ID
+        );
+
+        match self
+            .client
+            .get(&url)
+            .header("Cookie", format!("BDUSS={}", self.user_auth.bduss))
+            .header("User-Agent", USER_AGENT)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                match resp.json::<Value>().await {
+                    Ok(json) => {
+                        // 检查 user_info 是否存在且有效
+                        let user_info = &json["user_info"];
+                        let uk = user_info["uk"].as_u64().unwrap_or(0);
+                        if uk > 0 {
+                            let username = user_info["username"]
+                                .as_str()
+                                .or_else(|| user_info["baidu_name"].as_str())
+                                .unwrap_or("未知");
+                            info!("BDUSS 有效，用户: {}, UID: {}", username, uk);
+                            true
+                        } else {
+                            warn!("BDUSS 已失效：用户信息无效");
+                            false
+                        }
+                    }
+                    Err(e) => {
+                        warn!("BDUSS 验证失败：解析响应失败 {}", e);
+                        // 网络/解析错误，假设有效让后续逻辑处理
+                        true
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("BDUSS 验证失败：请求失败 {}", e);
+                // 记录代理失败（加速回退触发）
+                self.record_proxy_failure(&e.into());
+                // 网络错误，假设有效让后续逻辑处理
+                true
+            }
+        }
+    }
+
+    /// 获取用户UID
+    pub fn uid(&self) -> u64 {
+        self.user_auth.uid
+    }
+
+    /// 获取用户认证信息（用于重建客户端）
+    pub fn user_auth(&self) -> &UserAuth {
+        &self.user_auth
+    }
+
+    /// 获取用户BDUSS
+    pub fn bduss(&self) -> &str {
+        &self.user_auth.bduss
+    }
+
+    /// 获取文件列表
+    ///
+    /// # 参数
+    /// * `dir` - 目录路径（如 "/" 或 "/test"）
+    /// * `page` - 页码（从1开始）
+    /// * `page_size` - 每页数量（默认100）
+    ///
+    /// # 返回
+    /// 文件列表响应
+    pub async fn get_file_list(
+        &self,
+        dir: &str,
+        page: u32,
+        page_size: u32,
+    ) -> Result<FileListResponse> {
+        info!("获取文件列表: dir={}, page={}", dir, page);
+
+        let url = "https://pan.baidu.com/rest/2.0/xpan/file";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("method", "list"),
+                ("order", "name"),
+                ("desc", "0"),
+                ("showempty", "0"),
+                ("web", "1"),
+                ("page", &page.to_string()),
+                ("num", &page_size.to_string()),
+                ("dir", dir),
+                ("t", &chrono::Utc::now().timestamp_millis().to_string()),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to fetch file list");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let file_list: FileListResponse = response
+            .json()
+            .await
+            .context("Failed to parse file list response")?;
+
+        if file_list.errno != 0 {
+            anyhow::bail!("API error {}: {}", file_list.errno, file_list.errmsg);
+        }
+
+        debug!("获取到 {} 个文件/文件夹", file_list.list.len());
+        Ok(file_list)
+    }
+
+    /// 搜索文件
+    ///
+    /// # 参数
+    /// * `key` - 搜索关键词
+    /// * `page` - 页码（从1开始）
+    /// * `num` - 每页数量
+    /// * `recursion` - 是否递归搜索（1=递归）
+    ///
+    /// # 返回
+    /// 搜索结果文件列表
+    pub async fn search_files(
+        &self,
+        key: &str,
+        page: u32,
+        num: u32,
+        recursion: i32,
+    ) -> Result<crate::netdisk::SearchResponse> {
+        info!("搜索文件: key={}, page={}, num={}", key, page, num);
+
+        let url = "https://pan.baidu.com/api/search";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("clienttype", "0"),
+                ("app_id", "250528"),
+                ("web", "1"),
+                ("order", "time"),
+                ("desc", "1"),
+                ("num", &num.to_string()),
+                ("page", &page.to_string()),
+                ("recursion", &recursion.to_string()),
+                ("key", key),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("Failed to search files");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let search_result: crate::netdisk::SearchResponse = response
+            .json()
+            .await
+            .context("Failed to parse search response")?;
+
+        if search_result.errno != 0 {
+            anyhow::bail!("Search API error errno={}", search_result.errno);
+        }
+
+        debug!("搜索到 {} 个结果 (list={}, contentlist={})",
+            search_result.list.len() + search_result.contentlist.len(),
+            search_result.list.len(),
+            search_result.contentlist.len());
+        Ok(search_result)
+    }
+
+    /// 按完整路径获取文件元信息（fs_id / size / server_mtime / md5 等）。
+    ///
+    /// 说明：百度开放接口 `xpan/multimedia?method=filemetas` 只支持按 `fsids` 查询，
+    /// 其 `path` 参数仅用于共享目录/专属空间，并不能按普通文件路径查询；旧实现把路径数组
+    /// 塞进了 `dlink`（应为 0/1 开关）参数且未传 `fsids`，对普通文件实际取不到结果。
+    ///
+    /// 这里改为基于已验证可用的 `xpan/file?method=list`：列出每个路径的父目录并按完整
+    /// 路径精确匹配，取到对应文件的元信息。
+    ///
+    /// 注意：`method=list` 不返回 `block_list`（分片 MD5 列表），故结果中 `block_list`
+    /// 恒为 `None`。如需 block_list，应改用其它接口（当前仓库内并无活动调用方依赖它）。
+    ///
+    /// # 参数
+    /// * `paths` - 文件路径数组（完整路径，如 "/dir/file.mp4"）
+    ///
+    /// # 返回
+    /// 文件元信息响应（仅包含成功匹配到的文件）
+    pub async fn filemetas(&self, paths: &[String]) -> Result<crate::netdisk::FileMetasResponse> {
+        info!("获取文件元信息(按路径): paths={:?}", paths);
+
+        let mut list = Vec::with_capacity(paths.len());
+        for path in paths {
+            match self.find_file_item_by_path(path).await? {
+                Some(item) => list.push(crate::netdisk::FileMetaInfo {
+                    fs_id: item.fs_id,
+                    path: item.path,
+                    server_filename: item.server_filename,
+                    size: item.size,
+                    isdir: item.isdir,
+                    md5: item.md5,
+                    block_list: None,
+                    dlink: None,
+                    server_ctime: item.server_ctime,
+                    server_mtime: item.server_mtime,
+                }),
+                None => debug!("filemetas: 未在父目录中匹配到文件: {}", path),
+            }
+        }
+
+        debug!("获取到 {} 个文件元信息", list.len());
+        Ok(crate::netdisk::FileMetasResponse {
+            errno: 0,
+            errmsg: String::new(),
+            list,
+        })
+    }
+
+    /// 通过完整路径在其父目录列表中精确匹配文件项（用于按路径解析 fs_id 等元信息）。
+    ///
+    /// 分页遍历父目录（每页 1000，最多 100 页 ≈ 10 万项）直至命中或翻完。
+    async fn find_file_item_by_path(&self, path: &str) -> Result<Option<crate::netdisk::FileItem>> {
+        let parent = match path.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(idx) => path[..idx].to_string(),
+        };
+
+        const PAGE_SIZE: u32 = 1000;
+        const MAX_PAGES: u32 = 100;
+        for page in 1..=MAX_PAGES {
+            let resp = self.get_file_list(&parent, page, PAGE_SIZE).await?;
+            let count = resp.list.len();
+            if let Some(item) = resp.list.into_iter().find(|it| it.path == path) {
+                return Ok(Some(item));
+            }
+            // 不足一页说明已到末页
+            if count < PAGE_SIZE as usize {
+                break;
+            }
+        }
+        Ok(None)
+    }
+
+    /// 获取Locate下载链接（通过文件路径）
+    ///
+    /// # 参数
+    /// * `path` - 文件路径（如 "/apps/test/file.zip"）
+    ///
+    /// # 返回
+    /// 下载URL数组
+    ///
+    /// 🔥 对偶发的临时风控错误（errno=8002「参数异常,请更新最新版本客户端」、
+    /// errno=9019「need verify」）做阶梯式退避重试（3s→8s→20s，±20% 抖动，最多 3 次）。
+    /// 其余确定性错误立即返回。
+    pub async fn get_locate_download_url(&self, path: &str) -> Result<Vec<String>> {
+        crate::common::retry::retry_pcs_riskcontrol("Locate 下载取链", || {
+            self.get_locate_download_url_once(path)
+        })
+            .await
+    }
+
+    /// 获取Locate下载链接（单次尝试，不含重试）
+    async fn get_locate_download_url_once(&self, path: &str) -> Result<Vec<String>> {
+        info!("获取Locate下载链接: path={}", path);
+
+        // 1. 检查 UID
+        if self.uid() == 0 {
+            error!("UID 未设置，无法获取下载链接");
+            anyhow::bail!("UID 未设置，请先登录");
+        }
+
+        // 2. 生成Locate签名
+        let sign = LocateSign::new(self.uid(), self.bduss());
+
+        // 3. 构建完整UR
+        let url = format!(
+            "https://pcs.baidu.com/rest/2.0/pcs/file?\
+             ant=1&\
+             check_blue=1&\
+             es=1&\
+             esl=1&\
+             app_id=250528&\
+             method=locatedownload&\
+             path={}&\
+             ver=4.0&\
+             clienttype=17&\
+             channel=0&\
+             apn_id=1_0&\
+             freeisp=0&\
+             queryfree=0&\
+             use=0&\
+             {}",
+            urlencoding::encode(path),
+            sign.url_params()
+        );
+
+        debug!("Locate 请求 URL: {}", url);
+        debug!("UID: {}", self.uid());
+        debug!("BDUSS: {}...", &self.bduss()[..20.min(self.bduss().len())]);
+
+        // 4. 发送 POST 请求
+        let response = match self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                error!("发送 Locate 下载请求失败: path={}, 错误: {}", path, e);
+                let err = anyhow::Error::from(e).context("发送 Locate 下载请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        info!("Locate 请求响应状态: {} (path={})", status, path);
+
+        // 5. 检查响应状态
+        if !status.is_success() {
+            let error_text = response.text().await.unwrap_or_default();
+            error!(
+                "HTTP 请求失败: status={}, path={}, 响应: {}",
+                status, path, error_text
+            );
+            anyhow::bail!("HTTP 请求失败: {} - {}", status, error_text);
+        }
+
+        // 6. 解析响应
+        let response_text = match response.text().await {
+            Ok(text) => text,
+            Err(e) => {
+                error!("读取响应内容失败: path={}, 错误: {}", path, e);
+                return Err(e).context("读取响应内容失败");
+            }
+        };
+
+        debug!("响应内容: {}", response_text);
+
+        let json: serde_json::Value = match serde_json::from_str(&response_text) {
+            Ok(j) => j,
+            Err(e) => {
+                error!(
+                    "解析 JSON 响应失败: path={}, 错误: {}, 响应: {}",
+                    path, e, response_text
+                );
+                return Err(e).context("解析 JSON 响应失败");
+            }
+        };
+
+        // 7. 检查错误码
+        if let Some(errno) = json["errno"].as_i64() {
+            if errno != 0 {
+                let errmsg = json["errmsg"].as_str().unwrap_or("未知错误");
+                error!(
+                    "百度 API 返回错误: errno={}, errmsg={}, path={}",
+                    errno, errmsg, path
+                );
+                anyhow::bail!("百度 API 错误 {}: {}", errno, errmsg);
+            }
+        }
+
+        // 8. 提取下载链接
+        let urls = match json["urls"].as_array() {
+            Some(urls_array) => {
+                urls_array
+                    .iter()
+                    .filter(|u| u["encrypt"].as_i64() == Some(0)) // 只要非加密链接
+                    .filter_map(|u| u["url"].as_str())
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()
+            }
+            None => {
+                error!(
+                    "响应中没有 urls 字段: path={}, JSON: {}",
+                    path, response_text
+                );
+                anyhow::bail!("响应中没有 urls 字段");
+            }
+        };
+
+        if urls.is_empty() {
+            error!(
+                "未找到可用的下载链接: path={}, 响应: {}",
+                path, response_text
+            );
+            anyhow::bail!("未找到可用的下载链接");
+        }
+
+        info!("成功获取 {} 个下载链接", urls.len());
+        Ok(urls)
+    }
+
+    /// 获取Locate下载链接（批量，通过文件ID）
+    ///
+    /// # 参数
+    /// * `fs_ids` - 文件服务器ID列表
+    ///
+    /// # 返回
+    /// Locate下载响应
+    pub async fn get_locate_download_urls(&self, fs_ids: &[u64]) -> Result<LocateDownloadResponse> {
+        info!("获取Locate下载链接: {} 个文件", fs_ids.len());
+
+        // 注意：这个API可能需要不同的处理方式
+        // 目前优先使用 get_locate_download_url (通过路径)
+
+        anyhow::bail!("批量下载暂不支持，请使用 get_locate_download_url (通过文件路径)")
+    }
+
+    /// 获取单个文件的下载链接（通过文件路径）
+    ///
+    /// # 参数
+    /// * `path` - 文件路径
+    /// * `dlink_prefer` - 链接优先级索引（从0开始，默认使用第几个备选下载链接）
+    ///
+    /// # 返回
+    /// 最优下载URL
+    ///
+    /// # 链接选择逻辑
+    /// 1. 根据 dlink_prefer 选择链接索引
+    /// 2. 如果索引超出范围，使用最后一个链接
+    /// 3. 如果选中的链接是 nb.cache 开头且有更多链接，自动使用下一个链接
+    pub async fn get_download_url(&self, path: &str, dlink_prefer: usize) -> Result<String> {
+        let urls = self.get_locate_download_url(path).await?;
+
+        if urls.is_empty() {
+            anyhow::bail!("未找到可用的下载链接");
+        }
+
+        // 1. 边界检查：如果 dlink_prefer 超出范围，使用最后一个链接
+        let mut selected_index = if dlink_prefer >= urls.len() {
+            urls.len() - 1
+        } else {
+            dlink_prefer
+        };
+
+        // 2. 选择链接
+        let mut selected_url = &urls[selected_index];
+
+        // 3. 跳过 nb.cache 链接（如果选中的是 nb.cache 且有更多链接可用）
+        if selected_url.starts_with("http://nb.cache")
+            || selected_url.starts_with("https://nb.cache")
+        {
+            if selected_index + 1 < urls.len() {
+                // 使用下一个链接
+                selected_index += 1;
+                selected_url = &urls[selected_index];
+                info!(
+                    "检测到 nb.cache 链接，自动切换到下一个链接 (索引: {})",
+                    selected_index
+                );
+            } else {
+                warn!("所有链接都是 nb.cache，使用当前链接");
+            }
+        }
+
+        info!(
+            "选择下载链接 (索引: {}, 总数: {}): {}",
+            selected_index,
+            urls.len(),
+            selected_url
+        );
+
+        Ok(selected_url.clone())
+    }
+
+    // =====================================================
+    // 上传相关 API
+    // =====================================================
+
+    /// 创建文件
+    ///
+    /// # 参数
+    /// * `remote_path` - 网盘目标路径
+    /// * `file_size` - 文件大小
+    /// * `upload_id` - 上传ID（从 precreate 获取）
+    /// * `block_list` - 所有分片的 MD5 列表（JSON 数组格式，按顺序）
+    ///
+    /// # 返回
+    /// 创建文件响应
+    pub async fn create_file(
+        &self,
+        remote_path: &str,
+        block_list: &str,
+        upload_id: &str,
+        file_size: u64,
+        is_dir: &str,
+        rtype: &str,
+    ) -> Result<RapidUploadResponse> {
+        let url = "https://pan.baidu.com/api/create";
+
+        let response = self
+            .client
+            .post(url)
+            // .query(&[("method", "create")])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .form(&[
+                ("path", remote_path),
+                ("size", &file_size.to_string()),
+                ("isdir", is_dir),
+                ("uploadid", upload_id),
+                // rtype 文件命名策略:
+                // 1 = path冲突时重命名 (推荐,避免覆盖)
+                // 2 = path冲突且block_list不同时重命名 (智能去重)
+                // 3 = path冲突时覆盖 (危险)
+                ("rtype", rtype),
+                ("block_list", block_list),
+            ])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("创建文件请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取创建文件响应失败")?;
+
+        info!("创建文件响应: status={}, body={}", status, response_text);
+
+        let rapid_response: RapidUploadResponse =
+            serde_json::from_str(&response_text).context("解析创建文件响应失败")?;
+
+        if rapid_response.is_success() {
+            info!(
+                "创建文件成功: path={}, fs_id={}",
+                remote_path, rapid_response.fs_id
+            );
+        } else if rapid_response.file_not_exist() {
+            info!("创建文件失败，文件不存在: errno={}", rapid_response.errno);
+        } else {
+            info!(
+                "创建文件失败: errno={}, errmsg={}",
+                rapid_response.errno, rapid_response.errmsg
+            );
+        }
+
+        Ok(rapid_response)
+    }
+
+    // =====================================================
+    // 上传服务器定位
+    // =====================================================
+
+    /// 获取上传服务器列表
+    ///
+    /// 调用 locateupload 接口动态获取可用的 PCS 上传服务器
+    ///
+    /// # 返回
+    /// 上传服务器主机名列表（如 `["d.pcs.baidu.com", "c.pcs.baidu.com"]`）
+    ///
+    /// 🔥 与下载取链同口径：对临时风控错误（errno=8002/9019）做阶梯式退避重试。
+    pub async fn locate_upload(&self) -> Result<Vec<String>> {
+        crate::common::retry::retry_pcs_riskcontrol("Locate 上传服务器", || {
+            self.locate_upload_once()
+        })
+            .await
+    }
+
+    /// 获取上传服务器列表（单次尝试，不含重试）
+    async fn locate_upload_once(&self) -> Result<Vec<String>> {
+        info!("获取上传服务器列表");
+
+        let url = format!(
+            "https://pcs.baidu.com/rest/2.0/pcs/file?\
+             method=locateupload&\
+             upload_version=2.0&\
+             app_id={}",
+            BAIDU_APP_ID
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("获取上传服务器请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取上传服务器响应失败")?;
+
+        debug!(
+            "locate_upload 响应: status={}, body={}",
+            status, response_text
+        );
+
+        let locate_response: crate::netdisk::LocateUploadResponse =
+            serde_json::from_str(&response_text).context("解析上传服务器响应失败")?;
+
+        if !locate_response.is_success() {
+            anyhow::bail!(
+                "获取上传服务器失败: error_code={}, error_msg={}",
+                locate_response.error_code,
+                locate_response.error_msg
+            );
+        }
+
+        let servers = locate_response.server_hosts();
+        info!(
+            "获取到上传服务器: {:?} (有效期: {}秒)",
+            servers, locate_response.expire
+        );
+
+        Ok(servers)
+    }
+
+    /// 预创建文件（上传前的准备步骤）
+    ///
+    /// # 参数
+    /// * `remote_path` - 网盘目标路径
+    /// * `file_size` - 文件大小
+    /// * `block_list` - 分片 MD5 列表（JSON 数组格式，如 `["md5_1", "md5_2"]`）
+    ///
+    /// # 返回
+    /// 预创建响应（包含 uploadid）
+    /// 预创建文件（支持动态 rtype）
+    ///
+    /// # 参数
+    /// - remote_path: 远程路径
+    /// - file_size: 文件大小
+    /// - block_list: 分片列表
+    /// - rtype: 文件命名策略
+    ///   - "1": path 冲突时重命名（Auto_Rename）
+    ///   - "2": path 冲突且 block_list 不同时重命名（Smart_Dedup）
+    ///   - "3": path 冲突时覆盖（危险，不推荐）
+    pub async fn precreate(
+        &self,
+        remote_path: &str,
+        file_size: u64,
+        block_list: &str,
+        rtype: &str,
+    ) -> Result<PrecreateResponse> {
+        info!("预创建文件: path={}, size={}, rtype={}", remote_path, file_size, rtype);
+
+        let url = "https://pan.baidu.com/api/precreate";
+
+        let response = self
+            .client
+            .post(url)
+            // .query(&[("method", "precreate")])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .form(&[
+                ("path", remote_path),
+                ("size", &file_size.to_string()),
+                ("isdir", "0"),
+                ("autoinit", "1"),
+                ("rtype", rtype),
+                ("block_list", block_list),
+            ])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("预创建请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取预创建响应失败")?;
+
+        debug!("预创建响应: status={}, body={}", status, response_text);
+
+        let precreate_response: PrecreateResponse =
+            serde_json::from_str(&response_text).context("解析预创建响应失败")?;
+
+        if precreate_response.errno != 0 {
+            error!(
+                "预创建失败: errno={}, errmsg={}",
+                precreate_response.errno, precreate_response.errmsg
+            );
+            anyhow::bail!(
+                "预创建失败: {} - {}",
+                precreate_response.errno,
+                precreate_response.errmsg
+            );
+        }
+
+        info!(
+            "预创建成功: uploadid={}, return_type={}",
+            precreate_response.uploadid, precreate_response.return_type
+        );
+
+        Ok(precreate_response)
+    }
+
+    /// 上传分片
+    ///
+    /// # 参数
+    /// * `remote_path` - 网盘目标路径
+    /// * `upload_id` - 上传ID（从 precreate 获取）
+    /// * `part_seq` - 分片序号（从 0 开始）
+    /// * `data` - 分片数据
+    ///
+    /// # 返回
+    /// 上传分片响应（包含分片 MD5）
+    pub async fn upload_chunk(
+        &self,
+        remote_path: &str,
+        upload_id: &str,
+        part_seq: usize,
+        data: Vec<u8>,
+        server: Option<&str>,
+    ) -> Result<UploadChunkResponse> {
+        // 使用传入的服务器或默认值
+        let pcs_server = server.unwrap_or("d.pcs.baidu.com");
+
+        info!(
+            "上传分片: path={}, uploadid={}..., part={}, size={}, server={}",
+            remote_path,
+            &upload_id[..8.min(upload_id.len())],
+            part_seq,
+            data.len(),
+            pcs_server
+        );
+
+        // 使用 PCS 上传接口
+        let url = format!(
+            "https://{}/rest/2.0/pcs/superfile2?\
+             method=upload&\
+             app_id={}&\
+             type=tmpfile&\
+             path={}&\
+             uploadid={}&\
+             partseq={}",
+            pcs_server,
+            BAIDU_APP_ID,
+            urlencoding::encode(remote_path),
+            urlencoding::encode(upload_id),
+            part_seq
+        );
+
+        // 构建 multipart form
+        let part = multipart::Part::bytes(data)
+            .file_name("file")
+            .mime_str("application/octet-stream")?;
+
+        let form = multipart::Form::new().part("file", part);
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.mobile_user_agent)
+            .multipart(form)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("上传分片请求发送失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取上传分片响应失败")?;
+
+        debug!(
+            "上传分片响应: part={}, status={}, body={}",
+            part_seq, status, response_text
+        );
+
+        // 先检查 HTTP 状态码，非 2xx 直接返回可重试/不可重试错误
+        // 避免对 HTML 错误页等非 JSON 响应进行解析导致误导性错误信息
+        if !status.is_success() {
+            let truncated_body: String = response_text.chars().take(200).collect();
+            let error_msg = format!(
+                "上传分片HTTP错误: part={}, status={}, body={}",
+                part_seq, status, truncated_body
+            );
+            error!("{}", error_msg);
+            anyhow::bail!(error_msg);
+        }
+
+        let chunk_response: UploadChunkResponse = serde_json::from_str(&response_text)
+            .with_context(|| {
+                format!(
+                    "解析上传分片响应失败: status={}, body={}",
+                    status, response_text
+                )
+            })?;
+
+        if !chunk_response.is_success() {
+            let error_kind = UploadErrorKind::from_errno(chunk_response.error_code);
+            error!(
+                "上传分片失败: part={}, error_code={}, error_msg={}, retriable={}",
+                part_seq,
+                chunk_response.error_code,
+                chunk_response.error_msg,
+                error_kind.is_retriable()
+            );
+            anyhow::bail!(
+                "上传分片失败: {} - {}",
+                chunk_response.error_code,
+                chunk_response.error_msg
+            );
+        }
+
+        debug!(
+            "上传分片成功: part={}, md5={}",
+            part_seq, chunk_response.md5
+        );
+
+        Ok(chunk_response)
+    }
+
+    // /// 创建文件（合并分片，完成上传）
+    // ///
+    // /// # 参数
+    // /// * `remote_path` - 网盘目标路径
+    // /// * `file_size` - 文件大小
+    // /// * `upload_id` - 上传ID（从 precreate 获取）
+    // /// * `block_list` - 所有分片的 MD5 列表（JSON 数组格式，按顺序）
+    // ///
+    // /// # 返回
+    // /// 创建文件响应
+    // pub async fn create_file(
+    //     &self,
+    //     remote_path: &str,
+    //     file_size: u64,
+    //     upload_id: &str,
+    //     block_list: &str,
+    // ) -> Result<CreateFileResponse> {
+    //     info!(
+    //         "创建文件: path={}, size={}, uploadid={}...",
+    //         remote_path,
+    //         file_size,
+    //         &upload_id[..8.min(upload_id.len())]
+    //     );
+    //
+    //     let url = "https://pan.baidu.com/rest/2.0/xpan/file";
+    //
+    //     let response = self
+    //         .client
+    //         .post(url)
+    //         .query(&[("method", "create")])
+    //         .header("Cookie", format!("BDUSS={}", self.bduss()))
+    //         .header("User-Agent", &self.mobile_user_agent)
+    //         .form(&[
+    //             ("path", remote_path),
+    //             ("size", &file_size.to_string()),
+    //             ("isdir", "0"),
+    //             // rtype 文件命名策略:
+    //             // 1 = path冲突时重命名 (推荐,避免覆盖)
+    //             // 2 = path冲突且block_list不同时重命名 (智能去重)
+    //             // 3 = path冲突时覆盖 (危险)
+    //             ("rtype", "1"),
+    //             ("uploadid", upload_id),
+    //             ("block_list", block_list),
+    //         ])
+    //         .send()
+    //         .await
+    //         .context("创建文件请求发送失败")?;
+    //
+    //     let status = response.status();
+    //     let response_text = response.text().await.context("读取创建文件响应失败")?;
+    //
+    //     debug!("创建文件响应: status={}, body={}", status, response_text);
+    //
+    //     let create_response: CreateFileResponse =
+    //         serde_json::from_str(&response_text).context("解析创建文件响应失败")?;
+    //
+    //     if !create_response.is_success() {
+    //         error!(
+    //             "创建文件失败: errno={}, errmsg={}",
+    //             create_response.errno, create_response.errmsg
+    //         );
+    //         anyhow::bail!(
+    //             "创建文件失败: {} - {}",
+    //             create_response.errno,
+    //             create_response.errmsg
+    //         );
+    //     }
+    //
+    //     info!(
+    //         "创建文件成功: path={}, fs_id={}, size={}",
+    //         create_response.path, create_response.fs_id, create_response.size
+    //     );
+    //
+    //     Ok(create_response)
+    // }
+
+    /// 获取上传服务器列表
+    ///
+    /// # 返回
+    /// PCS 上传服务器地址列表
+    pub async fn get_upload_servers(&self) -> Result<Vec<String>> {
+        // 百度网盘的上传服务器是固定的几个
+        // 实际使用时会根据 precreate 响应或者 locateupload API 获取
+        // 这里返回默认的服务器列表
+        Ok(vec![
+            "d.pcs.baidu.com".to_string(),
+            "c.pcs.baidu.com".to_string(),
+            "pcs.baidu.com".to_string(),
+        ])
+    }
+
+    /// 从 CookieJar 收集所有 .baidu.com 的 cookie
+    pub async fn collect_all_baidu_cookies(&self) -> Result<String> {
+        let domains = [
+            "https://baidu.com/",
+            "https://www.baidu.com/",
+            "https://pan.baidu.com/",
+            "https://pcs.baidu.com/",
+        ];
+
+        let mut result = vec![];
+
+        for d in domains {
+            let url = d.parse::<reqwest::Url>()?;
+            if let Some(header) = self.cookie_jar.cookies(&url) {
+                if let Ok(s) = header.to_str() {
+                    for kv in s.split("; ") {
+                        if !result.contains(&kv.to_string()) {
+                            result.push(kv.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 强制保证 BDUSS + PANPSC 必定存在
+        if !result.iter().any(|x| x.starts_with("BDUSS=")) {
+            let bd = format!("BDUSS={}", self.user_auth.bduss);
+            result.push(bd);
+        }
+
+        let panpsc_val = self.panpsc_cookie.lock().await.clone();
+        if !result.iter().any(|x| x.starts_with("PANPSC=")) {
+            if let Some(v) = panpsc_val {
+                result.push(format!("PANPSC={}", v));
+            }
+        }
+
+        let merged = result.join("; ");
+        Ok(merged)
+    }
+
+    /// 在现有 Cookie 头基础上覆盖 randsk/BDCLND（用于密码保护的分享列表/转存）
+    async fn collect_all_baidu_cookies_with_randsk(&self, randsk: &str) -> Result<String> {
+        Ok(Self::override_cookie_randsk(
+            &self.collect_all_baidu_cookies().await?,
+            randsk,
+        ))
+    }
+
+    /// 工具函数：去掉 cookie 头里所有 randsk/BDCLND，再追加一对新的 randsk/BDCLND
+    fn override_cookie_randsk(cookie_header: &str, randsk: &str) -> String {
+        let mut cookies: Vec<String> = cookie_header
+            .split("; ")
+            .filter(|kv| !kv.is_empty() && !kv.starts_with("randsk=") && !kv.starts_with("BDCLND="))
+            .map(str::to_string)
+            .collect();
+        cookies.push(format!("randsk={}", randsk));
+        cookies.push(format!("BDCLND={}", randsk));
+        cookies.join("; ")
+    }
+
+    /// 创建文件夹
+    ///
+    /// # 参数
+    /// * `remote_path` - 网盘目标路径（必须以 / 开头）
+    ///
+    /// # 返回
+    /// 创建文件夹响应
+    pub async fn create_folder(&self, remote_path: &str) -> Result<CreateFileResponse> {
+        // 获取 bdstoken（只获取一次锁，立即克隆并释放，避免死锁）
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，请尝试重新登录")),
+            }
+        };
+
+        info!("创建文件夹: path={}", remote_path);
+
+        // 打印创建文件夹前的 Cookie Jar 状态
+        self.debug_print_cookies("创建文件夹前");
+        // 2. 统一从 CookieJar 中收集所有 domain = .baidu.com 的 cookie
+        let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+        // 3. 创建独立的 HTTP Client，确保我们自定义的 Cookie Header 不会被覆盖
+        let pan_client = self.build_temp_client_with_proxy()?;
+
+        // 使用 Web 端 API (与 Baidu 网页端保持一致)
+        let url = format!(
+            "https://pan.baidu.com/api/create?a=commit&clienttype=0&app_id={}&web=1&bdstoken={}",
+            BAIDU_APP_ID,
+            urlencoding::encode(&bdstoken),
+        );
+        info!("创建文件夹: 使用 bdstoken 参数");
+
+        debug!("创建文件夹 URL: {}", url);
+
+        // 打印创建文件夹前的 Cookie Jar 状态
+        self.debug_print_cookies("创建文件夹前");
+        // 4. 手动构造 Cookie header（不会被覆盖）
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+        headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+
+        // Cookie Jar 会自动携带所有 cookies (必须使用 .send() 而不是 .build().execute())
+        info!("发送创建文件夹请求...");
+
+        let response = pan_client
+            .post(&url)
+            .headers(headers)
+            .form(&[("path", remote_path), ("isdir", "1"), ("block_list", "[]")])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("创建文件夹请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取创建文件夹响应失败")?;
+
+        info!("创建文件夹响应: status={}, body={}", status, response_text);
+
+        // 解析响应
+        #[derive(Debug, serde::Deserialize)]
+        struct BasicResponse {
+            #[serde(default)]
+            errno: i32,
+            #[serde(default)]
+            errmsg: String,
+            #[serde(default)]
+            error_code: i32,
+            #[serde(default)]
+            error_msg: String,
+        }
+
+        let basic_response: BasicResponse =
+            serde_json::from_str(&response_text).context("解析创建文件夹响应失败")?;
+
+        let error_code = if basic_response.errno != 0 {
+            basic_response.errno
+        } else {
+            basic_response.error_code
+        };
+
+        let error_msg = if !basic_response.errmsg.is_empty() {
+            basic_response.errmsg
+        } else {
+            basic_response.error_msg
+        };
+
+        if error_code != 0 {
+            error!(
+                "创建文件夹失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("创建文件夹失败: errno={}, msg={}", error_code, error_msg);
+        }
+
+        info!("创建文件夹成功: path={}", remote_path);
+        self.debug_print_cookies("创建文件夹成功 Cookie 状态");
+
+        let create_response: CreateFileResponse = serde_json::from_str(&response_text)
+            .unwrap_or_else(|_| CreateFileResponse {
+                errno: 0,
+                fs_id: 0,
+                md5: String::new(),
+                server_filename: String::new(),
+                path: remote_path.to_string(),
+                size: 0,
+                ctime: 0,
+                mtime: 0,
+                isdir: 1,
+                errmsg: String::new(),
+            });
+
+        Ok(create_response)
+    }
+
+    // =====================================================
+    // 分享链接转存相关 API
+    // =====================================================
+
+    /// 解析分享链接，提取 short_key
+    ///
+    /// 支持格式：
+    /// - https://pan.baidu.com/s/1abcDEFg
+    /// - https://pan.baidu.com/s/1abcDEFg?pwd=xxxx
+    /// - https://pan.baidu.com/share/init?surl=abcDEFg
+    ///
+    /// # 返回
+    /// ShareLink 结构体，包含 short_key 和可能的密码
+    pub fn parse_share_link(&self, url: &str) -> Result<crate::transfer::ShareLink> {
+        use regex::Regex;
+
+        let url = url.trim();
+
+        // 检查是否为百度网盘链接
+        if !url.contains("pan.baidu.com") && !url.contains("baidu.com/s/") {
+            anyhow::bail!("无效的分享链接：不是百度网盘链接");
+        }
+
+        let mut short_key: Option<String> = None;
+        let mut password: Option<String> = None;
+
+        // 尝试匹配 /s/{key} 格式
+        // 例如: https://pan.baidu.com/s/1abcDEFg
+        let re_s = Regex::new(r"/s/([a-zA-Z0-9_-]+)")?;
+        if let Some(caps) = re_s.captures(url) {
+            if let Some(key) = caps.get(1) {
+                short_key = Some(key.as_str().to_string());
+            }
+        }
+
+        // 尝试匹配 /share/init?surl={key} 格式
+        // 例如: https://pan.baidu.com/share/init?surl=abcDEFg
+        if short_key.is_none() {
+            let re_surl = Regex::new(r"[?&]surl=([a-zA-Z0-9_-]+)")?;
+            if let Some(caps) = re_surl.captures(url) {
+                if let Some(key) = caps.get(1) {
+                    // surl 格式需要加 "1" 前缀
+                    short_key = Some(format!("1{}", key.as_str()));
+                }
+            }
+        }
+
+        // 提取密码
+        // 格式: ?pwd=xxxx 或 &pwd=xxxx
+        let re_pwd = Regex::new(r"[?&]pwd=([a-zA-Z0-9]{4})")?;
+        if let Some(caps) = re_pwd.captures(url) {
+            if let Some(pwd) = caps.get(1) {
+                password = Some(pwd.as_str().to_string());
+            }
+        }
+
+        match short_key {
+            Some(key) => {
+                info!(
+                    "解析分享链接成功: short_key={}, has_password={}",
+                    key,
+                    password.is_some()
+                );
+                Ok(crate::transfer::ShareLink {
+                    short_key: key,
+                    raw_url: url.to_string(),
+                    password,
+                })
+            }
+            None => {
+                anyhow::bail!("无法从链接中提取分享 ID")
+            }
+        }
+    }
+
+    /// 访问分享页面，获取分享信息
+    ///
+    /// # 参数
+    /// * `short_key` - 分享短链 ID（如 "1abcDEFg"）
+    /// * `first` - 是否为首次访问（影响 Referer）
+    ///
+    /// # 返回
+    /// SharePageInfo 或错误（需要密码/分享失效/页面不存在）
+    pub async fn access_share_page(
+        &self,
+        short_key: &str,
+        password: &Option<String>,
+        first: bool,
+    ) -> Result<crate::transfer::SharePageInfo> {
+        use regex::Regex;
+
+        let share_link = format!("https://pan.baidu.com/s/{}", short_key);
+        let referer = if first {
+            "https://pan.baidu.com/disk/home".to_string()
+        } else {
+            format!("https://pan.baidu.com/share/init?surl={}", &short_key[1..])
+        };
+
+        info!("访问分享页面: {}", share_link);
+
+        let response = self
+            .client
+            .get(&share_link)
+            .header("User-Agent", WEB_USER_AGENT)
+            .header("Referer", &referer)
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("访问分享页面失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let body = response.text().await.context("读取分享页面失败")?;
+
+        debug!("分享页面响应: status={}, body_len={}", status, body.len());
+
+        // 检测页面状态
+        if body.contains("platform-non-found") {
+            anyhow::bail!("分享已失效");
+        }
+        if body.contains("error-404") {
+            anyhow::bail!("分享不存在");
+        }
+
+        // 检测是否需要密码
+        // 如果页面包含密码输入框或验证逻辑，说明需要密码
+        let need_password = body.contains("请输入提取码")
+            || body.contains("accesscode")
+            || body.contains("verify-form");
+
+        // 从页面 JS 中提取分享信息（即使需要密码，这些信息可能仍然存在）
+        // 匹配模式: {... "loginstate":... }
+        let re = Regex::new(r"\{[^{}]*loginstate[^{}]*\}")?;
+
+        // 尝试更宽松的匹配
+        let re_loose = Regex::new(r#""shareid"\s*:\s*(\d+)"#)?;
+        let re_uk = Regex::new(r#""uk"\s*:\s*(\d+)"#)?;
+        let re_share_uk = Regex::new(r#""share_uk"\s*:\s*"?(\d+)"?"#)?;
+        let re_bdstoken = Regex::new(r#""bdstoken"\s*:\s*"([^"]+)""#)?;
+
+        // 辅助函数：安全地从 JSON Value 提取字符串或数字
+        fn extract_json_value(value: &serde_json::Value) -> Option<String> {
+            match value {
+                Value::String(s) => Some(s.clone()),
+                Value::Number(n) => Some(n.to_string()),
+                _ => None,
+            }
+        }
+
+        // 尝试完整匹配
+        if let Some(caps) = re.find(&body) {
+            let json_str = caps.as_str();
+            if let Ok(json) = serde_json::from_str::<Value>(json_str) {
+                // 安全提取字段，统一处理字符串和数字类型
+                let shareid = extract_json_value(&json["shareid"]).unwrap_or_default();
+                let uk = extract_json_value(&json["uk"]).unwrap_or_default();
+                let share_uk = extract_json_value(&json["share_uk"]).unwrap_or_default();
+                let bdstoken = extract_json_value(&json["bdstoken"]).unwrap_or_default();
+
+                if !shareid.is_empty() {
+                    info!("从 JSON 提取分享信息: shareid={}, uk={}", shareid, uk);
+                    return Ok(crate::transfer::SharePageInfo {
+                        shareid,
+                        uk,
+                        share_uk,
+                        bdstoken,
+                    });
+                }
+            }
+        }
+
+        // 使用宽松匹配提取各个字段
+        let shareid = re_loose
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let uk = re_uk
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let share_uk = re_share_uk
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_else(|| uk.clone());
+
+        let bdstoken = re_bdstoken
+            .captures(&body)
+            .and_then(|c| c.get(1))
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+
+        let _password = password
+            .as_deref()
+            .map(|s| s.trim())
+            .unwrap_or("")
+            .is_empty();
+        if shareid.is_empty() {
+            // 尝试检测是否需要登录
+            if body.contains("passport.baidu.com") || body.contains("请登录") {
+                anyhow::bail!("请先登录百度账号");
+            }
+            // 如果需要密码且无法提取分享信息，提示需要密码
+            if need_password && _password {
+                anyhow::bail!("需要密码");
+            }
+            anyhow::bail!("无法提取分享信息，请确认链接有效");
+        }
+
+        // 检测到需要密码时，返回错误让调用方处理
+        if need_password && _password {
+            anyhow::bail!("需要密码");
+        }
+
+        info!("提取分享信息成功: shareid={}, uk={}", shareid, uk);
+
+        Ok(crate::transfer::SharePageInfo {
+            shareid,
+            uk,
+            share_uk,
+            bdstoken,
+        })
+    }
+
+    /// 校验提取码
+    ///
+    /// # 参数
+    /// * `shareid` - 分享 ID
+    /// * `share_uk` - 分享者 UK
+    /// * `bdstoken` - CSRF 令牌
+    /// * `password` - 提取码
+    /// * `referer` - 来源页面
+    ///
+    /// # 返回
+    /// 成功返回 randsk，失败返回错误
+    pub async fn verify_share_password(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        password: &str,
+        referer: &str,
+    ) -> Result<String> {
+        info!("验证提取码: shareid={}", shareid);
+
+        let timestamp = chrono::Utc::now().timestamp_millis();
+        let url = format!(
+            "https://pan.baidu.com/share/verify?shareid={}&uk={}&t={}&clienttype=1",
+            shareid, share_uk, timestamp
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", referer)
+            .header(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=UTF-8",
+            )
+            .form(&[
+                ("pwd", password),
+                ("vcode", ""),
+                ("vcode_str", ""),
+                ("bdstoken", bdstoken),
+            ])
+            .send()
+            .await
+            .context("验证提取码请求失败")?;
+
+        let response_text = response.text().await.context("读取验证响应失败")?;
+        debug!("验证提取码响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析验证响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            let randsk = json["randsk"].as_str().unwrap_or_default().to_string();
+            info!(
+                "提取码验证成功，获取到randsk: {}...",
+                &randsk[..randsk.len().min(20)]
+            );
+
+            // 将 randsk 保存到 Cookie 中
+            // 这样后续的转存请求可以从 Cookie 中读取 randsk
+            let cookie_url = "https://pan.baidu.com"
+                .parse::<reqwest::Url>()
+                .context("解析 Cookie URL 失败")?;
+            let randsk_cookie = format!("randsk={}; Domain=.baidu.com; Path=/", randsk);
+            self.cookie_jar.add_cookie_str(&randsk_cookie, &cookie_url);
+            info!("✅ 已将 randsk 保存到 Cookie");
+
+            // 验证Cookie是否成功保存
+            if let Some(cookies) = self.cookie_jar.cookies(&cookie_url) {
+                let cookie_str = cookies.to_str().unwrap_or("");
+                if cookie_str.contains("randsk=") {
+                    info!("✅ 验证：Cookie中已包含randsk");
+                } else {
+                    warn!("❌ 警告：Cookie中未找到randsk，可能保存失败");
+                }
+            }
+
+            Ok(randsk)
+        } else if errno == -9 {
+            anyhow::bail!("提取码错误")
+        } else {
+            anyhow::bail!("验证失败: errno={}", errno)
+        }
+    }
+
+    /// 列出分享中的文件（根目录，与官方接口对齐）
+    ///
+    /// 官方根目录请求使用 shorturl + root=1，不传 dir
+    /// 响应中包含 uk 和 share_id，用于后续子目录导航拼接 dir
+    ///
+    /// # 参数
+    /// * `short_key` - 分享短链 ID（如 "1abcDEFg"）
+    /// * `bdstoken` - CSRF 令牌
+    /// * `page` - 页码（从 1 开始）
+    /// * `num` - 每页数量
+    ///
+    /// # 返回
+    /// ShareFileListResult（包含文件列表 + uk + shareid）
+    pub async fn list_share_files(
+        &self,
+        short_key: &str,
+        bdstoken: &str,
+        page: u32,
+        num: u32,
+    ) -> Result<crate::transfer::ShareFileListResult> {
+        self.list_share_files_with_randsk(short_key, bdstoken, page, num, None)
+            .await
+    }
+
+    pub async fn list_share_files_with_randsk(
+        &self,
+        short_key: &str,
+        bdstoken: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::ShareFileListResult> {
+        info!("获取分享文件列表(根目录): short_key={}, page={}, num={}", short_key, page, num);
+
+        // short_key 包含 '1'（如 "1abcDEFg"），需要去掉第一个字符
+        let shorturl = if short_key.starts_with('1') && short_key.len() > 1 {
+            &short_key[1..]
+        } else {
+            short_key
+        };
+
+        let url = format!(
+            "https://pan.baidu.com/share/list?\
+             shorturl={}&root=1&order=time&desc=1&showempty=0&\
+             web=1&page={}&num={}&view_mode=1&channel=chunlei&\
+             app_id={}&bdstoken={}&clienttype=0",
+            shorturl, page, num, BAIDU_APP_ID, bdstoken
+        );
+
+        let referer = format!("https://pan.baidu.com/s/{}", short_key);
+
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+            .context("获取分享文件列表失败")?;
+
+        let response_text = response.text().await.context("读取文件列表响应失败")?;
+        info!("文件列表响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析文件列表响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+        if errno != 0 {
+            let errmsg = json["errmsg"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| match errno {
+                    132 => "您的帐号可能存在安全风险，为了确保为您本人操作，请先进行安全验证"
+                        .to_string(),
+                    -7 => "该分享已删除或已取消".to_string(),
+                    -9 => "分享链接失效或提取码错误".to_string(),
+                    -12 => "访问密码错误".to_string(),
+                    -19 => "需要输入验证码".to_string(),
+                    -62 => "可能需要输入验证码".to_string(),
+                    8001 => "已触发验证，请稍后再试".to_string(),
+                    _ => format!("未知错误，错误码: {}", errno),
+                });
+
+            anyhow::bail!("获取文件列表失败: errno={}, errmsg={}", errno, errmsg);
+        }
+
+        // 从响应中提取 uk 和 share_id（用于子目录导航拼接 dir）
+        let resp_uk = json["uk"].as_u64().map(|v| v.to_string())
+            .or_else(|| json["uk"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+        let resp_shareid = json["share_id"].as_u64().map(|v| v.to_string())
+            .or_else(|| json["share_id"].as_str().map(|s| s.to_string()))
+            .unwrap_or_default();
+
+        // 从响应中提取 title（分享根的绝对路径），用于稳定推导 share_root
+        // 见 docs/share-root-fix.md
+        let share_root_path = json["title"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        info!(
+            "根目录响应: uk={}, share_id={}, share_root_path={:?}",
+            resp_uk, resp_shareid, share_root_path
+        );
+
+        let list = json["list"].as_array().context("文件列表格式错误")?;
+
+        let mut files = Vec::new();
+        for item in list {
+            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
+                id_str.parse::<u64>().unwrap_or(0)
+            } else {
+                item["fs_id"].as_u64().unwrap_or(0)
+            };
+
+            let is_dir = if let Some(n) = item["isdir"].as_i64() {
+                n == 1
+            } else if let Some(s) = item["isdir"].as_str() {
+                s == "1"
+            } else {
+                false
+            };
+            let path = item["path"].as_str().unwrap_or_default().to_string();
+            let size = if let Some(n) = item["size"].as_u64() {
+                n
+            } else if let Some(s) = item["size"].as_str() {
+                s.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let name = item["server_filename"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            info!(
+                "解析文件: fs_id={}, name={}, is_dir={}",
+                fs_id, name, is_dir
+            );
+
+            files.push(crate::transfer::SharedFileInfo {
+                fs_id,
+                is_dir,
+                path,
+                size,
+                name,
+            });
+        }
+
+        Ok(crate::transfer::ShareFileListResult {
+            files,
+            uk: resp_uk,
+            shareid: resp_shareid,
+            share_root_path,
+        })
+    }
+
+    /// 列出分享中指定目录下的文件（用于文件夹导航，与官方接口对齐）
+    ///
+    /// 官方子目录请求使用 uk + shareid + dir，不传 shorturl/root
+    pub async fn list_share_files_in_dir(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        self.list_share_files_in_dir_with_randsk(
+            short_key, shareid, uk, bdstoken, dir, page, num, None,
+        )
+            .await
+    }
+
+    pub async fn list_share_files_in_dir_with_randsk(
+        &self,
+        short_key: &str,
+        shareid: &str,
+        uk: &str,
+        bdstoken: &str,
+        dir: &str,
+        page: u32,
+        num: u32,
+        randsk: Option<&str>,
+    ) -> Result<Vec<crate::transfer::SharedFileInfo>> {
+        info!("获取分享子目录文件列表: shareid={}, dir={}, page={}, num={}", shareid, dir, page, num);
+
+        let encoded_dir = urlencoding::encode(dir);
+
+        let url = format!(
+            "https://pan.baidu.com/share/list?\
+             uk={}&shareid={}&order=name&desc=0&showempty=0&\
+             view_mode=1&web=1&page={}&num={}&dir={}&channel=chunlei&\
+             app_id={}&bdstoken={}&clienttype=0",
+            uk, shareid, page, num, encoded_dir, BAIDU_APP_ID, bdstoken
+        );
+
+        let referer = format!("https://pan.baidu.com/s/{}", short_key);
+
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .header("Cookie", cookie_header)
+                .send()
+                .await
+        } else {
+            self.client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", &referer)
+                .send()
+                .await
+        }
+            .context("获取分享子目录文件列表失败")?;
+
+        let response_text = response.text().await.context("读取子目录文件列表响应失败")?;
+        debug!("子目录文件列表响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析子目录文件列表响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+        if errno != 0 {
+            let errmsg = json["errmsg"]
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("未知错误，错误码: {}", errno));
+            anyhow::bail!("获取子目录文件列表失败: errno={}, errmsg={}", errno, errmsg);
+        }
+
+        let list = json["list"].as_array().context("子目录文件列表格式错误")?;
+
+        let mut files = Vec::new();
+        for item in list {
+            let fs_id = if let Some(id_str) = item["fs_id"].as_str() {
+                id_str.parse::<u64>().unwrap_or(0)
+            } else {
+                item["fs_id"].as_u64().unwrap_or(0)
+            };
+
+            let is_dir = if let Some(n) = item["isdir"].as_i64() {
+                n == 1
+            } else if let Some(s) = item["isdir"].as_str() {
+                s == "1"
+            } else {
+                false
+            };
+            let path = item["path"].as_str().unwrap_or_default().to_string();
+            let size = if let Some(n) = item["size"].as_u64() {
+                n
+            } else if let Some(s) = item["size"].as_str() {
+                s.parse::<u64>().unwrap_or(0)
+            } else {
+                0
+            };
+            let name = item["server_filename"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+
+            files.push(crate::transfer::SharedFileInfo {
+                fs_id,
+                is_dir,
+                path,
+                size,
+                name,
+            });
+        }
+
+        info!("子目录文件列表: {} 个文件, dir={}", files.len(), dir);
+        Ok(files)
+    }
+
+    /// 执行转存
+    ///
+    /// # 参数
+    /// * `shareid` - 分享 ID
+    /// * `share_uk` - 分享者 UK
+    /// * `bdstoken` - CSRF 令牌
+    /// * `fs_ids` - 要转存的文件 fs_id 列表
+    /// * `target_path` - 目标路径
+    /// * `referer` - 来源页面
+    /// * `internal_task_id` - 调用方内部任务 ID（用于日志关联）
+    ///
+    /// # 返回
+    /// 转存结果
+    pub async fn transfer_share_files(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        fs_ids: &[u64],
+        target_path: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
+        self.transfer_share_files_with_randsk(
+            shareid,
+            share_uk,
+            bdstoken,
+            fs_ids,
+            target_path,
+            referer,
+            internal_task_id,
+            None,
+        )
+            .await
+    }
+
+    pub async fn transfer_share_files_with_randsk(
+        &self,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        fs_ids: &[u64],
+        target_path: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+        randsk: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
+        // 构建转存URL
+        let url = format!(
+            "https://pan.baidu.com/share/transfer?\
+                 shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+            shareid, share_uk, bdstoken, BAIDU_APP_ID
+        );
+
+        // 构建 fs_id 列表
+        let fsidlist = format!(
+            "[{}]",
+            fs_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let response = if let Some(randsk) = randsk.filter(|s| !s.is_empty()) {
+            let cookie_header = self.collect_all_baidu_cookies_with_randsk(randsk).await?;
+            let client = self.build_temp_client_with_proxy()?;
+            client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .header("Cookie", cookie_header)
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        } else {
+            self.client
+                .post(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .form(&[("fsidlist", fsidlist.as_str()), ("path", target_path)])
+                .send()
+                .await
+        };
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("转存请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let response_text = response.text().await.context("读取转存响应失败")?;
+        info!("转存响应: {}", response_text);
+
+        let json: Value = serde_json::from_str(&response_text).context("解析转存响应失败")?;
+
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            // 🔥 检查是否为异步转存任务
+            let task_id_value = &json["task_id"];
+            let is_async_task = if task_id_value.is_string() {
+                // task_id 是字符串且非空且不是 "0"
+                let task_id_str = task_id_value.as_str().unwrap_or("");
+                !task_id_str.is_empty() && task_id_str != "0"
+            } else if task_id_value.is_u64() || task_id_value.is_i64() {
+                // task_id 是数字且非0
+                task_id_value.as_u64().unwrap_or(0) != 0
+            } else {
+                false
+            };
+
+            // 检查是否有 extra 字段
+            let has_extra = json["extra"]["list"].is_array();
+
+            if is_async_task && !has_extra {
+                // 🔥 异步转存模式：task_id 非0 且没有 extra 字段
+                // 生成 task_id 字符串（拥有所有权，避免临时引用问题）
+                let task_id_string = if task_id_value.is_string() {
+                    task_id_value.as_str().unwrap_or("unknown").to_string()
+                } else {
+                    task_id_value.to_string()
+                };
+
+                let show_msg = json["show_msg"].as_str().unwrap_or("");
+                info!(
+                        "检测到异步转存任务: baidu_task_id={}, internal_task_id={}, target_path={}, show_msg='{}'",
+                        task_id_string,
+                        internal_task_id.unwrap_or("N/A"),
+                        target_path,
+                        show_msg
+                    );
+
+                // 调用 query_transfer_task 轮询任务状态
+                return self
+                    .query_transfer_task(&task_id_string, shareid, share_uk, bdstoken, referer, internal_task_id)
+                    .await;
+            }
+
+            // 🔥 同步转存模式：提取 extra.list
+            let extra_list = json["extra"]["list"].as_array();
+            let mut transferred_paths = Vec::new();
+            let mut transferred_fs_ids = Vec::new();
+            let mut from_paths = Vec::new();
+
+            if let Some(list) = extra_list {
+                for item in list {
+                    if let Some(path) = item["to"].as_str() {
+                        transferred_paths.push(path.to_string());
+                    }
+                    if let Some(from) = item["from"].as_str() {
+                        from_paths.push(from.to_string());
+                    }
+                    if let Some(fsid) = item["to_fs_id"].as_u64() {
+                        transferred_fs_ids.push(fsid);
+                    }
+                }
+            }
+
+            Ok(crate::transfer::TransferResult {
+                success: true,
+                transferred_paths,
+                from_paths,
+                error: None,
+                transferred_fs_ids,
+            })
+        } else if errno == 12 {
+            // 部分错误
+            let info_list = json["info"].as_array();
+            if let Some(list) = info_list {
+                if let Some(first) = list.first() {
+                    let inner_errno = first["errno"].as_i64().unwrap_or(0);
+                    if inner_errno == -30 {
+                        let path = first["path"].as_str().unwrap_or_default();
+                        let filename = std::path::Path::new(path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string());
+                        return Ok(crate::transfer::TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            from_paths: vec![],
+                            error: Some(format!("同名文件已存在: {}", filename)),
+                            transferred_fs_ids: vec![],
+                        });
+                    }
+                }
+            }
+
+            // 检查转存数量限制
+            let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
+            let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
+            if target_file_nums > target_file_nums_limit {
+                return Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(format!(
+                        "转存文件数 {} 超过上限 {}",
+                        target_file_nums, target_file_nums_limit
+                    )),
+                    transferred_fs_ids: vec![],
+                });
+            }
+
+            Ok(crate::transfer::TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            })
+        } else if errno == 4 {
+            // errno=4 + duplicated 字段 = 文件/文件夹重复
+            // 百度的 show_msg 可能显示"请求超时"，但实际是重复
+            let duplicated = &json["duplicated"];
+            if duplicated.is_object() || duplicated.is_array() {
+                // 提取重复文件名
+                let dup_names: Vec<String> = duplicated["list"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| item["server_filename"].as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let error_msg = if dup_names.is_empty() {
+                    "目标位置已存在同名文件/文件夹".to_string()
+                } else {
+                    format!("目标位置已存在同名文件: {}", dup_names.join(", "))
+                };
+                Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(error_msg),
+                    transferred_fs_ids: vec![],
+                })
+            } else {
+                // 没有 duplicated 字段，可能是真的超时
+                let show_msg = json["show_msg"].as_str().unwrap_or("请求超时").to_string();
+                Ok(crate::transfer::TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(show_msg),
+                    transferred_fs_ids: vec![],
+                })
+            }
+        } else {
+            Ok(crate::transfer::TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            })
+        }
+    }
+    /// 查询异步转存任务状态
+    ///
+    /// 使用阶梯式轮询策略查询百度网盘异步转存任务的完成状态。
+    ///
+    /// # 轮询策略
+    ///
+    /// | 尝试次数范围 | 基础间隔 | 随机抖动 | 实际间隔范围 |
+    /// |------------|---------|---------|------------|
+    /// | 第 1 次 | 0秒 | 无 | 0秒（立即） |
+    /// | 第 2-5 次 | 1秒 | ±200ms | 0.8-1.2秒 |
+    /// | 第 6-10 次 | 2秒 | ±400ms | 1.6-2.4秒 |
+    /// | 第 11+ 次 | 5秒 | ±1000ms | 4.0-6.0秒 |
+    ///
+    /// # 终止条件
+    ///
+    /// - `status == "success"` → 任务完成，返回结果
+    /// - `status == "failed"` 或 `task_errno != 0` → 任务失败，返回错误
+    /// - `errno != 0` → API 错误，返回错误
+    /// - `status == "running"` 或其他状态 → 继续轮询
+    ///
+    /// # 参数
+    ///
+    /// - `task_id`: 异步任务 ID（从转存 API 响应获取）
+    /// - `shareid`: 分享 ID
+    /// - `share_uk`: 分享者 UK
+    /// - `bdstoken`: 用户会话令牌
+    /// - `referer`: HTTP Referer 头
+    ///
+    /// # 返回
+    ///
+    /// 成功时返回 `TransferResult`，包含转存的文件路径和 fs_id 列表
+    pub async fn query_transfer_task(
+        &self,
+        task_id: &str,
+        shareid: &str,
+        share_uk: &str,
+        bdstoken: &str,
+        referer: &str,
+        internal_task_id: Option<&str>,
+    ) -> Result<crate::transfer::TransferResult> {
+        use rand::Rng;
+
+        let mut attempt = 0;
+
+        loop {
+            attempt += 1;
+
+            // 计算延迟时间（阶梯式策略 + 随机抖动）
+            let delay_ms = if attempt == 1 {
+                0 // 第 1 次：立即
+            } else {
+                let (base_ms, jitter_ms) = match attempt {
+                    2..=5 => (1000, 200),   // 第 2-5 次：1秒 ± 200ms
+                    6..=10 => (2000, 400),  // 第 6-10 次：2秒 ± 400ms
+                    _ => (5000, 1000),      // 第 11+ 次：5秒 ± 1000ms
+                };
+
+                // 生成随机抖动
+                let mut rng = rand::thread_rng();
+                let jitter = rng.gen_range(-jitter_ms..=jitter_ms);
+                (base_ms + jitter).max(0) as u64
+            };
+
+            // 等待延迟
+            if delay_ms > 0 {
+                debug!(
+                        "异步转存任务查询 - 尝试 {}: 等待 {}ms 后查询",
+                        attempt, delay_ms
+                    );
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            } else {
+                debug!("异步转存任务查询 - 尝试 {}: 立即查询", attempt);
+            }
+
+            // 构建查询 URL
+            let url = format!(
+                "https://pan.baidu.com/share/taskquery?\
+                     taskid={}&shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+                task_id, shareid, share_uk, bdstoken, BAIDU_APP_ID
+            );
+
+            // 发送请求
+            let response = self
+                .client
+                .get(&url)
+                .header("User-Agent", &self.web_user_agent)
+                .header("Referer", referer)
+                .send()
+                .await;
+
+            let response = match response {
+                Ok(resp) => {
+                    self.record_proxy_success();
+                    resp
+                }
+                Err(e) => {
+                    let err = anyhow::Error::from(e).context("任务查询请求失败");
+                    self.record_proxy_failure(&err);
+                    return Err(err);
+                }
+            };
+
+            let response_text = response.text().await.context("读取任务查询响应失败")?;
+            debug!("任务查询响应 (尝试 {}): {}", attempt, response_text);
+
+            let json: Value = serde_json::from_str(&response_text).context("解析任务查询响应失败")?;
+
+            let errno = json["errno"].as_i64().unwrap_or(-1);
+            let task_errno = json["task_errno"].as_i64().unwrap_or(0);
+            let status = json["status"].as_str().unwrap_or("");
+
+            // 检查 API 错误
+            if errno != 0 {
+                return Err(anyhow::anyhow!(
+                        "任务查询 API 错误: errno={}, response={}",
+                        errno,
+                        response_text
+                    ));
+            }
+
+            // 检查任务错误
+            if task_errno != 0 {
+                let show_msg = json["show_msg"].as_str().unwrap_or("");
+                let progress = json["progress"].as_str().unwrap_or("");
+                warn!(
+                        "异步转存任务失败: baidu_task_id={}, internal_task_id={}, task_errno={}, status={}, show_msg='{}', progress='{}'",
+                        task_id,
+                        internal_task_id.unwrap_or("N/A"),
+                        task_errno,
+                        status,
+                        show_msg,
+                        progress
+                    );
+                return Err(anyhow::anyhow!(
+                        "异步转存任务失败: task_errno={}, response={}",
+                        task_errno,
+                        response_text
+                    ));
+            }
+
+            // 检查任务状态
+            match status {
+                "success" => {
+                    // 任务完成，提取结果
+                    info!(
+                            "异步转存任务完成 (task_id={}, 尝试次数={})",
+                            task_id, attempt
+                        );
+
+                    let list = json["list"].as_array();
+                    let mut transferred_paths = Vec::new();
+                    let mut transferred_fs_ids = Vec::new();
+                    let mut from_paths = Vec::new();
+
+                    if let Some(list) = list {
+                        for item in list {
+                            if let Some(path) = item["to"].as_str() {
+                                transferred_paths.push(path.to_string());
+                            }
+                            if let Some(from) = item["from"].as_str() {
+                                from_paths.push(from.to_string());
+                            }
+                            if let Some(fsid) = item["to_fs_id"].as_u64() {
+                                transferred_fs_ids.push(fsid);
+                            }
+                        }
+
+                        info!(
+                                "异步转存成功: {} 个文件 (使用 list.length)",
+                                list.len()
+                            );
+                    } else {
+                        warn!("任务查询响应中没有 list 字段");
+                    }
+
+                    return Ok(crate::transfer::TransferResult {
+                        success: true,
+                        transferred_paths,
+                        from_paths,
+                        error: None,
+                        transferred_fs_ids,
+                    });
+                }
+                "failed" => {
+                    // 任务失败
+                    return Err(anyhow::anyhow!(
+                            "异步转存任务失败: status=failed, response={}",
+                            response_text
+                        ));
+                }
+                "running" => {
+                    // 任务仍在运行，继续轮询
+                    debug!(
+                            "异步转存任务仍在运行 (task_id={}, 尝试 {})",
+                            task_id, attempt
+                        );
+                    continue;
+                }
+                _ => {
+                    // 未知状态，记录警告并继续轮询（兼容性考虑）
+                    warn!(
+                            "异步转存任务状态未知: status='{}', 继续轮询 (尝试 {})",
+                            status, attempt
+                        );
+                    continue;
+                }
+            }
+        }
+    }
+
+    // =====================================================
+    // 离线下载（Cloud Download）相关 API
+    // =====================================================
+
+    /// 标准化磁力链接
+    ///
+    /// 百度网盘离线下载 API 只接受大写十六进制格式的 info hash。
+    /// 此函数将 Base32 编码的 hash 转换为十六进制，并将小写转换为大写。
+    /// 同时简化磁力链接，只保留 xt 参数，去掉 tracker 等其他参数。
+    ///
+    /// # 参数
+    /// * `magnet_url` - 原始磁力链接
+    ///
+    /// # 返回
+    /// 标准化后的磁力链接（格式：magnet:?xt=urn:btih:HASH）
+    fn normalize_magnet_link(magnet_url: &str) -> String {
+        // 检查是否是磁力链接
+        if !magnet_url.to_lowercase().starts_with("magnet:?") {
+            return magnet_url.to_string();
+        }
+
+        // 解析磁力链接参数，提取 info hash
+        let query_start = magnet_url.find('?').unwrap_or(magnet_url.len());
+        let query_str = &magnet_url[query_start + 1..];
+
+        // 只提取 xt 参数中的 info hash，忽略其他参数（tr, dn 等）
+        // 百度 API 只需要简单的 magnet:?xt=urn:btih:HASH 格式
+        for param in query_str.split('&') {
+            if let Some((key, value)) = param.split_once('=') {
+                if key == "xt" && value.to_lowercase().starts_with("urn:btih:") {
+                    // 提取 info hash
+                    let hash = &value[9..]; // 跳过 "urn:btih:"
+
+                    let normalized_hash = if hash.len() == 32 {
+                        // Base32 编码，需要转换为十六进制
+                        match Self::base32_to_hex(hash) {
+                            Some(hex) => {
+                                info!(
+                                    "磁力链接 hash 从 Base32 转换为十六进制: {} -> {}",
+                                    hash, hex
+                                );
+                                hex
+                            }
+                            None => {
+                                warn!("Base32 解码失败，保持原样: {}", hash);
+                                hash.to_uppercase()
+                            }
+                        }
+                    } else if hash.len() == 40 {
+                        // 已经是十六进制，只需转换为大写
+                        let upper = hash.to_uppercase();
+                        if upper != hash {
+                            info!("磁力链接 hash 转换为大写: {} -> {}", hash, upper);
+                        }
+                        upper
+                    } else {
+                        // 未知格式，保持原样
+                        warn!("未知的 info hash 格式 (长度={}): {}", hash.len(), hash);
+                        hash.to_string()
+                    };
+
+                    // 返回简化的磁力链接，只包含 xt 参数
+                    let result = format!("magnet:?xt=urn:btih:{}", normalized_hash);
+                    info!("磁力链接标准化完成: {} -> {}", magnet_url, result);
+                    return result;
+                }
+            }
+        }
+
+        // 没有找到有效的 xt 参数，返回原始链接
+        warn!("磁力链接中未找到有效的 xt 参数: {}", magnet_url);
+        magnet_url.to_string()
+    }
+
+    /// 将 Base32 编码的字符串转换为十六进制
+    ///
+    /// BitTorrent 使用的是 RFC 4648 Base32 编码（无填充）
+    fn base32_to_hex(base32: &str) -> Option<String> {
+        // Base32 字母表 (RFC 4648)
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+
+        let input = base32.to_uppercase();
+        let input_bytes = input.as_bytes();
+
+        // 验证输入长度（32 字符 Base32 = 20 字节 = 40 字符十六进制）
+        if input_bytes.len() != 32 {
+            return None;
+        }
+
+        // 解码 Base32
+        let mut bits: u64 = 0;
+        let mut bit_count = 0;
+        let mut output = Vec::with_capacity(20);
+
+        for &c in input_bytes {
+            let value = ALPHABET.iter().position(|&x| x == c)? as u64;
+            bits = (bits << 5) | value;
+            bit_count += 5;
+
+            if bit_count >= 8 {
+                bit_count -= 8;
+                output.push((bits >> bit_count) as u8);
+                bits &= (1 << bit_count) - 1;
+            }
+        }
+
+        // 转换为十六进制（大写）
+        let hex: String = output.iter().map(|b| format!("{:02X}", b)).collect();
+
+        Some(hex)
+    }
+
+    /// 查询磁力链接信息，获取文件列表
+    ///
+    /// # 参数
+    /// * `magnet_url` - 磁力链接
+    /// * `save_path` - 保存路径
+    ///
+    /// # 返回
+    /// 文件数量
+    async fn cloud_dl_query_magnet_info(&self, magnet_url: &str, save_path: &str) -> Result<usize> {
+        info!("查询磁力链接信息: {}", magnet_url);
+
+        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .form(&[
+                ("method", "query_magnetinfo"),
+                ("app_id", "250528"),
+                ("source_url", magnet_url),
+                ("save_path", save_path),
+                ("type", "4"),
+            ])
+            .send()
+            .await
+            .context("查询磁力链接信息请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取磁力链接信息响应失败")?;
+
+        info!("查询磁力链接信息响应: status={}, body={}", status, response_text);
+
+        // 解析响应，提取文件数量
+        let json: serde_json::Value =
+            serde_json::from_str(&response_text).context("解析磁力链接信息响应失败")?;
+
+        // 检查错误码
+        if let Some(error_code) = json.get("error_code").and_then(|v| v.as_i64()) {
+            if error_code != 0 {
+                let error_msg = json
+                    .get("error_msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("未知错误");
+                anyhow::bail!("查询磁力链接信息失败: {} ({})", error_msg, error_code);
+            }
+        }
+
+        // 提取文件列表
+        let file_count = json
+            .get("magnet_info")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.len())
+            .unwrap_or(0);
+
+        info!("磁力链接包含 {} 个文件", file_count);
+
+        Ok(file_count)
+    }
+
+    /// 添加离线下载任务
+    ///
+    /// # 参数
+    /// * `source_url` - 下载源链接（支持 HTTP/HTTPS/磁力链接/ed2k）
+    /// * `save_path` - 网盘保存路径（默认为根目录 "/"）
+    ///
+    /// # 返回
+    /// 新创建的任务 ID
+    pub async fn cloud_dl_add_task(&self, source_url: &str, save_path: &str) -> Result<i64> {
+        info!("添加离线下载任务: source_url={}, save_path={}", source_url, save_path);
+
+        // 标准化磁力链接（将 Base32 转换为十六进制，小写转大写）
+        let normalized_url = Self::normalize_magnet_link(source_url);
+
+        // 判断是否为磁力链接
+        let is_magnet = normalized_url.starts_with("magnet:");
+
+        // 对于磁力链接，需要先查询文件列表，然后选择所有文件
+        let selected_idx = if is_magnet {
+            match self.cloud_dl_query_magnet_info(&normalized_url, save_path).await {
+                Ok(file_count) if file_count > 0 => {
+                    // 生成所有文件的索引：1,2,3,...,n（索引从1开始）
+                    let indices: Vec<String> = (1..=file_count).map(|i| i.to_string()).collect();
+                    indices.join(",")
+                }
+                Ok(_) => {
+                    warn!("磁力链接文件列表为空，使用默认索引");
+                    String::new()
+                }
+                Err(e) => {
+                    warn!("查询磁力链接信息失败: {}，使用默认索引", e);
+                    String::new()
+                }
+            }
+        } else {
+            // 非磁力链接不需要 selected_idx
+            String::new()
+        };
+
+        info!("selected_idx={}", selected_idx);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=add_task&\
+             app_id=250528&\
+             task_from=0&\
+             selected_idx={}&\
+             save_path={}&\
+             source_url={}",
+            urlencoding::encode(&selected_idx),
+            urlencoding::encode(save_path),
+            urlencoding::encode(&normalized_url)
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("添加离线下载任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取添加任务响应失败")?;
+
+        info!("添加离线任务响应: status={}, body={}", status, response_text);
+
+        let api_response: crate::netdisk::cloud_dl::BaiduAddTaskResponse =
+            serde_json::from_str(&response_text).context("解析添加任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "添加离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("添加离线任务失败: {}", error_msg);
+        }
+
+        info!("添加离线任务成功: task_id={}", api_response.task_id);
+        Ok(api_response.task_id)
+    }
+
+    /// 查询离线下载任务列表
+    ///
+    /// # 参数
+    /// * `start` - 起始位置（默认 0）
+    /// * `limit` - 返回数量限制（默认 1000）
+    /// * `status` - 状态过滤（255 表示所有状态）
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_list_task(&self) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        self.cloud_dl_list_task_with_params(0, 1000, 255).await
+    }
+
+    /// 查询离线下载任务列表（带参数）
+    ///
+    /// # 参数
+    /// * `start` - 起始位置
+    /// * `limit` - 返回数量限制
+    /// * `status` - 状态过滤（255 表示所有状态）
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_list_task_with_params(
+        &self,
+        start: u32,
+        limit: u32,
+        status: u32,
+    ) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        info!(
+            "查询离线下载任务列表: start={}, limit={}, status={}",
+            start, limit, status
+        );
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=list_task&\
+             need_task_info=1&\
+             status={}&\
+             start={}&\
+             limit={}&\
+             app_id=250528",
+            status, start, limit
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("查询离线任务列表请求失败")?;
+
+        let status_code = response.status();
+        let response_text = response.text().await.context("读取任务列表响应失败")?;
+
+        debug!(
+            "查询离线任务列表响应: status={}, body={}",
+            status_code, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduListTaskResponse =
+            serde_json::from_str(&response_text).map_err(|e| {
+                error!(
+                    "解析任务列表响应失败: error={}, response_text={}",
+                    e, response_text
+                );
+                anyhow::anyhow!("解析任务列表响应失败: {}", e)
+            })?;
+
+        if api_response.errno != 0 {
+            error!(
+                "查询离线任务列表失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "查询离线任务列表失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        let tasks: Vec<crate::netdisk::CloudDlTaskInfo> = api_response
+            .task_info
+            .into_iter()
+            .map(|t| t.into_task_info())
+            .collect();
+
+        info!("查询到 {} 个离线下载任务", tasks.len());
+        Ok(tasks)
+    }
+
+    /// 查询指定任务详情
+    ///
+    /// # 参数
+    /// * `task_ids` - 任务 ID 列表
+    ///
+    /// # 返回
+    /// 任务信息列表
+    pub async fn cloud_dl_query_task(
+        &self,
+        task_ids: &[i64],
+    ) -> Result<Vec<crate::netdisk::CloudDlTaskInfo>> {
+        if task_ids.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let ids_str = task_ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+
+        info!("查询离线任务详情: task_ids={}", ids_str);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=query_task&\
+             app_id=250528&\
+             op_type=1&\
+             task_ids={}",
+            ids_str
+        );
+
+        let response = self
+            .client
+            .get(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("查询离线任务详情请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取任务详情响应失败")?;
+
+        info!(
+            "查询离线任务详情响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduQueryTaskResponse =
+            serde_json::from_str(&response_text).context("解析任务详情响应失败")?;
+
+        if api_response.errno != 0 {
+            error!(
+                "查询离线任务详情失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "查询离线任务详情失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        // task_info 是一个对象，key 是 task_id，value 是任务信息
+        let mut tasks = Vec::new();
+        if let Some(task_map) = api_response.task_info.as_object() {
+            for (task_id_str, task_value) in task_map {
+                if let Ok(mut baidu_task) =
+                    serde_json::from_value::<crate::netdisk::cloud_dl::BaiduTaskInfo>(
+                        task_value.clone(),
+                    )
+                {
+                    // 如果 task_id 为空，使用 JSON key 作为 task_id
+                    if baidu_task.task_id.is_empty() {
+                        baidu_task.task_id = task_id_str.clone();
+                    }
+                    tasks.push(baidu_task.into_task_info());
+                }
+            }
+        }
+
+        info!("查询到 {} 个任务详情", tasks.len());
+        Ok(tasks)
+    }
+
+    /// 取消离线下载任务
+    ///
+    /// # 参数
+    /// * `task_id` - 任务 ID
+    ///
+    /// # 返回
+    /// 操作是否成功
+    pub async fn cloud_dl_cancel_task(&self, task_id: i64) -> Result<()> {
+        info!("取消离线下载任务: task_id={}", task_id);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=cancel_task&\
+             app_id=250528&\
+             task_id={}",
+            task_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("取消离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取取消任务响应失败")?;
+
+        debug!(
+            "取消离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduOperationResponse =
+            serde_json::from_str(&response_text).context("解析取消任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "取消离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("{}", error_msg);
+        }
+
+        info!("取消离线任务成功: task_id={}", task_id);
+        Ok(())
+    }
+
+    /// 删除离线下载任务
+    ///
+    /// # 参数
+    /// * `task_id` - 任务 ID
+    ///
+    /// # 返回
+    /// 操作是否成功
+    pub async fn cloud_dl_delete_task(&self, task_id: i64) -> Result<()> {
+        info!("删除离线下载任务: task_id={}", task_id);
+
+        let url = format!(
+            "https://pan.baidu.com/rest/2.0/services/cloud_dl?\
+             method=delete_task&\
+             app_id=250528&\
+             task_id={}",
+            task_id
+        );
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("删除离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取删除任务响应失败")?;
+
+        info!(
+            "删除离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduOperationResponse =
+            serde_json::from_str(&response_text).context("解析删除任务响应失败")?;
+
+        if !api_response.is_success() {
+            let error_code = api_response.get_error_code();
+            let error_msg = api_response.get_error_msg();
+            error!(
+                "删除离线任务失败: error_code={}, error_msg={}",
+                error_code, error_msg
+            );
+            anyhow::bail!("{}", error_msg);
+        }
+
+        info!("删除离线任务成功: task_id={}", task_id);
+        Ok(())
+    }
+
+    /// 清空离线下载任务记录
+    ///
+    /// # 返回
+    /// 清空的任务数量
+    pub async fn cloud_dl_clear_task(&self) -> Result<i32> {
+        info!("清空离线下载任务记录");
+
+        let url = "https://pan.baidu.com/rest/2.0/services/cloud_dl?method=clear_task&app_id=250528";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .send()
+            .await
+            .context("清空离线任务请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取清空任务响应失败")?;
+
+        debug!(
+            "清空离线任务响应: status={}, body={}",
+            status, response_text
+        );
+
+        let api_response: crate::netdisk::cloud_dl::BaiduClearTaskResponse =
+            serde_json::from_str(&response_text).context("解析清空任务响应失败")?;
+
+        if api_response.errno != 0 {
+            error!(
+                "清空离线任务失败: errno={}, errmsg={}",
+                api_response.errno, api_response.errmsg
+            );
+            anyhow::bail!(
+                "清空离线任务失败: errno={}, errmsg={}",
+                api_response.errno,
+                api_response.errmsg
+            );
+        }
+
+        info!("清空离线任务成功: total={}", api_response.total);
+        Ok(api_response.total)
+    }
+
+    // =====================================================
+    // 分享链接相关 API
+    // =====================================================
+
+    /// 创建分享链接
+    ///
+    /// # 参数
+    /// * `paths` - 文件路径列表
+    /// * `period` - 有效期（0=永久, 1=1天, 7=7天, 30=30天）
+    /// * `pwd` - 提取码（4位字符）
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/share/pset
+    /// Content-Type: application/x-www-form-urlencoded
+    /// 参数: path_list=["path1","path2"], schannel=4, channel_list=[], period=7, pwd=xxxx, share_type=9
+    ///
+    /// # 返回
+    /// ShareSetResponse 包含 link, pwd, shareid
+    pub async fn share_set(
+        &self,
+        paths: &[String],
+        period: i32,
+        pwd: &str,
+    ) -> Result<crate::netdisk::ShareSetResponse> {
+        info!(
+            "创建分享链接: paths={:?}, period={}, pwd={}",
+            paths, period, pwd
+        );
+
+        // 构建 path_list JSON 数组
+        let path_list = serde_json::to_string(paths).context("序列化路径列表失败")?;
+
+        let url = "https://pan.baidu.com/share/pset";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .form(&[
+                ("path_list", path_list.as_str()),
+                ("period", &period.to_string()),
+                ("pwd", pwd),
+                ("schannel", "4"),
+                ("channel_list", "[]"),
+                ("share_type", "9"),
+            ])
+            .send()
+            .await
+            .context("创建分享链接请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享响应失败")?;
+
+        info!(
+            "创建分享链接响应: status={}, body={}",
+            status, response_text
+        );
+
+        let share_response: crate::netdisk::ShareSetResponse =
+            serde_json::from_str(&response_text).context("解析分享响应失败")?;
+
+        if share_response.is_success() {
+            info!(
+                "创建分享链接成功: link={}, shareid={}",
+                share_response.link, share_response.shareid
+            );
+        } else {
+            warn!(
+                "创建分享链接失败: errno={}, errmsg={}",
+                share_response.errno, share_response.errmsg
+            );
+        }
+
+        Ok(share_response)
+    }
+
+    /// 取消分享
+    ///
+    /// # 参数
+    /// * `share_ids` - 分享ID列表
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/share/cancel
+    /// 参数: shareid_list=[123,456]
+    ///
+    /// # 返回
+    /// ShareCancelResponse
+    pub async fn share_cancel(
+        &self,
+        share_ids: &[u64],
+    ) -> Result<crate::netdisk::ShareCancelResponse> {
+        info!("取消分享: share_ids={:?}", share_ids);
+
+        // 构建 shareid_list JSON 数组
+        let shareid_list = serde_json::to_string(share_ids).context("序列化分享ID列表失败")?;
+
+        let url = "https://pan.baidu.com/share/cancel";
+
+        let response = self
+            .client
+            .post(url)
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .form(&[("shareid_list", shareid_list.as_str())])
+            .send()
+            .await
+            .context("取消分享请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取取消分享响应失败")?;
+
+        info!("取消分享响应: status={}, body={}", status, response_text);
+
+        let cancel_response: crate::netdisk::ShareCancelResponse =
+            serde_json::from_str(&response_text).context("解析取消分享响应失败")?;
+
+        if cancel_response.is_success() {
+            info!("取消分享成功");
+        } else {
+            warn!(
+                "取消分享失败: errno={}, errmsg={}",
+                cancel_response.errno, cancel_response.errmsg
+            );
+        }
+
+        Ok(cancel_response)
+    }
+
+    /// 获取分享列表
+    ///
+    /// # 参数
+    /// * `page` - 页码（从1开始）
+    ///
+    /// # API
+    /// GET https://pan.baidu.com/share/record?page=1&desc=1&order=time
+    ///
+    /// # 返回
+    /// ShareListResponse
+    pub async fn share_list(&self, page: u32) -> Result<crate::netdisk::ShareListResponse> {
+        info!("获取分享列表: page={}", page);
+
+        let url = "https://pan.baidu.com/share/record";
+        let page_str = page.to_string();
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("page", page_str.as_str()),
+                ("desc", "1"),
+                ("order", "time"),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .send()
+            .await
+            .context("获取分享列表请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享列表响应失败")?;
+
+        // 临时使用 info 级别日志查看响应内容
+        info!("获取分享列表响应: status={}, body={}", status, response_text);
+
+        let list_response: crate::netdisk::ShareListResponse =
+            serde_json::from_str(&response_text).context("解析分享列表响应失败")?;
+
+        if list_response.is_success() {
+            info!(
+                "获取分享列表成功: total={}, count={}",
+                list_response.total,
+                list_response.list.len()
+            );
+        } else {
+            warn!(
+                "获取分享列表失败: errno={}, errmsg={}",
+                list_response.errno, list_response.errmsg
+            );
+        }
+
+        Ok(list_response)
+    }
+
+    /// 获取分享详情（包含提取码）
+    ///
+    /// # 参数
+    /// * `share_id` - 分享ID
+    ///
+    /// # API
+    /// GET https://pan.baidu.com/share/surlinfoinrecord?shareid=xxx&sign=xxx
+    /// 注意: sign 需要使用 ShareSURLInfoSign 算法生成
+    ///
+    /// # 返回
+    /// ShareSURLInfoResponse（pwd="0" 时表示无密码，会转换为空字符串）
+    pub async fn share_surl_info(
+        &self,
+        share_id: u64,
+    ) -> Result<crate::netdisk::ShareSURLInfoResponse> {
+        info!("获取分享详情: share_id={}", share_id);
+
+        // 使用签名算法生成 sign
+        let sign = crate::sign::share_surl_info_sign(share_id);
+
+        let url = "https://pan.baidu.com/share/surlinfoinrecord";
+
+        let response = self
+            .client
+            .get(url)
+            .query(&[
+                ("shareid", share_id.to_string().as_str()),
+                ("sign", sign.as_str()),
+            ])
+            .header("Cookie", format!("BDUSS={}", self.bduss()))
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .send()
+            .await
+            .context("获取分享详情请求失败")?;
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取分享详情响应失败")?;
+
+        debug!(
+            "获取分享详情响应: status={}, body={}",
+            status, response_text
+        );
+
+        let mut info_response: crate::netdisk::ShareSURLInfoResponse =
+            serde_json::from_str(&response_text).context("解析分享详情响应失败")?;
+
+        // 处理 pwd="0" 的情况，转换为空字符串
+        if info_response.pwd == "0" {
+            info_response.pwd = String::new();
+        }
+
+        if info_response.is_success() {
+            info!(
+                "获取分享详情成功: shorturl={}, has_pwd={}",
+                info_response.shorturl,
+                !info_response.pwd.is_empty()
+            );
+        } else {
+            warn!(
+                "获取分享详情失败: errno={}, errmsg={}",
+                info_response.errno, info_response.errmsg
+            );
+        }
+
+        Ok(info_response)
+    }
+
+    // =====================================================
+    // 文件删除相关 API
+    // =====================================================
+
+    /// 删除网盘文件/文件夹
+    ///
+    /// # 参数
+    /// * `paths` - 要删除的文件/文件夹路径列表
+    ///
+    /// # API
+    /// POST https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken=xxx&newVerify=1&clienttype=0&app_id=250528&web=1
+    /// Content-Type: application/x-www-form-urlencoded
+    /// Body: filelist=["path1","path2"]
+    ///
+    /// # 返回
+    /// DeleteFilesResponse（可能部分成功）
+    ///
+    /// # 示例
+    /// ```ignore
+    /// let response = client.delete_files(&["/test/file.txt".to_string()]).await?;
+    /// if response.success {
+    ///     println!("删除成功: {} 个文件", response.deleted_count);
+    /// } else {
+    ///     println!("删除失败: {:?}", response.failed_paths);
+    /// }
+    /// ```
+    pub async fn delete_files(
+        &self,
+        paths: &[String],
+    ) -> Result<crate::netdisk::DeleteFilesResponse> {
+        use crate::netdisk::DeleteFilesResponse;
+
+        if paths.is_empty() {
+            return Ok(DeleteFilesResponse::success(0));
+        }
+
+        info!("删除网盘文件: paths={:?}", paths);
+
+        // 获取 bdstoken
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，无法删除文件")),
+            }
+        };
+
+        // 构建 filelist JSON: ["/path1","/path2"]
+        let filelist_json = serde_json::to_string(paths).context("序列化文件列表失败")?;
+
+        debug!("删除文件 filelist: {}", filelist_json);
+
+        // 使用 Web API 删除文件（与网页端一致）
+        let url = format!(
+            "https://pan.baidu.com/api/filemanager?opera=delete&async=2&onnest=fail&bdstoken={}&newVerify=1&clienttype=0&app_id={}&web=1",
+            urlencoding::encode(&bdstoken),
+            BAIDU_APP_ID
+        );
+
+        // 收集 cookies 并创建独立 client（与 create_folder 一致）
+        let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+        let pan_client = self.build_temp_client_with_proxy()?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+        headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+
+        let response = pan_client
+            .post(&url)
+            .headers(headers)
+            .form(&[("filelist", filelist_json.as_str())])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context("删除文件请求失败");
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response.text().await.context("读取删除文件响应失败")?;
+
+        info!(
+            "删除文件响应: status={}, body={}",
+            status, response_text
+        );
+
+        // 解析响应
+        let api_response: crate::netdisk::DeleteFilesApiResponse =
+            serde_json::from_str(&response_text).context("解析删除文件响应失败")?;
+
+        if api_response.is_success() {
+            info!("删除文件成功: {} 个文件", paths.len());
+            Ok(DeleteFilesResponse::success(paths.len()))
+        } else {
+            // API 返回错误
+            let error_msg = if api_response.errmsg.is_empty() {
+                format!("删除失败: errno={}", api_response.errno)
+            } else {
+                api_response.errmsg.clone()
+            };
+
+            // errno 12: 文件不存在（可能已被删除），视为成功（幂等性）
+            if api_response.errno == 12 {
+                warn!("文件不存在（errno=12），视为删除成功");
+                Ok(DeleteFilesResponse::success(paths.len()))
+            } else {
+                // 风控/删除失败诊断摘要（不打印完整 safesign 避免日志泄露）
+                if api_response.errno == 132 {
+                    let widget_summary = api_response.authwidget.as_ref().map(|w| {
+                        format!(
+                            "saferand={}, safetpl={}, safesign_len={}",
+                            w.saferand.as_deref().unwrap_or(""),
+                            w.safetpl.as_deref().unwrap_or(""),
+                            w.safesign.as_deref().map(|s| s.len()).unwrap_or(0)
+                        )
+                    });
+                    warn!(
+                        "删除被风控拦截(errno=132): errmsg={}, widget=[{}], verify_scene={:?}",
+                        error_msg,
+                        widget_summary.as_deref().unwrap_or("N/A"),
+                        api_response.verify_scene
+                    );
+                } else {
+                    error!(
+                        "删除文件失败: errno={}, errmsg={}, verify_scene={:?}",
+                        api_response.errno, error_msg, api_response.verify_scene
+                    );
+                }
+                Ok(DeleteFilesResponse::failure_with_errno(
+                    error_msg,
+                    api_response.errno,
+                    api_response.authwidget,
+                    api_response.verify_scene,
+                ))
+            }
+        }
+    }
+
+    /// 分块删除：规避「目录内文件过多 → 一次性删除文件数超阈值」触发的
+    /// 百度二次安全验证（errno=132）。
+    ///
+    /// 策略:
+    /// 1. 先整批删除一次（小目录/少量文件可直接成功，避免多余的列目录请求）；
+    /// 2. 若命中 errno=132，则递归列出各目录,把所有叶子文件分批删除
+    ///    （每批 ≤ `BAIDUPCS_DELETE_CHUNK_SIZE`，默认 100），文件清空后再删空壳目录；
+    /// 3. 分块过程中若再次命中 132，说明账号已被风控标记,拆分也无济于事 ——
+    ///    立即返回该 132 响应,交由上层引导用户去网页端完成安全验证。
+    pub async fn delete_files_chunked(
+        &self,
+        paths: &[String],
+    ) -> Result<crate::netdisk::DeleteFilesResponse> {
+        use crate::netdisk::DeleteFilesResponse;
+
+        if paths.is_empty() {
+            return Ok(DeleteFilesResponse::success(0));
+        }
+
+        let chunk_size = std::env::var("BAIDUPCS_DELETE_CHUNK_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DELETE_CHUNK_SIZE);
+
+        // 第一步:整批删除一次。
+        match self.delete_files(paths).await {
+            Ok(r) if r.success => return Ok(r),
+            Ok(r) if r.errno == Some(132) => {
+                info!(
+                    "删除命中 errno=132(二次验证),改为分块删除规避: {} 个顶层路径, chunk_size={}",
+                    paths.len(),
+                    chunk_size
+                );
+            }
+            Ok(r) => return Ok(r), // 其它失败原样返回
+            Err(e) => return Err(e),
+        }
+
+        // 第二步:枚举所有叶子文件 + 顶层目录/文件。
+        let mut leaf_files: Vec<String> = Vec::new();
+        let mut container_dirs: Vec<String> = Vec::new();
+        let mut direct_files: Vec<String> = Vec::new();
+        for p in paths {
+            let mut stack: Vec<String> = vec![p.clone()];
+            let mut is_dir_tree = false;
+            while let Some(d) = stack.pop() {
+                match self.try_list_all_children(&d).await? {
+                    Some(children) => {
+                        if &d == p {
+                            is_dir_tree = true;
+                        }
+                        for item in children {
+                            if item.isdir == 1 {
+                                stack.push(item.path);
+                            } else {
+                                leaf_files.push(item.path);
+                            }
+                        }
+                    }
+                    None => {
+                        if &d == p {
+                            direct_files.push(p.clone());
+                        }
+                    }
+                }
+            }
+            if is_dir_tree {
+                container_dirs.push(p.clone());
+            }
+        }
+
+        info!(
+            "分块删除枚举完成: {} 个叶子文件, {} 个顶层文件, {} 个顶层目录",
+            leaf_files.len(),
+            direct_files.len(),
+            container_dirs.len()
+        );
+
+        // 第三步:分批删除。叶子文件 → 顶层文件 → 清空后的顶层目录。
+        let mut deleted = 0usize;
+        // 顶层目录留到最后删(此时内部文件已清空,删整目录只计 0 个文件,不再触发阈值)。
+        let batches: Vec<&[String]> = leaf_files
+            .chunks(chunk_size)
+            .chain(direct_files.chunks(chunk_size))
+            .chain(container_dirs.chunks(chunk_size))
+            .collect();
+        let risk_retries = std::env::var("BAIDUPCS_DELETE_RISK_RETRIES")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(DELETE_RISK_RETRIES);
+        for (i, batch) in batches.iter().enumerate() {
+            // 单批删除:命中 errno=132 时按指数退避 + 抖动重试,给瞬时风控一个缓冲;
+            // 重试耗尽仍 132 才认定账号被标记,上报让用户去网页端完成安全验证。
+            let mut attempt = 0u32;
+            let r = loop {
+                let r = self.delete_files(batch).await?;
+                if r.errno == Some(132) && attempt < risk_retries {
+                    let backoff = Self::delete_risk_backoff_delay(attempt);
+                    warn!(
+                        "分块删除第 {} 批命中 errno=132,退避重试 {}/{},等待 {:?}",
+                        i + 1,
+                        attempt + 1,
+                        risk_retries,
+                        backoff
+                    );
+                    tokio::time::sleep(backoff).await;
+                    attempt += 1;
+                    continue;
+                }
+                break r;
+            };
+            if r.success {
+                deleted += batch.len();
+            } else if r.errno == Some(132) {
+                // 退避重试后仍被风控:账号已被标记,拆分也无济于事,上报让用户去验证。
+                warn!(
+                    "分块删除第 {} 批退避 {} 次后仍命中 errno=132,账号疑似被风控标记,交由上层引导验证",
+                    i + 1,
+                    risk_retries
+                );
+                return Ok(r);
+            } else {
+                return Ok(r);
+            }
+            // 批次之间随机抖动节流,降低被频率风控的概率。
+            if i + 1 < batches.len() {
+                tokio::time::sleep(Self::delete_batch_delay()).await;
+            }
+        }
+
+        Ok(DeleteFilesResponse::success(deleted))
+    }
+
+    /// 分块删除批次之间的等待:基础间隔 ± 抖动（避免固定节奏被频率风控识别）。
+    fn delete_batch_delay() -> std::time::Duration {
+        use rand::Rng;
+        let base = std::env::var("BAIDUPCS_DELETE_BATCH_DELAY_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DELETE_BATCH_DELAY_MS);
+        let ratio = std::env::var("BAIDUPCS_DELETE_BATCH_JITTER_RATIO")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|r| *r >= 0.0)
+            .unwrap_or(DELETE_BATCH_JITTER_RATIO);
+        let delta = (base as f64 * ratio) as i64;
+        let offset = if delta > 0 {
+            rand::thread_rng().gen_range(-delta..=delta)
+        } else {
+            0
+        };
+        let ms = (base as i64 + offset).max(0) as u64;
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// errno=132 退避重试的第 `attempt`（从 0 起）次等待:base × 2^attempt ± 抖动。
+    fn delete_risk_backoff_delay(attempt: u32) -> std::time::Duration {
+        use rand::Rng;
+        let base = std::env::var("BAIDUPCS_DELETE_RISK_BACKOFF_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DELETE_RISK_BACKOFF_MS);
+        let factor = 1u64 << attempt.min(5); // 2^attempt,封顶避免过长
+        let scaled = base.saturating_mul(factor);
+        let delta = (scaled / 4) as i64; // ±25% 抖动
+        let offset = if delta > 0 {
+            rand::thread_rng().gen_range(-delta..=delta)
+        } else {
+            0
+        };
+        let ms = (scaled as i64 + offset).max(0) as u64;
+        std::time::Duration::from_millis(ms)
+    }
+
+    /// 列出某目录下的全部子项(自动翻页)。若该路径不是目录(列表接口返回非 0 errno),返回 `None`。
+    async fn try_list_all_children(
+        &self,
+        dir: &str,
+    ) -> Result<Option<Vec<crate::netdisk::FileItem>>> {
+        const PAGE_SIZE: u32 = 1000;
+        let mut page = 1u32;
+        let mut all: Vec<crate::netdisk::FileItem> = Vec::new();
+        loop {
+            let resp = self.get_file_list(dir, page, PAGE_SIZE).await?;
+            if resp.errno != 0 {
+                if page == 1 {
+                    return Ok(None); // 不是目录(或不可访问)
+                }
+                break; // 翻页中途出错:返回已收集到的部分
+            }
+            let n = resp.list.len() as u32;
+            all.extend(resp.list);
+            if n < PAGE_SIZE {
+                break;
+            }
+            page += 1;
+            if page > 100_000 {
+                break; // 安全上限
+            }
+        }
+        Ok(Some(all))
+    }
+
+    // =====================================================
+    // 文件管理操作（filemanager: copy / move / rename）
+    // =====================================================
+
+    /// 内部辅助：向 `pan.baidu.com/api/filemanager` 发送 POST 请求
+    ///
+    /// 共用 `delete_files` 已建立的请求模式：
+    /// - `bdstoken` 锁内 clone 后立即释放
+    /// - 通过 `collect_all_baidu_cookies()` 拼装 Cookie
+    /// - 独立 `pan_client`（HTTP/2 连接池复用、代理配置）
+    /// - `application/x-www-form-urlencoded` 提交 `filelist`
+    ///
+    /// 返回响应原始 body 文本（已脱敏前的 raw body，由调用方在入日志前再脱敏）。
+    async fn filemanager_post(&self, opera: &str, filelist_json: &str) -> Result<String> {
+        let bdstoken = {
+            let token_guard = self.bdstoken.lock().await;
+            match token_guard.as_ref() {
+                Some(token) if !token.is_empty() => token.clone(),
+                _ => return Err(anyhow::anyhow!("bdstoken 尚未获取，无法调用 filemanager")),
+            }
+        };
+
+        let url = format!(
+            "https://pan.baidu.com/api/filemanager?opera={}&async=2&onnest=fail&bdstoken={}&newVerify=1&clienttype=0&app_id={}&web=1",
+            opera,
+            urlencoding::encode(&bdstoken),
+            BAIDU_APP_ID
+        );
+
+        let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+        let pan_client = self.build_temp_client_with_proxy()?;
+
+        let mut headers = HeaderMap::new();
+        headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+        headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+        headers.insert(
+            "Referer",
+            HeaderValue::from_static("https://pan.baidu.com/disk/main"),
+        );
+
+        debug!("filemanager POST opera={} filelist_len={}", opera, filelist_json.len());
+
+        let response = pan_client
+            .post(&url)
+            .headers(headers)
+            .form(&[("filelist", filelist_json)])
+            .send()
+            .await;
+
+        let response = match response {
+            Ok(resp) => {
+                self.record_proxy_success();
+                resp
+            }
+            Err(e) => {
+                let err = anyhow::Error::from(e).context(format!("filemanager {} 请求失败", opera));
+                self.record_proxy_failure(&err);
+                return Err(err);
+            }
+        };
+
+        let status = response.status();
+        let response_text = response
+            .text()
+            .await
+            .context(format!("读取 filemanager {} 响应失败", opera))?;
+        let safe_body = redact_authwidget_in_body(&response_text);
+        info!("filemanager {} 响应: status={}, body={}", opera, status, safe_body);
+
+        Ok(response_text)
+    }
+
+    /// 解析 filemanager POST 响应，转换为 `FileOperationOutcome`
+    ///
+    /// 决策点：
+    /// - `errno != 0` → `Failed { errno=Some(resp.errno), task_errno=None, authwidget?, verify_scene? }`
+    /// - `errno == 0 && taskid == 0` → 同步完成，返回 Success（罕见）
+    /// - `errno == 0 && taskid != 0` → 进入 `query_filemanager_task` 轮询
+    async fn handle_filemanager_result(&self, body: &str) -> Result<FileOperationOutcome> {
+        let resp: FileManagerResponse = serde_json::from_str(body)
+            .with_context(|| format!("解析 filemanager 响应失败: body={}", redact_authwidget_in_body(body)))?;
+
+        if resp.errno != 0 {
+            let message = if !resp.errmsg.is_empty() {
+                resp.errmsg.clone()
+            } else {
+                format!("filemanager 失败: errno={}", resp.errno)
+            };
+            return Ok(FileOperationOutcome::Failed {
+                message,
+                payload: FileOperationErrorPayload {
+                    taskid: resp.taskid,
+                    errno: Some(resp.errno),
+                    task_errno: None,
+                    authwidget: resp.authwidget,
+                    verify_scene: resp.verify_scene,
+                    still_running: false,
+                },
+            });
+        }
+
+        if resp.taskid == 0 {
+            // 同步完成（罕见路径）：百度协议下偶尔出现 errno=0 且无 taskid
+            return Ok(FileOperationOutcome::Success(FileOperationSuccess {
+                taskid: 0,
+                total: 0,
+                list: Vec::new(),
+            }));
+        }
+
+        // 进入异步轮询
+        self.query_filemanager_task(resp.taskid).await
+    }
+
+    /// 查询 filemanager 异步任务状态（轮询 `share/taskquery`）
+    ///
+    /// 复用 `query_transfer_task` 的阶梯式退避策略；最多 60 次仍未完成时返回
+    /// `Failed { still_running=true }`。
+    async fn query_filemanager_task(&self, taskid: i64) -> Result<FileOperationOutcome> {
+        use rand::Rng;
+        const MAX_ATTEMPTS: u32 = 60;
+
+        // filemanager 的 taskquery 不需要 bdstoken / shareid / from（与 transfer 任务查询不同），
+        // 文档明确要求仅传 taskid + clienttype + app_id + web，详见
+        // docs/批量复制移动重命名功能开发文档.md §2.5。
+        let mut attempt: u32 = 0;
+        loop {
+            attempt += 1;
+            if attempt > MAX_ATTEMPTS {
+                warn!("filemanager taskquery 轮询达到上限 {} 次仍未完成: taskid={}", MAX_ATTEMPTS, taskid);
+                return Ok(FileOperationOutcome::Failed {
+                    message: "任务仍在后台处理，请稍后刷新查看".to_string(),
+                    payload: FileOperationErrorPayload {
+                        taskid,
+                        errno: None,
+                        task_errno: None,
+                        authwidget: None,
+                        verify_scene: None,
+                        still_running: true,
+                    },
+                });
+            }
+
+            // 阶梯式延迟 + 抖动
+            let delay_ms: u64 = if attempt == 1 {
+                0
+            } else {
+                let (base_ms, jitter_ms) = match attempt {
+                    2..=5 => (1000u64, 200u64),
+                    6..=10 => (2000, 400),
+                    _ => (5000, 1000),
+                };
+                let mut rng = rand::thread_rng();
+                let jitter = rng.gen_range(-(jitter_ms as i64)..=(jitter_ms as i64));
+                ((base_ms as i64 + jitter).max(0)) as u64
+            };
+            if delay_ms > 0 {
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay_ms)).await;
+            }
+
+            let url = format!(
+                "https://pan.baidu.com/share/taskquery?taskid={}&clienttype=0&app_id={}&web=1",
+                taskid, BAIDU_APP_ID
+            );
+
+            let merged_cookie_str = self.collect_all_baidu_cookies().await?;
+            let pan_client = self.build_temp_client_with_proxy()?;
+            let mut headers = HeaderMap::new();
+            headers.insert("User-Agent", HeaderValue::from_str(&self.web_user_agent)?);
+            headers.insert("Cookie", HeaderValue::from_str(&merged_cookie_str)?);
+            headers.insert(
+                "Referer",
+                HeaderValue::from_static("https://pan.baidu.com/disk/main"),
+            );
+
+            let response = pan_client.get(&url).headers(headers).send().await;
+            let response = match response {
+                Ok(resp) => {
+                    self.record_proxy_success();
+                    resp
+                }
+                Err(e) => {
+                    let err = anyhow::Error::from(e).context("filemanager taskquery 请求失败");
+                    self.record_proxy_failure(&err);
+                    return Err(err);
+                }
+            };
+            let body = response
+                .text()
+                .await
+                .context("读取 filemanager taskquery 响应失败")?;
+            let safe_body = redact_authwidget_in_body(&body);
+            debug!("filemanager taskquery 响应 (尝试 {}): {}", attempt, safe_body);
+
+            let parsed: FileManagerTaskQueryResponse = serde_json::from_str(&body).with_context(|| {
+                format!("解析 filemanager taskquery 响应失败: body={}", safe_body)
+            })?;
+
+            // body 本身 errno != 0：透传 errno，并同步填 task_errno（与 status=failed 路径保持一致，便于 -6/111 retry 判定）
+            if parsed.errno != 0 {
+                let message = if !parsed.show_msg.is_empty() {
+                    parsed.show_msg.clone()
+                } else if !parsed.errmsg.is_empty() {
+                    parsed.errmsg.clone()
+                } else {
+                    format!("任务查询失败: errno={}", parsed.errno)
+                };
+                return Ok(FileOperationOutcome::Failed {
+                    message,
+                    payload: FileOperationErrorPayload {
+                        taskid,
+                        errno: Some(parsed.errno),
+                        task_errno: Some(parsed.errno),
+                        authwidget: parsed.authwidget,
+                        verify_scene: parsed.verify_scene,
+                        still_running: false,
+                    },
+                });
+            }
+
+            match parsed.status.as_str() {
+                "success" => {
+                    info!("filemanager 任务完成: taskid={} total={}", taskid, parsed.total);
+                    return Ok(FileOperationOutcome::Success(FileOperationSuccess {
+                        taskid,
+                        total: parsed.total,
+                        list: parsed.list,
+                    }));
+                }
+                "failed" => {
+                    let message = if !parsed.show_msg.is_empty() {
+                        parsed.show_msg.clone()
+                    } else if !parsed.errmsg.is_empty() {
+                        parsed.errmsg.clone()
+                    } else {
+                        format!("任务失败: task_errno={}", parsed.task_errno)
+                    };
+                    return Ok(FileOperationOutcome::Failed {
+                        message,
+                        payload: FileOperationErrorPayload {
+                            taskid,
+                            // status=failed 同步写 errno = task_errno，保证 should_retry_after_warmup
+                            // 在判断 -6/111 时不会因为只看 errno 而漏分支。
+                            errno: Some(parsed.task_errno),
+                            task_errno: Some(parsed.task_errno),
+                            authwidget: parsed.authwidget,
+                            verify_scene: parsed.verify_scene,
+                            still_running: false,
+                        },
+                    });
+                }
+                "running" | "pending" | "" => {
+                    // 继续轮询
+                    continue;
+                }
+                other => {
+                    // 未知状态，按容错策略继续轮询
+                    warn!("filemanager taskquery 未知状态: status='{}' (尝试 {})", other, attempt);
+                    continue;
+                }
+            }
+        }
+    }
+
+    /// 批量复制文件（filemanager opera=copy）
+    ///
+    /// 入参 `items` 中每条 item 必须已经经过 handler 层路径归一化与校验（含
+    /// 加密保护、文件名校验、根路径拒绝）。本方法不做这些校验。
+    pub async fn copy_files(&self, items: &[FileOperationItem]) -> Result<FileOperationOutcome> {
+        if items.is_empty() {
+            return Err(anyhow::anyhow!("copy_files: items 不能为空"));
+        }
+        let filelist_json = serde_json::to_string(items).context("序列化 copy filelist 失败")?;
+        let body = self.filemanager_post("copy", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+
+    /// 批量移动文件（filemanager opera=move）
+    pub async fn move_files(&self, items: &[FileOperationItem]) -> Result<FileOperationOutcome> {
+        if items.is_empty() {
+            return Err(anyhow::anyhow!("move_files: items 不能为空"));
+        }
+        let filelist_json = serde_json::to_string(items).context("序列化 move filelist 失败")?;
+        let body = self.filemanager_post("move", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+
+    /// 重命名单个文件（filemanager opera=rename）
+    ///
+    /// 接收 owned `RenameItem`：rename 单条 item，调用方按需 clone 以支持 warmup 重试。
+    pub async fn rename_file(&self, item: RenameItem) -> Result<FileOperationOutcome> {
+        let filelist_json = serde_json::to_string(&[item]).context("序列化 rename filelist 失败")?;
+        let body = self.filemanager_post("rename", &filelist_json).await?;
+        self.handle_filemanager_result(&body).await
+    }
+}
+
+/// 校验文件名合法性（前后端共用规则）
+///
+/// 拒绝条件：
+/// - 空字符串
+/// - UTF-16 code units 长度 > 255（与前端 `String.length` 完全一致）
+/// - `.` / `..`
+/// - 含 `/` `\` `:` `*` `?` `"` `<` `>` `|` 任一字符
+/// - 含 ASCII 控制字符（`\x00`-`\x1F` 或 `\x7F`）
+/// - 首/尾空格
+/// - 尾部 `.`
+/// - Windows 保留名（含大小写、含扩展名、仅 stem 三种形态）：
+///   `CON` / `PRN` / `AUX` / `NUL` / `COM1`-`COM9` / `LPT1`-`LPT9`
+pub fn validate_filename(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    // UTF-16 code units 长度边界（与前端 `String.length` 对齐）
+    if name.encode_utf16().count() > 255 {
+        return Err("名称过长（最长 255 个字符）".to_string());
+    }
+    if name == "." || name == ".." {
+        return Err(format!("名称不能为 {}", name));
+    }
+    // 非法字符
+    const ILLEGAL: &[char] = &['/', '\\', ':', '*', '?', '"', '<', '>', '|'];
+    if let Some(c) = name.chars().find(|c| ILLEGAL.contains(c)) {
+        return Err(format!("名称含非法字符: {}", c));
+    }
+    // ASCII 控制字符
+    if name.chars().any(|c| (c as u32) < 0x20 || (c as u32) == 0x7F) {
+        return Err("名称含控制字符".to_string());
+    }
+    // 首尾空格
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return Err("名称不能以空格开头或结尾".to_string());
+    }
+    // 尾部点
+    if name.ends_with('.') {
+        return Err("名称不能以 . 结尾".to_string());
+    }
+    // Windows 保留名（取 stem 部分对比，大小写不敏感）
+    let stem = name.split('.').next().unwrap_or(name).to_uppercase();
+    const RESERVED: &[&str] = &[
+        "CON", "PRN", "AUX", "NUL",
+        "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+        "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    ];
+    if RESERVED.contains(&stem.as_str()) {
+        return Err(format!("名称不能使用系统保留词: {}", stem));
+    }
+    Ok(())
+}
+
+/// 脱敏响应 body 中的 `authwidget.safesign` / `safetpl` / `saferand` 后再入日志
+///
+/// 使用规约：所有可能含 `authwidget` 的接口（filemanager、share/taskquery 等）的
+/// raw body 在进入 `info!` / `debug!` / `anyhow::Context::with_context` 之前必须先经过本函数。
+pub fn redact_authwidget_in_body(body: &str) -> String {
+    if !body.contains("authwidget") {
+        return body.to_string();
+    }
+    // 静态正则缓存，避免日志路径热点上重复编译。本项目当前 rustc 1.80+ 可用 LazyLock。
+    static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r#""(safesign|safetpl|saferand)"\s*:\s*"[^"]*""#)
+            .expect("redact regex 静态字面量不会编译失败")
+    });
+    RE.replace_all(body, r#""$1":"<redacted>""#).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_user_auth() -> UserAuth {
+        UserAuth::new(123456789, "test_user".to_string(), "test_bduss".to_string())
+    }
+
+    #[test]
+    fn test_netdisk_client_creation() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth.clone());
+
+        assert!(client.is_ok());
+
+        let client = client.unwrap();
+        assert_eq!(client.uid(), user_auth.uid);
+        assert_eq!(client.bduss(), user_auth.bduss);
+    }
+
+    #[test]
+    fn test_default_user_agent() {
+        let ua = NetdiskClient::default_mobile_user_agent();
+        assert!(ua.contains("netdisk"));
+        assert!(ua.contains("android"));
+    }
+
+    #[test]
+    fn test_parse_share_link_s_format() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试 /s/{key} 格式
+        let result = client.parse_share_link("https://pan.baidu.com/s/1abcDEFg");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        assert_eq!(share_link.short_key, "1abcDEFg");
+        assert!(share_link.password.is_none());
+    }
+
+    #[test]
+    fn test_parse_share_link_with_password() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试带密码的链接
+        let result = client.parse_share_link("https://pan.baidu.com/s/1abcDEFg?pwd=a1b2");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        assert_eq!(share_link.short_key, "1abcDEFg");
+        assert_eq!(share_link.password, Some("a1b2".to_string()));
+    }
+
+    #[test]
+    fn test_parse_share_link_surl_format() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试 /share/init?surl={key} 格式
+        let result = client.parse_share_link("https://pan.baidu.com/share/init?surl=abcDEFg");
+        assert!(result.is_ok());
+        let share_link = result.unwrap();
+        // surl 格式需要加 "1" 前缀
+        assert_eq!(share_link.short_key, "1abcDEFg");
+    }
+
+    #[test]
+    fn test_parse_share_link_invalid() {
+        let user_auth = create_test_user_auth();
+        let client = NetdiskClient::new(user_auth).unwrap();
+
+        // 测试无效链接
+        let result = client.parse_share_link("https://google.com/file");
+        assert!(result.is_err());
+    }
+
+    // =====================================================
+    // DeleteFilesResponse 单元测试
+    // =====================================================
+
+    #[test]
+    fn test_delete_files_response_success() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试成功响应
+        let response = DeleteFilesResponse::success(3);
+        assert!(response.success);
+        assert!(response.error.is_none());
+        assert!(response.failed_paths.is_empty());
+        assert_eq!(response.deleted_count, 3);
+    }
+
+    #[test]
+    fn test_delete_files_response_partial_success() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试部分成功响应
+        let failed_paths = vec!["/test/file1.txt".to_string(), "/test/file2.txt".to_string()];
+        let response = DeleteFilesResponse::partial_success(5, failed_paths.clone());
+
+        assert!(!response.success);
+        assert!(response.error.is_some());
+        assert!(response.error.as_ref().unwrap().contains("部分文件删除失败"));
+        assert_eq!(response.failed_paths, failed_paths);
+        assert_eq!(response.deleted_count, 5);
+    }
+
+    #[test]
+    fn test_delete_files_response_failure() {
+        use crate::netdisk::DeleteFilesResponse;
+
+        // 测试失败响应
+        let error_msg = "网络错误".to_string();
+        let response = DeleteFilesResponse::failure(error_msg.clone());
+
+        assert!(!response.success);
+        assert_eq!(response.error, Some(error_msg));
+        assert!(response.failed_paths.is_empty());
+        assert_eq!(response.deleted_count, 0);
+    }
+
+    #[test]
+    fn test_delete_files_api_response_success() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试 API 成功响应解析
+        let json = r#"{"errno": 0, "errmsg": "", "request_id": 12345}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.is_success());
+        assert_eq!(response.errno, 0);
+        assert_eq!(response.request_id, 12345);
+    }
+
+    #[test]
+    fn test_delete_files_api_response_error() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试 API 错误响应解析
+        let json = r#"{"errno": 31066, "errmsg": "文件不存在", "request_id": 12345}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(!response.is_success());
+        assert_eq!(response.errno, 31066);
+        assert_eq!(response.errmsg, "文件不存在");
+    }
+
+    #[test]
+    fn test_delete_files_api_response_partial_fields() {
+        use crate::netdisk::DeleteFilesApiResponse;
+
+        // 测试部分字段缺失的响应解析
+        let json = r#"{"errno": 0}"#;
+        let response: DeleteFilesApiResponse = serde_json::from_str(json).unwrap();
+
+        assert!(response.is_success());
+        assert_eq!(response.errmsg, "");
+        assert_eq!(response.request_id, 0);
+    }
+}
+
+// ============================================
+// 保留属性测试 - 异步转存任务查询修复
+// ============================================
+// 这些测试验证同步转存行为在修复后保持不变（无回归）
+
+#[cfg(test)]
+mod transfer_preservation_tests {
+    use crate::transfer::TransferResult;
+    use proptest::prelude::*;
+    use serde_json::json;
+
+    // ============================================
+    // 测试辅助函数
+    // ============================================
+
+    /// 模拟同步转存响应（task_id=0，带 extra.list）
+    fn mock_sync_transfer_response(file_count: usize) -> String {
+        let list: Vec<_> = (0..file_count)
+            .map(|i| {
+                json!({
+                    "from": format!("/source/file{}.txt", i),
+                    "to": format!("/target/file{}.txt", i),
+                    "from_fs_id": 1000000 + i as u64,
+                    "to_fs_id": 2000000 + i as u64,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟同步转存响应（task_id 为字符串 "0"）
+    fn mock_sync_transfer_response_string_zero(file_count: usize) -> String {
+        let list: Vec<_> = (0..file_count)
+            .map(|i| {
+                json!({
+                    "from": format!("/source/file{}.txt", i),
+                    "to": format!("/target/file{}.txt", i),
+                    "from_fs_id": 1000000 + i as u64,
+                    "to_fs_id": 2000000 + i as u64,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 0,
+            "task_id": "0",
+            "extra": {
+                "list": list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=4 重复文件错误响应
+    fn mock_duplicate_error_response(filenames: Vec<&str>) -> String {
+        let dup_list: Vec<_> = filenames
+            .iter()
+            .map(|name| {
+                json!({
+                    "server_filename": name,
+                    "fs_id": 123456,
+                })
+            })
+            .collect();
+
+        json!({
+            "errno": 4,
+            "show_msg": "请求超时",
+            "duplicated": {
+                "list": dup_list
+            }
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=4 但没有 duplicated 字段（真正的超时）
+    fn mock_timeout_error_response() -> String {
+        json!({
+            "errno": 4,
+            "show_msg": "请求超时"
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=12 部分错误（同名文件）
+    fn mock_partial_error_same_name(filename: &str) -> String {
+        json!({
+            "errno": 12,
+            "info": [
+                {
+                    "errno": -30,
+                    "path": format!("/target/{}", filename)
+                }
+            ]
+        })
+            .to_string()
+    }
+
+    /// 模拟 errno=12 转存数量超限
+    fn mock_transfer_limit_exceeded(current: u64, limit: u64) -> String {
+        json!({
+            "errno": 12,
+            "target_file_nums": current,
+            "target_file_nums_limit": limit
+        })
+            .to_string()
+    }
+
+    /// 解析转存响应（模拟 transfer_share_files 的核心逻辑）
+    fn parse_transfer_response(response_text: &str) -> TransferResult {
+        let json: serde_json::Value = serde_json::from_str(response_text).unwrap();
+        let errno = json["errno"].as_i64().unwrap_or(-1);
+
+        if errno == 0 {
+            // 检查是否为异步转存任务
+            let task_id_value = &json["task_id"];
+            let is_async_task = if task_id_value.is_string() {
+                let task_id_str = task_id_value.as_str().unwrap_or("");
+                !task_id_str.is_empty() && task_id_str != "0"
+            } else if task_id_value.is_u64() || task_id_value.is_i64() {
+                task_id_value.as_u64().unwrap_or(0) != 0
+            } else {
+                false
+            };
+
+            let has_extra = json["extra"]["list"].is_array();
+
+            if is_async_task && !has_extra {
+                // 异步模式 - 这不是我们在保留测试中测试的
+                return TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some("异步模式不在保留测试范围内".to_string()),
+                    transferred_fs_ids: vec![],
+                };
+            }
+
+            // 同步转存模式：提取 extra.list
+            let extra_list = json["extra"]["list"].as_array();
+            let mut transferred_paths = Vec::new();
+            let mut transferred_fs_ids = Vec::new();
+            let mut from_paths = Vec::new();
+
+            if let Some(list) = extra_list {
+                for item in list {
+                    if let Some(path) = item["to"].as_str() {
+                        transferred_paths.push(path.to_string());
+                    }
+                    if let Some(from) = item["from"].as_str() {
+                        from_paths.push(from.to_string());
+                    }
+                    if let Some(fsid) = item["to_fs_id"].as_u64() {
+                        transferred_fs_ids.push(fsid);
+                    }
+                }
+            }
+
+            TransferResult {
+                success: true,
+                transferred_paths,
+                from_paths,
+                error: None,
+                transferred_fs_ids,
+            }
+        } else if errno == 12 {
+            // 部分错误
+            let info_list = json["info"].as_array();
+            if let Some(list) = info_list {
+                if let Some(first) = list.first() {
+                    let inner_errno = first["errno"].as_i64().unwrap_or(0);
+                    if inner_errno == -30 {
+                        let path = first["path"].as_str().unwrap_or_default();
+                        let filename = std::path::Path::new(path)
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_else(|| path.to_string());
+                        return TransferResult {
+                            success: false,
+                            transferred_paths: vec![],
+                            from_paths: vec![],
+                            error: Some(format!("同名文件已存在: {}", filename)),
+                            transferred_fs_ids: vec![],
+                        };
+                    }
+                }
+            }
+
+            // 检查转存数量限制
+            let target_file_nums = json["target_file_nums"].as_u64().unwrap_or(0);
+            let target_file_nums_limit = json["target_file_nums_limit"].as_u64().unwrap_or(0);
+            if target_file_nums > target_file_nums_limit {
+                return TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(format!(
+                        "转存文件数 {} 超过上限 {}",
+                        target_file_nums, target_file_nums_limit
+                    )),
+                    transferred_fs_ids: vec![],
+                };
+            }
+
+            TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            }
+        } else if errno == 4 {
+            // errno=4 + duplicated 字段 = 文件/文件夹重复
+            let duplicated = &json["duplicated"];
+            if duplicated.is_object() || duplicated.is_array() {
+                let dup_names: Vec<String> = duplicated["list"]
+                    .as_array()
+                    .map(|list| {
+                        list.iter()
+                            .filter_map(|item| {
+                                item["server_filename"].as_str().map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let error_msg = if dup_names.is_empty() {
+                    "目标位置已存在同名文件/文件夹".to_string()
+                } else {
+                    format!("目标位置已存在同名文件: {}", dup_names.join(", "))
+                };
+                TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(error_msg),
+                    transferred_fs_ids: vec![],
+                }
+            } else {
+                let show_msg = json["show_msg"].as_str().unwrap_or("请求超时").to_string();
+                TransferResult {
+                    success: false,
+                    transferred_paths: vec![],
+                    from_paths: vec![],
+                    error: Some(show_msg),
+                    transferred_fs_ids: vec![],
+                }
+            }
+        } else {
+            TransferResult {
+                success: false,
+                transferred_paths: vec![],
+                from_paths: vec![],
+                error: Some(format!("转存失败: {}", response_text)),
+                transferred_fs_ids: vec![],
+            }
+        }
+    }
+
+    // ============================================
+    // 单元测试 - 同步转存保留
+    // ============================================
+
+    #[test]
+    fn test_sync_transfer_single_file_task_id_zero() {
+        // 需求 3.1: 同步转存（task_id=0）应继续从 extra.list 提取结果
+        let response = mock_sync_transfer_response(1);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success, "同步转存应该成功");
+        assert_eq!(result.transferred_paths.len(), 1, "应该转存 1 个文件");
+        assert_eq!(result.from_paths.len(), 1, "应该有 1 个源路径");
+        assert_eq!(result.transferred_fs_ids.len(), 1, "应该有 1 个 fs_id");
+        assert_eq!(result.transferred_paths[0], "/target/file0.txt");
+        assert_eq!(result.from_paths[0], "/source/file0.txt");
+        assert_eq!(result.transferred_fs_ids[0], 2000000);
+    }
+
+    #[test]
+    fn test_sync_transfer_task_id_string_zero() {
+        // 需求 3.1: task_id="0" 也应该被视为同步模式
+        let response = mock_sync_transfer_response_string_zero(1);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success, "task_id='0' 应该被视为同步模式");
+        assert_eq!(result.transferred_paths.len(), 1);
+    }
+
+    #[test]
+    fn test_sync_transfer_multiple_files() {
+        // 需求 3.1, 3.2: 多文件同步转存应正确提取所有路径
+        let response = mock_sync_transfer_response(5);
+        let result = parse_transfer_response(&response);
+
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 5);
+        assert_eq!(result.from_paths.len(), 5);
+        assert_eq!(result.transferred_fs_ids.len(), 5);
+
+        // 验证路径映射正确
+        for i in 0..5 {
+            assert_eq!(
+                result.transferred_paths[i],
+                format!("/target/file{}.txt", i)
+            );
+            assert_eq!(result.from_paths[i], format!("/source/file{}.txt", i));
+            assert_eq!(result.transferred_fs_ids[i], 2000000 + i as u64);
+        }
+    }
+
+    // ============================================
+    // 单元测试 - 错误处理保留
+    // ============================================
+
+    #[test]
+    fn test_errno_4_duplicate_with_filenames() {
+        // 需求 3.3: errno=4 + duplicated 字段应报告重复文件
+        let response = mock_duplicate_error_response(vec!["test.txt", "doc.pdf"]);
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success, "重复文件应该失败");
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(
+            error_msg.contains("同名文件"),
+            "错误消息应包含'同名文件': {}",
+            error_msg
+        );
+        assert!(error_msg.contains("test.txt"), "应包含文件名 test.txt");
+        assert!(error_msg.contains("doc.pdf"), "应包含文件名 doc.pdf");
+    }
+
+    #[test]
+    fn test_errno_4_duplicate_without_filenames() {
+        // 需求 3.3: errno=4 + duplicated 但没有文件名列表
+        let response = json!({
+            "errno": 4,
+            "duplicated": {}
+        })
+            .to_string();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("同名文件"));
+    }
+
+    #[test]
+    fn test_errno_4_timeout_without_duplicated() {
+        // 需求 3.3: errno=4 但没有 duplicated 字段应报告超时
+        let response = mock_timeout_error_response();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert_eq!(error_msg, "请求超时");
+    }
+
+    #[test]
+    fn test_errno_12_same_name_file() {
+        // 需求 3.3: errno=12 + inner errno=-30 应报告同名文件
+        let response = mock_partial_error_same_name("existing.txt");
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("同名文件已存在"));
+        assert!(error_msg.contains("existing.txt"));
+    }
+
+    #[test]
+    fn test_errno_12_transfer_limit_exceeded() {
+        // 需求 3.3: errno=12 转存数量超限
+        let response = mock_transfer_limit_exceeded(150, 100);
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+        let error_msg = result.error.unwrap();
+        assert!(error_msg.contains("超过上限"));
+        assert!(error_msg.contains("150"));
+        assert!(error_msg.contains("100"));
+    }
+
+    #[test]
+    fn test_other_errno_generic_error() {
+        // 需求 3.3: 其他 errno 应返回通用错误
+        let response = json!({
+            "errno": -1,
+            "show_msg": "未知错误"
+        })
+            .to_string();
+        let result = parse_transfer_response(&response);
+
+        assert!(!result.success);
+        assert!(result.error.is_some());
+    }
+
+    // ============================================
+    // 基于属性的测试 - 同步转存保留
+    // ============================================
+
+    proptest! {
+        #[test]
+        fn prop_sync_transfer_preserves_file_count(file_count in 1usize..20) {
+            // 属性 2: 对于所有同步转存，提取的文件数应等于 extra.list 的长度
+            let response = mock_sync_transfer_response(file_count);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(result.success);
+            prop_assert_eq!(result.transferred_paths.len(), file_count);
+            prop_assert_eq!(result.from_paths.len(), file_count);
+            prop_assert_eq!(result.transferred_fs_ids.len(), file_count);
+        }
+
+        #[test]
+        fn prop_sync_transfer_path_mapping_correct(file_count in 1usize..20) {
+            // 属性 2: 对于所有同步转存，路径映射应正确（from -> to）
+            let response = mock_sync_transfer_response(file_count);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(result.success);
+            for i in 0..file_count {
+                prop_assert_eq!(
+                    &result.transferred_paths[i],
+                    &format!("/target/file{}.txt", i)
+                );
+                prop_assert_eq!(
+                    &result.from_paths[i],
+                    &format!("/source/file{}.txt", i)
+                );
+                prop_assert_eq!(
+                    result.transferred_fs_ids[i],
+                    2000000 + i as u64
+                );
+            }
+        }
+
+        #[test]
+        fn prop_error_responses_always_fail(errno in 1i64..100) {
+            // 属性 2: 对于所有错误响应（errno != 0），结果应该失败
+            if errno == 0 {
+                return Ok(());
+            }
+
+            let response = json!({
+                "errno": errno,
+                "show_msg": format!("错误码 {}", errno)
+            }).to_string();
+
+            let result = parse_transfer_response(&response);
+            prop_assert!(!result.success);
+            prop_assert!(result.error.is_some());
+        }
+
+        #[test]
+        fn prop_duplicate_error_contains_filenames(
+            filename1 in "[a-z]{3,10}\\.txt",
+            filename2 in "[a-z]{3,10}\\.pdf"
+        ) {
+            // 属性 2: errno=4 重复错误应包含所有文件名
+            let response = mock_duplicate_error_response(vec![&filename1, &filename2]);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(!result.success);
+            let error_msg = result.error.unwrap();
+            prop_assert!(error_msg.contains(&filename1));
+            prop_assert!(error_msg.contains(&filename2));
+        }
+
+        #[test]
+        fn prop_transfer_limit_error_contains_numbers(
+            current in 100u64..1000,
+            limit in 1u64..100
+        ) {
+            // 属性 2: 转存数量超限错误应包含当前值和限制值
+            let response = mock_transfer_limit_exceeded(current, limit);
+            let result = parse_transfer_response(&response);
+
+            prop_assert!(!result.success);
+            let error_msg = result.error.unwrap();
+            prop_assert!(error_msg.contains(&current.to_string()));
+            prop_assert!(error_msg.contains(&limit.to_string()));
+        }
+    }
+
+    // ============================================
+    // bdstoken 参数保留测试
+    // ============================================
+
+    #[test]
+    fn test_bdstoken_parameter_format() {
+        // 需求 3.4: 验证 bdstoken 参数格式
+        // 注意：这个测试验证 URL 构建逻辑，实际的 HTTP 请求由 NetdiskClient 处理
+
+        let shareid = "123456";
+        let share_uk = "789012";
+        let bdstoken = "test_token_abc123";
+        let app_id = "250528";
+
+        let url = format!(
+            "https://pan.baidu.com/share/transfer?\
+             shareid={}&from={}&bdstoken={}&app_id={}&channel=chunlei&clienttype=0&web=1",
+            shareid, share_uk, bdstoken, app_id
+        );
+
+        // 验证 URL 包含所有必需参数
+        assert!(url.contains("shareid=123456"));
+        assert!(url.contains("from=789012"));
+        assert!(url.contains("bdstoken=test_token_abc123"));
+        assert!(url.contains("app_id=250528"));
+        assert!(url.contains("channel=chunlei"));
+        assert!(url.contains("clienttype=0"));
+        assert!(url.contains("web=1"));
+    }
+
+    // ============================================
+    // 边界情况测试
+    // ============================================
+
+    #[test]
+    fn test_empty_extra_list() {
+        // 边界情况: extra.list 为空数组（转存 0 个文件）
+        let response = json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": []
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 0);
+        assert_eq!(result.from_paths.len(), 0);
+        assert_eq!(result.transferred_fs_ids.len(), 0);
+    }
+
+    #[test]
+    fn test_missing_optional_fields_in_list() {
+        // 边界情况: list 项中缺少某些可选字段
+        let response = json!({
+            "errno": 0,
+            "task_id": 0,
+            "extra": {
+                "list": [
+                    {
+                        "to": "/target/file1.txt",
+                        // 缺少 from 和 to_fs_id
+                    },
+                    {
+                        "from": "/source/file2.txt",
+                        "to_fs_id": 2000001
+                        // 缺少 to
+                    }
+                ]
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        // 应该只提取存在的字段
+        assert_eq!(result.transferred_paths.len(), 1); // 只有第一项有 to
+        assert_eq!(result.from_paths.len(), 1); // 只有第二项有 from
+        assert_eq!(result.transferred_fs_ids.len(), 1); // 只有第二项有 to_fs_id
+    }
+
+    #[test]
+    fn test_task_id_empty_string() {
+        // 边界情况: task_id 为空字符串应视为同步模式
+        let response = json!({
+            "errno": 0,
+            "task_id": "",
+            "extra": {
+                "list": [
+                    {
+                        "from": "/source/file.txt",
+                        "to": "/target/file.txt",
+                        "to_fs_id": 2000000
+                    }
+                ]
+            }
+        })
+            .to_string();
+
+        let result = parse_transfer_response(&response);
+        assert!(result.success);
+        assert_eq!(result.transferred_paths.len(), 1);
+    }
+
+    // =====================================================
+    // filemanager（copy / move / rename）相关单元测试
+    // =====================================================
+
+    use crate::netdisk::{
+        FileManagerResponse, FileManagerTaskQueryResponse,
+    };
+    use crate::netdisk::client::{redact_authwidget_in_body, validate_filename};
+
+    #[test]
+    fn test_filemanager_response_parse_taskid_number() {
+        let json = r#"{"errno":0,"taskid":290568593300395,"request_id":12345}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.taskid, 290568593300395);
+        assert_eq!(r.request_id, 12345);
+    }
+
+    #[test]
+    fn test_filemanager_response_parse_taskid_string() {
+        let json = r#"{"errno":0,"taskid":"290568593300395"}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.taskid, 290568593300395);
+    }
+
+    #[test]
+    fn test_filemanager_response_parse_errno_132() {
+        let json = r#"{"errno":132,"errmsg":"风控","authwidget":{"saferand":"abc","safesign":"sig","safetpl":"tpl"},"verify_scene":1}"#;
+        let r: FileManagerResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 132);
+        let aw = r.authwidget.expect("应解析出 authwidget");
+        assert_eq!(aw.saferand.as_deref(), Some("abc"));
+        assert_eq!(aw.safesign.as_deref(), Some("sig"));
+        assert_eq!(aw.safetpl.as_deref(), Some("tpl"));
+        assert_eq!(r.verify_scene, Some(1));
+    }
+
+    #[test]
+    fn test_delete_batch_delay_within_bounds() {
+        // 默认 base=400ms ± 50% → [200, 600]ms。多采样确保落在区间内。
+        let max = ((super::DELETE_BATCH_DELAY_MS as f64) * (1.0 + super::DELETE_BATCH_JITTER_RATIO)) as u128;
+        let min = ((super::DELETE_BATCH_DELAY_MS as f64) * (1.0 - super::DELETE_BATCH_JITTER_RATIO)) as u128;
+        for _ in 0..200 {
+            let ms = super::NetdiskClient::delete_batch_delay().as_millis();
+            assert!(ms <= max, "delay {ms} 超过上界 {max}");
+            assert!(ms >= min, "delay {ms} 低于下界 {min}");
+        }
+    }
+
+    #[test]
+    fn test_delete_risk_backoff_grows_with_attempt() {
+        // 退避随 attempt 指数增长(允许抖动,用宽松下界比较各档中位)。
+        let d0 = super::NetdiskClient::delete_risk_backoff_delay(0).as_millis();
+        let d2 = super::NetdiskClient::delete_risk_backoff_delay(2).as_millis();
+        // attempt=0 ≈ base(1500)±25% ≤ ~1875；attempt=2 ≈ base*4(6000)±25% ≥ 4500
+        assert!(d0 <= 1900, "attempt0 退避 {d0} 偏大");
+        assert!(d2 >= 4000, "attempt2 退避 {d2} 未随次数增长");
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_running() {
+        let json = r#"{"status":"running","progress":10}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.status, "running");
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_success() {
+        let json = r#"{"status":"success","list":[{"from":"/a/x","to":"/b/x"}],"total":1}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "success");
+        assert_eq!(r.list.len(), 1);
+        assert_eq!(r.total, 1);
+    }
+
+    #[test]
+    fn test_taskquery_response_parse_failed() {
+        let json = r#"{"status":"failed","task_errno":-6,"show_msg":"会话过期"}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.task_errno, -6);
+        assert_eq!(r.show_msg, "会话过期");
+    }
+
+    #[test]
+    fn test_taskquery_response_errno_default_zero() {
+        let json = r#"{}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.errno, 0);
+        assert_eq!(r.status, "");
+    }
+
+    #[test]
+    fn test_file_operation_item_serialize() {
+        use crate::netdisk::FileOperationItem;
+        let items = vec![FileOperationItem {
+            path: "/a/x.mp4".into(),
+            dest: "/b".into(),
+            newname: "x.mp4".into(),
+        }];
+        let s = serde_json::to_string(&items).unwrap();
+        // 字段集合与值一致即可，不断言对象字段顺序
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        let expected: serde_json::Value =
+            serde_json::from_str(r#"[{"path":"/a/x.mp4","dest":"/b","newname":"x.mp4"}]"#).unwrap();
+        assert_eq!(v, expected);
+        // 不出现 null / 默认字段
+        assert!(!s.contains("null"));
+    }
+
+    #[test]
+    fn test_rename_item_serialize() {
+        use crate::netdisk::RenameItem;
+        let it = RenameItem {
+            path: "/a/x.mp4".into(),
+            newname: "y.mp4".into(),
+            id: 1234567890,
+        };
+        let s = serde_json::to_string(&it).unwrap();
+        // id 必须是 number 而非 string
+        assert!(s.contains(r#""id":1234567890"#));
+        assert!(!s.contains(r#""id":"1234567890""#));
+    }
+
+    #[test]
+    fn test_validate_filename_basic() {
+        assert!(validate_filename("normal.txt").is_ok());
+        assert!(validate_filename("").is_err());
+        assert!(validate_filename(".").is_err());
+        assert!(validate_filename("..").is_err());
+        assert!(validate_filename("a/b").is_err());
+        assert!(validate_filename("a\\b").is_err());
+        assert!(validate_filename("a:b").is_err());
+        assert!(validate_filename("a*b").is_err());
+        assert!(validate_filename("a?b").is_err());
+        assert!(validate_filename("a\"b").is_err());
+        assert!(validate_filename("a<b").is_err());
+        assert!(validate_filename("a>b").is_err());
+        assert!(validate_filename("a|b").is_err());
+        assert!(validate_filename("a\x01b").is_err()); // 控制字符
+        assert!(validate_filename(" leading.txt").is_err());
+        assert!(validate_filename("trailing.txt ").is_err());
+        assert!(validate_filename("trailing.").is_err());
+    }
+
+    #[test]
+    fn test_validate_filename_utf16_boundary() {
+        let s255: String = "a".repeat(255);
+        let s256: String = "a".repeat(256);
+        assert!(validate_filename(&s255).is_ok());
+        assert!(validate_filename(&s256).is_err());
+        // emoji 占 2 个 UTF-16 code units
+        let mut emoji_long = String::new();
+        for _ in 0..127 {
+            emoji_long.push_str("😀"); // 2 cu * 127 = 254 cu
+        }
+        emoji_long.push('a'); // +1 = 255 cu
+        assert_eq!(emoji_long.encode_utf16().count(), 255);
+        assert!(validate_filename(&emoji_long).is_ok());
+        emoji_long.push('b'); // 256 cu
+        assert!(validate_filename(&emoji_long).is_err());
+    }
+
+    #[test]
+    fn test_validate_filename_windows_reserved() {
+        // 大小写、含扩展名、仅 stem 三种形态
+        for name in [
+            "CON", "con", "Con",
+            "PRN", "prn",
+            "AUX.txt", "aux.bak",
+            "NUL.bak", "nul",
+            "COM1", "com2", "COM9", "lpt1", "LPT9",
+        ] {
+            assert!(
+                validate_filename(name).is_err(),
+                "保留名 '{}' 应被拒绝",
+                name
+            );
+        }
+        // 非保留名必须通过
+        for name in ["NULL.txt", "CONSOLE.txt", "COM10", "LPT10", "comma.txt"] {
+            assert!(
+                validate_filename(name).is_ok(),
+                "非保留名 '{}' 应被接受",
+                name
+            );
+        }
+    }
+
+    #[test]
+    fn test_redact_authwidget_in_body_basic() {
+        let body = r#"{"errno":132,"authwidget":{"saferand":"r1","safesign":"sig123","safetpl":"tplA"}}"#;
+        let red = redact_authwidget_in_body(body);
+        assert!(red.contains(r#""saferand":"<redacted>""#));
+        assert!(red.contains(r#""safesign":"<redacted>""#));
+        assert!(red.contains(r#""safetpl":"<redacted>""#));
+        assert!(!red.contains("sig123"));
+    }
+
+    #[test]
+    fn test_redact_authwidget_in_body_no_widget() {
+        let body = r#"{"errno":0,"taskid":1}"#;
+        let red = redact_authwidget_in_body(body);
+        assert_eq!(red, body);
+    }
+
+    #[test]
+    fn test_authwidget_extra_passthrough() {
+        use crate::netdisk::AuthWidget;
+        let json = r#"{"saferand":"r","unknown_future_field":"abc","extra_obj":{"a":1}}"#;
+        let aw: AuthWidget = serde_json::from_str(json).unwrap();
+        assert_eq!(aw.saferand.as_deref(), Some("r"));
+        assert!(aw.safesign.is_none());
+        assert!(aw.extra.contains_key("unknown_future_field"));
+        assert!(aw.extra.contains_key("extra_obj"));
+    }
+
+    #[test]
+    fn test_taskquery_failed_errno_132() {
+        // status=failed + task_errno=132 必须能解析出 authwidget
+        let json = r#"{"status":"failed","task_errno":132,"authwidget":{"safesign":"x"}}"#;
+        let r: FileManagerTaskQueryResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(r.status, "failed");
+        assert_eq!(r.task_errno, 132);
+        let aw = r.authwidget.expect("authwidget 必须解析出来");
+        assert_eq!(aw.safesign.as_deref(), Some("x"));
+    }
+}

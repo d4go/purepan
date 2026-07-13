@@ -1,0 +1,143 @@
+// 认证API封装
+
+import axios from 'axios'
+
+// 本地存储键名（与 webAuth store 保持一致）
+const WEB_AUTH_ACCESS_TOKEN_KEY = 'web_auth_access_token'
+
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 20000,
+  headers: {
+    'Content-Type': 'application/json'
+  }
+})
+
+// 路径修正：axios 对以 / 开头的 URL 会忽略 baseURL，导致 Tauri 生产环境请求发到 webview
+// 而非后端。去掉前导 / 使其成为相对路径，让 axios 正确拼接 baseURL（已含 /api/v1 前缀）。
+apiClient.interceptors.request.use((config) => {
+  if (config.url && !config.url.startsWith('/api/') && !config.url.startsWith('http')) {
+    config.url = config.url.replace(/^\//, '')
+  }
+  return config
+})
+
+// 添加 Web 认证拦截器
+apiClient.interceptors.request.use(
+    (config) => {
+      const token = localStorage.getItem(WEB_AUTH_ACCESS_TOKEN_KEY)
+      if (token) {
+        config.headers.Authorization = `Bearer ${token}`
+      }
+      return config
+    },
+    (error) => Promise.reject(error)
+)
+
+// 响应拦截器
+apiClient.interceptors.response.use(
+    response => response.data,
+    error => {
+      console.error('API Error:', error)
+      return Promise.reject(error)
+    }
+)
+
+export interface ApiResponse<T> {
+  code: number
+  message: string
+  data?: T
+}
+
+export interface QRCode {
+  sign: string
+  image_base64: string
+  qrcode_url: string
+  created_at: number
+}
+
+export interface UserAuth {
+  uid: number
+  username: string
+  nickname?: string
+  avatar_url?: string
+  vip_type?: number
+  total_space?: number
+  used_space?: number
+  bduss: string
+  stoken?: string
+  ptoken?: string
+  cookies?: string
+  login_time: number
+}
+
+export interface QRCodeStatus {
+  status: 'waiting' | 'scanned' | 'success' | 'expired' | 'failed'
+  user?: UserAuth
+  token?: string
+  reason?: string
+}
+
+/**
+ * 生成登录二维码
+ */
+export async function generateQRCode(): Promise<QRCode> {
+  const response = (await apiClient.post('/auth/qrcode/generate', {})) as ApiResponse<QRCode>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '生成二维码失败')
+  }
+  return response.data
+}
+
+/**
+ * 查询扫码状态
+ *
+ * @param sign 二维码 sign
+ * @param addMode 是否处于"添加账号"模式。为 true 时附带 `add=true`，
+ *   后端会跳过"已有活跃账号即视为登录成功"的短路，避免尚未扫码就误报成功。
+ */
+export async function getQRCodeStatus(sign: string, addMode = false, firstCheck = false): Promise<QRCodeStatus> {
+  const params = new URLSearchParams({ sign })
+  if (addMode) params.set('add', 'true')
+  if (firstCheck) params.set('first', 'true')
+  const response = (await apiClient.get(`/auth/qrcode/status?${params.toString()}`)) as ApiResponse<QRCodeStatus>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || '查询状态失败')
+  }
+  return response.data
+}
+
+/**
+ * 获取当前用户信息
+ */
+export async function getCurrentUser(): Promise<UserAuth> {
+  const response = (await apiClient.get('/auth/user')) as ApiResponse<UserAuth>
+  if (response.code === 0 && response.data) {
+    return response.data
+  }
+  // 如果没有数据或者返回错误码，抛出异常
+  throw new Error(response.message || '获取用户信息失败')
+}
+
+export interface CookieLoginResult {
+  user: UserAuth
+  message: string
+}
+
+/**
+ * Cookie 登录
+ */
+export async function cookieLogin(cookies: string): Promise<CookieLoginResult> {
+  const response = (await apiClient.post('/auth/cookie/login', { cookies })) as ApiResponse<UserAuth>
+  if (response.code !== 0 || !response.data) {
+    throw new Error(response.message || 'Cookie 登录失败')
+  }
+  return { user: response.data, message: response.message }
+}
+
+/**
+ * 登出
+ */
+export async function logout(): Promise<void> {
+  await apiClient.post('/auth/logout', {})
+}

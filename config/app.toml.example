@@ -1,0 +1,71 @@
+# 百度网盘 Rust 客户端配置文件
+# Baidu Netdisk Rust Configuration
+
+[server]
+# 服务器监听地址（桌面应用模式建议绑定本地地址）
+host = "127.0.0.1"
+
+# 服务器监听端口
+port = 18888
+
+# CORS 允许的源列表（"*" 表示允许所有源）
+cors_origins = ["*"]
+
+[download]
+# 默认下载目录
+download_dir = "downloads"
+
+# 并发下载分片数（建议: 4-16）
+concurrent_chunks = 8
+
+# 每个分片的大小（单位: MB，建议: 5-20）
+chunk_size_mb = 10
+
+# 下载失败后的最大重试次数
+max_retries = 3
+
+
+[filesystem]
+# 允许上传选择器访问的本地白名单目录（空数组表示不限制）
+allowed_paths = ["/data/uploads", "/data/media"]
+
+# 上传弹窗默认优先展示的白名单目录（需位于 allowed_paths 范围内）
+default_path = "/data/uploads"
+
+# 是否显示隐藏文件
+show_hidden = false
+
+# 是否跟随符号链接
+follow_symlinks = false
+
+# Web 访问认证配置
+# 用于保护部署在公网 VPS 上的管理界面
+[web_auth]
+# 是否启用 Web 访问认证
+# 设置为 false 可禁用所有认证（紧急恢复时使用）
+enabled = false
+
+# 认证模式:
+# - "none": 无认证（默认）
+# - "password": 仅密码认证
+# - "totp": 仅 TOTP 双因素认证
+# - "password_totp": 密码 + TOTP 双因素认证
+mode = "none"
+
+# 分享直下配置
+# 用于配置分享链接直接下载功能
+[share_direct_download]
+# 临时目录路径（网盘上的路径，用于存放转存的文件）
+# 下载完成后会自动清理
+temp_dir = "/.bpr_share_temp/"
+
+# 下载完成后是否自动清理临时目录
+auto_cleanup = true
+
+# 下载失败时是否清理临时目录
+cleanup_on_failure = true
+
+# 启动时是否清理孤立的临时目录（不属于任何活跃任务的目录）
+# 默认关闭，避免误删用户数据
+cleanup_orphaned_on_startup = false
+
