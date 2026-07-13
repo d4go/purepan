@@ -273,46 +273,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 ---
 
-## 📋 最新版本
-
-### v2.1.2 (当前版本)
-
-**问题修复：**
-- 🐛 **分享同步·批量下载可靠性**（@hamr-hub PR #121）：≥2 文件整批 submit 合并任务；本地目标缺失/大小不一致自动补同步；分片下载兜底创建父目录；`errno=-9` 提示明确为链接失效或提取码错误
-- 🐛 **下载·断点续传**：恢复时目标文件缺失或截断则重置分片进度，避免损坏文件误标完成
-- 🐛 **下载·收尾竞争**：修复 100% 后双 finalize 竞争（误报/文件损坏）；收尾窗口暂停作废 旧 epoch；明文文件不再误报「解密失败」
-
-**工程：** 新增分享同步诊断脚本 `share_sync_probe.py` / `share_sync_status.py` / `share_sync_restore_snapshot.py`。
-
-### v2.1.1
-
-**问题修复：**
-- 🐛 **扫码登录**：确认失败/无真实 uid 时不再降级成 `uid=0`「临时用户」假成功，改为如实报错——修复假登录导致网盘 API 全部 `errno=-6`
-- 🐛 **系统设置**：左侧导航点击不再把顶部「保存设置」栏顶出可视区
-- 🐛 **分享同步**：手动触发做前置校验并返回真实 `run_id`（不再假成功）；调度器不再静默吞错；下载等待改「空闲超时+硬上限」、文件夹聚合速度用活跃下载状态（修速度恒 0）；`owner_uid=0` 历史数据启动期迁移；修孤儿 run 与 `resume_link_invalid` 状态不一致
-
-**新功能：**
-- ✨ **分享同步·运行明细分页**：新增 `GET /share-sync/runs/:id/items` 分页接口，前端运行详情接入分页，避免大 run 明细截断到 100 条
-- ✨ **分享同步·下载停滞自动重试**：检测到下载长时间无进展自动 `pause→冷却→resume`（限次数+冷却，可调参）
-
-**工程/CI：** 统一 Rust 工具链 1.87（本地/Docker/CI 一致）；增加 Conventional Commits 校验。
-
-### v2.1.0
-
-**新功能：**
-- ✨ **分享同步（Share Sync）**：订阅分享链接，周期/定时拉取并与上次快照对比，自动转存到网盘和/或下载到本地；支持多账号隔离、网盘+本地双目标、include/exclude 过滤、三种冲突策略、实时子任务进度（速度/预计剩余）与运行历史审计
-
-**问题修复：**
-- 🐛 **分享同步**：增量改动只同步变动文件（不再整目录重转存+重下载）；转存撞同名视为已存在并继续下载；修复单文件误判失败与网盘目录名翻倍；进行中子任务不再回包已完成文件夹；重启后自动续跑被中断的 run；删除订阅清理名下孤儿任务
-- 🐛 **风控**：列目录/拆批接入全局限速器，大目录删除/转存自动分块规避 `errno=132`、`errno=4` 超时退避重试，链接连续失效自动暂停轮询
-- 🐛 **进度显示**：修复文件夹下载已下载翻倍（200%）与上传超过 100%（已上传改用已完成分片之和，幂等），全站进度条钳到 [0,100]
-- 🐛 **Windows 控制台日志乱码**：默认关闭控制台 ANSI 彩色输出，避免出现 `[2m`、`[32m` 等转义字符（文件日志不受影响，非 Windows 平台仍保留彩色）
-- 🐛 **其他**：文件列表滚动加载失败不再无限翻页；修复路由切换后 el-table 列错位；ESLint v9 flat config 修复
-
-> 📝 **完整版本历史**：查看 [CHANGELOG.md](CHANGELOG.md) 了解所有版本的详细更新记录
-
----
-
 ## 🚀 快速开始
 
 <details>
@@ -325,7 +285,7 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
     - 确保 APP 已登录你的账号
 
 2. **扫描二维码**
-    - 在浏览器中访问应用（默认 `http://localhost:18888`）
+    - 打开应用
     - 页面会自动显示登录二维码
     - 打开百度网盘 APP，点击"扫一扫"功能
     - 扫描网页上显示的二维码
@@ -336,7 +296,7 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
     - **重要：确认后，APP 不能关闭或切换到后台**，否则登录会失败
 
 4. **等待登录完成**
-    - 网页会自动轮询登录状态（通常 1-3 秒）
+    - 网页会自动轮询登录状态（通常 1-2 秒）
     - 登录成功后会自动跳转到文件管理页面
 
 #### ⚠️ 重要提示
@@ -354,92 +314,6 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 - 登录成功后，会话会自动保存到本地
 - 下次启动应用时会自动恢复登录状态
 - 如果会话过期，会自动跳转到登录页面重新登录
-
-</details>
-
-<details>
-<summary><b>🖼️ 界面预览</b>（点击展开查看所有界面截图）</summary>
-
-### 界面预览
-
-#### 文件管理
-![文件管理](docs/images/file-management.png)
-
-浏览和管理百度网盘中的文件和目录，支持目录导航、文件信息查看和下载操作。
-
-#### 文件管理（加密文件显示）
-![文件管理-加密文件](docs/images/file-management-encrypted.png)
-
-加密文件和文件夹在文件列表中会显示"加密"标签，并自动还原显示原始文件名（通过查询本地加密映射表）。下载加密文件时会自动解密并恢复原始文件名。
-
-#### 下载管理
-![下载管理](docs/images/download-management.png)
-
-实时查看下载进度，支持多任务并发下载，显示下载速度、进度百分比和剩余时间。
-
-#### 下载对话框
-
-![下载对话框](docs/images/download-dialog.png)
-
-通过下载对话框确认下载任务的保存路径和任务信息，并可根据需要调整下载参数。
-
-#### 上传管理
-![上传管理](docs/images/upload-management.png)
-
-集中查看所有上传任务，实时展示进度、速度和剩余时间，支持暂停、继续和删除操作。
-
-#### 转存管理
-
-![转存管理](docs/images/transfer-management.png)
-
-在转存管理页面集中查看所有分享链接转存任务的进度和状态，支持查看成功、失败任务，并进行删除等操作。
-
-#### 转存弹窗
-
-![转存弹窗](docs/images/transfer-dialog.png)
-
-通过转存弹窗输入或粘贴百度网盘分享链接和提取码，选择转存目标目录，并发起转存任务。
-
-#### 文件上传对话框（本地文件资源管理器）
-![文件上传](docs/images/file-upload.png)
-
-通过内置的本地文件资源管理器选择文件或文件夹上传，支持目录导航、空态/错误态提示和分页加载。
-
-#### 上传相关系统设置
-![上传设置](docs/images/system-upload-settings.png)
-
-在系统设置中配置上传相关参数（如并发策略等），与下载配置统一管理。
-
-#### 转存设置
-
-![转存设置](docs/images/transfer-setting.png)
-
-在转存设置中配置与分享链接转存相关的参数，例如默认转存目录、是否自动在转存完成后创建下载任务等。
-
-#### 系统设置
-![系统设置](docs/images/system-settings.png)
-
-配置服务器参数和下载选项，包括线程数、分片大小、下载目录等。
-
-#### 自动备份管理
-![自动备份管理](docs/images/autobackup-management.png)
-
-集中管理所有备份配置，查看备份状态、活跃任务数和加密状态，支持手动触发备份、禁用/启用和删除操作。
-
-#### 自动备份设置
-![自动备份设置](docs/images/autobackup-setting.png)
-
-配置备份触发方式，包括文件系统监听（实时检测文件变化）、轮询兜底设置和下载备份轮询模式。
-
-#### 加密设置
-![加密设置](docs/images/encrypted-setting.png)
-
-在系统设置中配置客户端侧加密，支持生成、导出和删除加密密钥，使用 AES-256-GCM 算法保护文件隐私。
-
-#### Web 访问认证设置
-![Web 访问认证设置](docs/images/web-auth-setting.png)
-
-在系统设置中配置 Web 访问认证，支持密码保护和 TOTP 双因素认证，防止未授权访问 Web 界面。
 
 </details>
 
@@ -491,8 +365,8 @@ open http://localhost:18888
 
 ```bash
 # 1. 克隆项目
-git clone https://github.com/komorebiCarry/BaiduPCS-Rust.git
-cd BaiduPCS-Rust
+git clone https://github.com/d4go/purepan.git
+cd purepan
 
 # 2. 构建并启动服务
 docker-compose up -d
