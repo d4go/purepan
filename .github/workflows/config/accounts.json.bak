@@ -1,0 +1,41 @@
+{
+  "active_uid": 2779453309,
+  "users": [
+    {
+      "uid": 2779453309,
+      "username": "sydneyxz128",
+      "nickname": "sydneyxz128",
+      "avatar_url": "https://ss0.bdstatic.com/7Ls0a8Sm1A5BphGlnYG/sys/portrait/item/public.1.d5b94b21.y0QyPbTkMRDpcQ3fDplUSQ.jpg",
+      "vip_type": 2,
+      "total_space": null,
+      "used_space": null,
+      "bduss": "NwUDFFS244LTEwb3IyTEdhanRSWVNEUTc2TVhNN0hKMzRRSG4xWkF5WjNLbnhxSVFBQUFBJCQAAAAAAAAAAAEAAABZpaKvc3lkbmV5eHoxMjgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHedVGp3nVRqcV",
+      "stoken": "33d962eb15f1d18074cf92ddf0e35a3610099c36965d5319b440680cfcc5167c",
+      "ptoken": "f643acadc6aadd2c0cf56b4b9831fad2",
+      "baiduid": "7886A7FA59706C48F54273319A9E5C93:FG=1",
+      "passid": "1oZ9zo",
+      "cookies": "PASSID=1oZ9zo; UBI=fi_PncwhpxZ%7ETaJcwgYZoHdbvYK1uAyI2JV; STOKEN=33d962eb15f1d18074cf92ddf0e35a3610099c36965d5319b440680cfcc5167c; BDUSS=NwUDFFS244LTEwb3IyTEdhanRSWVNEUTc2TVhNN0hKMzRRSG4xWkF5WjNLbnhxSVFBQUFBJCQAAAAAAAAAAAEAAABZpaKvc3lkbmV5eHoxMjgAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAHedVGp3nVRqcV; PTOKEN=f643acadc6aadd2c0cf56b4b9831fad2",
+      "panpsc": null,
+      "csrf_token": null,
+      "bdstoken": null,
+      "login_time": 1783930231,
+      "last_warmup_at": null,
+      "custom_config": {
+        "auto_apply_recommended": true,
+        "download": {
+          "max_global_threads": 1,
+          "chunk_size_mb": 4,
+          "max_concurrent_tasks": 3,
+          "max_retries": 3
+        },
+        "upload": {
+          "max_global_threads": 1,
+          "chunk_size_mb": 4,
+          "max_concurrent_tasks": 3,
+          "max_retries": 3,
+          "skip_hidden_files": false
+        }
+      }
+    }
+  ]
+}
