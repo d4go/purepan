@@ -168,7 +168,7 @@
 
       <!-- 底部 -->
       <div class="login-footer">
-        <span>v0.1.3</span>
+        <span>v0.1.4</span>
       </div>
     </div>
   </div>
@@ -177,8 +177,10 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
+import axios from 'axios'
 import { ElMessage } from 'element-plus'
 import { useAuthStore } from '@/stores/auth'
+import { waitForBackendReady } from '@/utils/backendReady'
 import { transitionToLogin, transitionToMain } from '@/utils/windowManager'
 import TitleBar from '@/components/TitleBar.vue'
 import {
@@ -260,7 +262,15 @@ async function generateQRCode() {
   isExpired.value = false
 
   try {
-    await authStore.generateQRCode()
+    try {
+      await authStore.generateQRCode()
+    } catch (firstError) {
+      // 启动屏障之后通常不会再命中这里；若后端恰好重启，只对没有收到 HTTP
+      // 响应的连接错误等待并重试一次。业务错误和 HTTP 错误仍原样展示。
+      if (!axios.isAxiosError(firstError) || firstError.response) throw firstError
+      await waitForBackendReady({ maxWaitMs: 5_000 })
+      await authStore.generateQRCode()
+    }
     authStore.startPolling(
       async () => {
         stopCountdown()
