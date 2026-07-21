@@ -1,5 +1,6 @@
 import type { Pinia } from 'pinia'
 import { setActivePinia } from 'pinia'
+import { waitForBackendReady } from '@/utils/backendReady'
 
 export interface StartupResult {
   target: string
@@ -30,6 +31,10 @@ export async function initializeInBackground(pinia: Pinia): Promise<StartupResul
 
   const webAuthStore = useWebAuthStore(pinia)
   const authStore = useAuthStore(pinia)
+
+  // Tauri 的 WebView 和内嵌 Axum 服务并行启动。必须等端口完成绑定后再发起
+  // WebSocket / 认证请求，否则会把启动期 connection refused 误判为未登录。
+  await waitForBackendReady()
 
   // WS 自带重连，不需要等待连接结果。
   connectWebSocket()
