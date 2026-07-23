@@ -5,6 +5,14 @@ use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::Manager;
 
+fn configure_runtime_directory(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    let runtime_dir = app.path().app_data_dir()?;
+    std::fs::create_dir_all(&runtime_dir)?;
+    std::env::set_current_dir(&runtime_dir)?;
+    eprintln!("PurePan runtime data directory: {}", runtime_dir.display());
+    Ok(())
+}
+
 fn show_main_window(app: &tauri::AppHandle) {
     if let Some(window) = app.get_webview_window("main") {
         let _ = window.unminimize();
@@ -36,6 +44,10 @@ fn main() {
         .plugin(tauri_plugin_shell::init())
         .invoke_handler(tauri::generate_handler![frontend_ready])
         .setup(|app| {
+            if !cfg!(debug_assertions) {
+                configure_runtime_directory(app)?;
+            }
+
             // 在 Tauri 的 tokio 运行时中启动内嵌 Axum 服务器
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = start_server().await {
