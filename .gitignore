@@ -23,6 +23,8 @@ frontend/vite.local.config.ts
 /backend/logs/
 /config/app.toml
 /backend/auth.json
+/.github/workflows/config/accounts.json
+/.github/workflows/config/accounts.json.*
 *.db
 *.db-shm
 *.db-wal
