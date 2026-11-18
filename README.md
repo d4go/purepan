@@ -323,7 +323,7 @@ PurePan 桌面端使用 Rust + [GPUI](https://gpui.rs)（[gpui-kit](https://gpui
 
 #### 前提条件
 
-- Rust 工具链 1.92+（`rustup`）
+- Rust 工具链 1.95+（建议最新 stable，`rustup`）
 - 系统依赖：
   - **Linux**：`libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1`，以及可用的 Vulkan 驱动；图形会话（Wayland/X11）
   - **macOS**：Xcode Command Line Tools（macOS 15+）
