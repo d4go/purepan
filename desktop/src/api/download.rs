@@ -123,11 +123,11 @@ impl ApiClient {
         self.request(Method::POST, &format!("/downloads/{id}/resume"), Some(json!({}))).await
     }
 
-    /// DELETE /downloads/:id?delete_files=
+    /// DELETE /downloads/:id?delete_file=
     pub async fn delete_download(&self, id: &str, delete_files: bool) -> Result<String, ApiError> {
         self.request(
             Method::DELETE,
-            &format!("/downloads/{id}?delete_files={delete_files}"),
+            &format!("/downloads/{id}?delete_file={delete_files}"),
             None,
         )
         .await
@@ -135,6 +135,26 @@ impl ApiClient {
 
     pub async fn clear_completed_downloads(&self) -> Result<usize, ApiError> {
         self.request(Method::DELETE, "/downloads/clear/completed", None).await
+    }
+
+    /// POST /downloads/folder/:id/pause
+    pub async fn pause_folder_download(&self, id: &str) -> Result<String, ApiError> {
+        self.request(Method::POST, &format!("/downloads/folder/{id}/pause"), Some(json!({}))).await
+    }
+
+    /// POST /downloads/folder/:id/resume
+    pub async fn resume_folder_download(&self, id: &str) -> Result<String, ApiError> {
+        self.request(Method::POST, &format!("/downloads/folder/{id}/resume"), Some(json!({}))).await
+    }
+
+    /// DELETE /downloads/folder/:id?delete_files=
+    pub async fn cancel_folder_download(&self, id: &str, delete_files: bool) -> Result<String, ApiError> {
+        self.request(
+            Method::DELETE,
+            &format!("/downloads/folder/{id}?delete_files={delete_files}"),
+            None,
+        )
+        .await
     }
 
     pub async fn clear_failed_downloads(&self) -> Result<usize, ApiError> {

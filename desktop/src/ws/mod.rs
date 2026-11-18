@@ -18,6 +18,10 @@ const RECONNECT_DELAYS_MS: [u64; 6] = [1000, 2000, 4000, 8000, 16000, 30000];
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(30);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// 后端只向订阅了对应 topic 的连接推送任务事件;`*` 覆盖下载/上传/转存/
+/// 文件夹/离线/账号等普通事件,`backup:*` 单独放开备份任务隔离。
+const DEFAULT_SUBSCRIPTIONS: [&str; 2] = ["*", "backup:*"];
+
 #[derive(Debug, Clone)]
 pub enum WsCommand {
     Subscribe(Vec<String>),
@@ -48,7 +52,7 @@ impl WsHandle {
 pub fn spawn(rt: &Handle, url: String, ui: async_channel::Sender<UiEvent>) -> WsHandle {
     let (cmd_tx, cmd_rx) = async_channel::unbounded::<WsCommand>();
     rt.spawn(async move {
-        let mut subs: HashSet<String> = HashSet::new();
+        let mut subs: HashSet<String> = DEFAULT_SUBSCRIPTIONS.iter().map(|s| s.to_string()).collect();
         let mut attempt: usize = 0;
         loop {
             // 连接前先消化积压的订阅命令,保证重连后订阅是最新的

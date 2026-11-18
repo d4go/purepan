@@ -73,9 +73,17 @@ impl TransferDialog {
         let _ = wh.update(cx, |_, w, cx| toast::show(w, cx, kind, msg.clone()));
     }
 
-    fn preview(&mut self, cx: &mut Context<Self>) {
+    /// 预填分享链接与提取码(剪贴板识别、外部带参打开)。
+    pub fn set_share(&mut self, url: &str, pwd: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        self.share_url.update(cx, |s, cx| s.set_value(url.to_string(), window, cx));
+        if let Some(p) = pwd {
+            self.password.update(cx, |s, cx| s.set_value(p.to_string(), window, cx));
+        }
+    }
+
+    fn preview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.share_url.read(cx).value().trim().to_string();
-        if url.is_empty() { self.toast(cx, ToastKind::Warning, "请输入分享链接"); return; }
+        if url.is_empty() { toast::show(window, cx, ToastKind::Warning, "请输入分享链接"); return; }
         let pwd = self.password.read(cx).value().trim().to_string();
         let pwd = if pwd.is_empty() { None } else { Some(pwd) };
         self.loading = true;
@@ -147,23 +155,19 @@ impl TransferDialog {
         }).detach();
     }
 
-    fn pick_save_path(&mut self, cx: &mut Context<Self>) {
+    fn pick_save_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         let current = self.save_path.read(cx).value().to_string();
-        let on_confirm: Rc<dyn Fn(String, &mut Window, &mut App)> = Rc::new(move |path, _w, cx| {
+        let on_confirm: Rc<dyn Fn(String, &mut Window, &mut App)> = Rc::new(move |path, w, cx| {
             let _ = view.update(cx, |this, cx| {
                 let input = this.save_path.clone();
-                let wh = this.window_handle;
-                let _ = wh.update(cx, |_, w, cx| input.update(cx, |s, cx| s.set_value(path.clone(), w, cx)));
+                input.update(cx, |s, cx| s.set_value(path.clone(), w, cx));
             });
         });
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let picker = cx.new(|cx| crate::components::dialogs::netdisk_picker::NetdiskPicker::new(
-                &current, Vec::new(), Vec::new(), on_confirm, window, cx,
-            ));
-            window.open_dialog(cx, move |d: gpui_kit::component::dialog::Dialog, _, _| d.title("选择保存路径").child(picker.clone()));
-        });
+        let picker = cx.new(|cx| crate::components::dialogs::netdisk_picker::NetdiskPicker::new(
+            &current, Vec::new(), Vec::new(), on_confirm, window, cx,
+        ));
+        window.open_dialog(cx, move |d: gpui_kit::component::dialog::Dialog, _, _| d.title("选择保存路径").width(px(560.)).child(picker.clone()));
     }
 }
 
@@ -177,7 +181,7 @@ impl Render for TransferDialog {
         if !self.direct_mode {
             form = form.child(h_flex().gap_2().items_center()
                 .child("保存路径").child(Input::new(&self.save_path))
-                .child(Button::new("td-pick").small().icon(IconName::Folder).on_click(cx.listener(|this, _, _, cx| this.pick_save_path(cx)))));
+                .child(Button::new("td-pick").small().icon(IconName::Folder).on_click(cx.listener(|this, _, window, cx| this.pick_save_path(window, cx)))));
         }
         form = form.child(
             Switch::new("td-auto-dl").label(if self.direct_mode { "下载到本地(分享直下)" } else { "转存后自动下载" })
@@ -217,7 +221,7 @@ impl Render for TransferDialog {
                 .child(Button::new("td-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
                 .when(!previewed, |this| this.child(
                     Button::new("td-preview").primary().loading(loading).label("预览文件")
-                        .on_click(cx.listener(|this, _, _, cx| this.preview(cx)))))
+                        .on_click(cx.listener(|this, _, window, cx| this.preview(window, cx)))))
                 .when(previewed, |this| this.child(
                     Button::new("td-create").primary().loading(creating).label(if self.direct_mode { "开始直下" } else { "开始转存" })
                         .on_click(cx.listener(|this, _, _, cx| this.create(cx))))),

@@ -69,7 +69,7 @@ where
 {
     Sidebar::new("app-sidebar")
         .collapsible(SidebarCollapsible::None)
-        .w(px(240.))
+        .w(px(208.))
         .child(SidebarMenu::new().children(Nav::ALL.iter().map(|&nav| {
             SidebarMenuItem::new(nav.label())
                 .icon(nav.icon())

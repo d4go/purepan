@@ -64,9 +64,9 @@ impl SharesView {
         }).detach();
     }
 
-    fn copy(&self, text: String, cx: &mut Context<Self>) {
+    fn copy(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast(cx, ToastKind::Success, "已复制");
+        toast::show(window, cx, ToastKind::Success, "已复制");
     }
 
     fn cancel(&mut self, share_id: u64, cx: &mut Context<Self>) {
@@ -120,13 +120,13 @@ impl SharesView {
 impl Render for SharesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child(format!("分享管理 · {} 个", self.total)))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个分享", self.total)))
             .child(Button::new("sh-refresh").small().icon(IconName::RefreshCw).label("刷新").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
-        let mut list = v_flex().overflow_y_scrollbar();
+        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
         if self.shares.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child(if self.loading { "加载中..." } else { "暂无分享" }));
+            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child(if self.loading { "加载中..." } else { "暂无分享" }));
         }
         for s in &self.shares {
             let id = s.share_id;
@@ -139,7 +139,7 @@ impl Render for SharesView {
             let id_cancel = id;
             let link_copy = link.clone();
             list = list.child(
-                h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
+                h_flex().gap_2().items_center().px_3().py_2().rounded_lg().bg(theme.secondary)
                     .child(Icon::new(IconName::Share2).size(px(18.)).text_color(theme.primary))
                     .child(v_flex().flex_1().gap_0p5()
                         .child(div().truncate().child(path))
@@ -148,7 +148,7 @@ impl Render for SharesView {
                     .child(Tag::new().small().child(if status == 0 { "正常" } else { "失效" }))
                     .child(div().text_color(theme.muted_foreground).child(if expired == 0 { "永久".to_string() } else { util::format_timestamp(s.expired_time) }))
                     .child(Button::new(format!("sh-pwd-{id}")).ghost().small().icon(IconName::KeyRound).on_click(cx.listener(move |this, _, _, cx| this.show_detail(id_detail, cx))))
-                    .child(Button::new(format!("sh-copy-{id}")).ghost().small().icon(IconName::Copy).on_click(cx.listener(move |this, _, _, cx| this.copy(link_copy.clone(), cx))))
+                    .child(Button::new(format!("sh-copy-{id}")).ghost().small().icon(IconName::Copy).on_click(cx.listener(move |this, _, window, cx| this.copy(link_copy.clone(), window, cx))))
                     .child(Button::new(format!("sh-cancel-{id}")).ghost().small().icon(IconName::Trash).on_click(cx.listener(move |this, _, _, cx| this.cancel(id_cancel, cx)))),
             );
         }
