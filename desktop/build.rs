@@ -7,5 +7,5 @@ fn main() {
     let res_dir = std::path::Path::new("assets/icons");
     println!("cargo:rerun-if-changed=assets/icons/app.rc");
     println!("cargo:rerun-if-changed=assets/icons/icon.ico");
-    embed_resource::compile(res_dir.join("app.rc"), embed_resource::ParamsIncludeDirs([res_dir]));
+    let _ = embed_resource::compile(res_dir.join("app.rc"), embed_resource::ParamsIncludeDirs([res_dir]));
 }

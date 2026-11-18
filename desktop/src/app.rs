@@ -192,7 +192,94 @@ impl AppController {
         }
     }
 
-    /// 启动引导任务(窗口已由 open_initial 在 App 上下文打开,避免实体更新内开窗)。
+    /// 开窗前同步探测登录态(内嵌后端通常 <1s,最多等 5s),
+    /// 保证第一帧窗口就是正确尺寸,不会出现大框闪一下再变登录框。
+    fn probe_boot(&mut self, cx: &mut Context<Self>) -> Screen {
+        let rt = self.rt.clone();
+        let http = self.http.clone();
+        let url = self.health_url.clone();
+        let api = self.api.clone();
+
+        let (tokens, status, accounts, user) = rt.block_on(async move {
+            let start = Instant::now();
+            let mut delay = Duration::from_millis(100);
+            let healthy = loop {
+                let ok = http
+                    .get(&url)
+                    .timeout(Duration::from_secs(1))
+                    .send()
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false);
+                if ok {
+                    break true;
+                }
+                if start.elapsed() > Duration::from_secs(5) {
+                    break false;
+                }
+                tokio::time::sleep(delay).await;
+                delay = (delay * 2).min(Duration::from_secs(1));
+            };
+            if !healthy {
+                return (None, None, None, None);
+            }
+            let tokens = api.tokens_snapshot().await;
+            let status = api.web_status().await.ok();
+            let accounts = api.list_accounts().await.ok();
+            let user = if accounts.is_none() {
+                api.current_user().await.ok()
+            } else {
+                None
+            };
+            (Some(tokens), status, accounts, user)
+        });
+
+        let now = chrono::Utc::now().timestamp();
+        let token_valid = tokens
+            .as_ref()
+            .map(|t| {
+                t.access_token.is_some()
+                    && t.access_expires_at.map(|e| e > now).unwrap_or(false)
+            })
+            .unwrap_or(false);
+        cx.update_global::<WebAuthState, _>(|s, _| {
+            if let Some(status) = &status {
+                s.auth_config = Some(status.clone());
+                s.is_authenticated = !status.enabled || token_valid;
+            } else if token_valid {
+                s.is_authenticated = true;
+            }
+        });
+        match accounts {
+            Some(resp) => {
+                cx.update_global::<AuthStore, _>(|s, _| {
+                    s.accounts = resp.accounts;
+                    s.active_uid = resp.active_uid;
+                    s.accounts_loaded = true;
+                });
+            }
+            None => {
+                if let Some(user) = user {
+                    cx.update_global::<AuthStore, _>(|s, _| s.user = Some(user));
+                }
+            }
+        }
+
+        let web = cx.global::<WebAuthState>();
+        let screen = if web.is_auth_enabled() && !web.is_authenticated {
+            Screen::WebLogin
+        } else if !cx.global::<AuthStore>().is_logged_in() {
+            Screen::Login
+        } else {
+            Screen::Main
+        };
+        self.screen = screen;
+        self.booted = true;
+        self.last_active_uid = cx.global::<AuthStore>().active_uid;
+        screen
+    }
+
+    /// 启动引导任务:窗口已按探测定好的屏幕打开,这里继续等待后端就绪并校准状态。
     fn spawn_boot(&mut self, cx: &mut Context<Self>) {
         let (rt, api, http, url) = (
             self.rt.clone(),
@@ -260,7 +347,7 @@ impl AppController {
                 None
             };
 
-            let _ = this.update(cx, |this, cx| {
+            let plan = this.update(cx, |this, cx| {
                 cx.update_global::<WebAuthState, _>(|s, _| {
                     if let Some(status) = status {
                         s.auth_config = Some(status.clone());
@@ -292,8 +379,23 @@ impl AppController {
                 } else {
                     Screen::Main
                 };
-                this.transition(screen, cx);
+                if this.window.is_some() {
+                    this.transition(screen, cx);
+                    None
+                } else {
+                    // 窗口尚未创建:先落状态,引导任务按最终屏幕直接开窗
+                    this.screen = screen;
+                    Some(screen)
+                }
             });
+
+            if let Ok(Some(screen)) = plan {
+                let Some(controller) = this.upgrade() else { return };
+                let _ = cx.update(|cx| {
+                    let (handle, _) = open_app_window(cx, screen, controller.clone());
+                    let _ = controller.update(cx, |c, _| c.window = Some(handle));
+                });
+            }
         })
         .detach();
     }
@@ -383,14 +485,22 @@ impl AppController {
         }
     }
 
-    /// 切换屏幕;登录↔主界面尺寸不同需重建窗口,Boot→Main 同尺寸直接复用。
+    /// 切换屏幕;登录↔主界面尺寸不同需重建窗口。
     pub fn transition(&mut self, screen: Screen, cx: &mut Context<Self>) {
         if self.screen == screen {
             return;
         }
         let old_screen = self.screen;
         self.screen = screen;
-        if old_screen == Screen::Boot && screen == Screen::Main {
+        // 引导阶段窗口尚未创建:由引导任务按最终屏幕直接开窗
+        if self.window.is_none() {
+            cx.notify();
+            return;
+        }
+        // 400×600 的屏幕之间(启动占位/登录/Web 登录)复用窗口,避免无谓闪烁
+        let same_size = matches!(old_screen, Screen::Boot | Screen::Login | Screen::WebLogin)
+            && matches!(screen, Screen::Login | Screen::WebLogin);
+        if same_size {
             cx.notify();
             return;
         }
@@ -657,10 +767,11 @@ impl Render for AppShell {
     }
 }
 
-/// 在 App 上下文(无实体借用)打开初始 Boot 窗口,再启动引导。
-/// 窗口创建会触发首帧渲染,此时不能处于 controller.update 内,否则读控制器会 panic。
+/// 启动控制器:开窗前先探测登录态,直接按 400×600(登录)或主界面尺寸建窗,
+/// 随后交给引导任务校准状态。窗口创建会触发首帧渲染,不能处于 controller.update 内。
 pub fn open_initial(cx: &mut App, controller: Entity<AppController>) {
-    let (handle, _) = open_app_window(cx, Screen::Boot, controller.clone());
+    let screen = controller.update(cx, |c, cx| c.probe_boot(cx));
+    let (handle, _) = open_app_window(cx, screen, controller.clone());
     controller.update(cx, |c, _| c.window = Some(handle));
     controller.update(cx, |c, cx| c.spawn_boot(cx));
 }
@@ -671,7 +782,7 @@ fn open_app_window(
     controller: Entity<AppController>,
 ) -> (AnyWindowHandle, Entity<AppShell>) {
     let options = match screen {
-        Screen::Login | Screen::WebLogin => WindowOptions {
+        Screen::Boot | Screen::Login | Screen::WebLogin => WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
                 size(px(400.), px(600.)),
