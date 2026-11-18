@@ -1,0 +1,40 @@
+[package]
+name = "purepan-desktop"
+version = "0.1.5"
+edition = "2024"
+rust-version = "1.92"
+
+[[bin]]
+name = "purepan"
+path = "src/main.rs"
+
+[dependencies]
+gpui-kit = "0.10.0"
+purepan-backend = { path = "../backend" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.28"
+futures = "0.3"
+async-channel = "2"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+base64 = "0.22"
+image = "0.25"
+chrono = { version = "0.4", features = ["serde"] }
+
+dirs = "6"
+open = "5"
+rand = "0.8"
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ksni = { version = "0.3", features = ["blocking"] }
+
+[dev-dependencies]
+tempfile = "3"
