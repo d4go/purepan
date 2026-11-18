@@ -1,9 +1,33 @@
 //! 通用工具(后续逐步移植 frontend/src/utils/fileUtils.ts 的格式化函数)。
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use base64::Engine as _;
 use gpui_kit::RenderImage;
+
+/// 应用图标原始像素(窗口图标,Linux/X11 使用)。
+pub fn app_icon() -> Arc<image::RgbaImage> {
+    static ICON: OnceLock<Arc<image::RgbaImage>> = OnceLock::new();
+    ICON.get_or_init(|| {
+        let img = image::load_from_memory(include_bytes!("../assets/icons/icon.png"))
+            .expect("内置应用图标损坏")
+            .to_rgba8();
+        Arc::new(img)
+    })
+    .clone()
+}
+
+/// 应用 logo(GPUI 可渲染),用于标题栏。
+pub fn app_logo() -> Arc<RenderImage> {
+    static LOGO: OnceLock<Arc<RenderImage>> = OnceLock::new();
+    LOGO.get_or_init(|| {
+        let img = image::load_from_memory(include_bytes!("../assets/icons/icon.png"))
+            .expect("内置应用图标损坏")
+            .to_rgba8();
+        Arc::new(RenderImage::new(vec![image::Frame::new(img)]))
+    })
+    .clone()
+}
 
 /// 把后端返回的 `data:image/png;base64,...` 解码为 GPUI 可渲染的图像。
 pub fn decode_data_uri_image(data_uri: &str) -> Option<Arc<RenderImage>> {
@@ -11,6 +35,67 @@ pub fn decode_data_uri_image(data_uri: &str) -> Option<Arc<RenderImage>> {
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(img)])))
+}
+
+/// 从任意文本中提取百度网盘分享链接与提取码。
+/// 支持 `https://pan.baidu.com/s/xxx?pwd=abcd` 及「链接 + 提取码: abcd」两种复制格式。
+pub fn parse_share_link(text: &str) -> Option<(String, Option<String>)> {
+    let lower = text.to_lowercase();
+    let idx = ["pan.baidu.com/s/", "yun.baidu.com/s/"]
+        .iter()
+        .filter_map(|p| lower.find(p))
+        .min()?;
+    let mut start = idx;
+    if text[..idx].ends_with("https://") {
+        start = idx - 8;
+    } else if text[..idx].ends_with("http://") {
+        start = idx - 7;
+    }
+    let rest = &text[start..];
+    let end = rest
+        .find(|c: char| {
+            c.is_whitespace()
+                || matches!(c, '"' | '\'' | '<' | '>' | '，' | '。' | '；' | '！' | '？' | '、' | ')' | '）' | ']' | '】')
+        })
+        .unwrap_or(rest.len());
+    let mut url = rest[..end].trim_end_matches(['.', ',', ';', ':', '!']).to_string();
+    if url.is_empty() {
+        return None;
+    }
+    if !url.starts_with("http") {
+        url = format!("https://{url}");
+    }
+
+    let url_lower = url.to_lowercase();
+    let mut pwd = None;
+    for key in ["pwd=", "password="] {
+        if let Some(pos) = url_lower.find(key) {
+            let code: String = url[pos + key.len()..]
+                .chars()
+                .take(4)
+                .take_while(|c| c.is_ascii_alphanumeric())
+                .collect();
+            if code.len() == 4 {
+                pwd = Some(code);
+            }
+            break;
+        }
+    }
+    if pwd.is_none() {
+        if let Some(pos) = lower.find("提取码") {
+            let code: String = lower[pos..]
+                .chars()
+                .skip(3)
+                .take(12)
+                .filter(|c| c.is_ascii_alphanumeric())
+                .take(4)
+                .collect();
+            if code.len() == 4 {
+                pwd = Some(code);
+            }
+        }
+    }
+    Some((url, pwd))
 }
 
 /// 字节数 → 人类可读(移植 fileUtils.ts formatSize)。

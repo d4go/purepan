@@ -11,7 +11,7 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _,
+    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, ParentElement as _,
     Render, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::Value;
@@ -47,17 +47,14 @@ impl TransfersView {
         let _ = wh.update(cx, |_, w, cx| toast::show(w, cx, kind, msg.clone()));
     }
 
-    fn open_transfer_dialog(&mut self, direct: bool, cx: &mut Context<Self>) {
-        let wh = self.window_handle;
+    fn open_transfer_dialog(&mut self, direct: bool, window: &mut Window, cx: &mut Context<Self>) {
         let initial = "/".to_string();
-        let _ = wh.update(cx, move |_, window, cx| {
-            let on_success: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(|_w, cx| {
-                cx.global::<Backend>().ws.request_snapshot();
-            });
-            let dlg = cx.new(|cx| TransferDialog::new(direct, &initial, on_success, window, cx));
-            let title = if direct { "分享直下" } else { "新建转存" };
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title(title).child(dlg.clone()));
+        let on_success: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(|_w, cx| {
+            cx.global::<Backend>().ws.request_snapshot();
         });
+        let dlg = cx.new(|cx| TransferDialog::new(direct, &initial, on_success, window, cx));
+        let title = if direct { "分享直下" } else { "新建转存" };
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title(title).width(px(600.)).child(dlg.clone()));
     }
 
     fn cancel(&mut self, id: &str, cx: &mut Context<Self>) {
@@ -67,7 +64,12 @@ impl TransfersView {
         cx.spawn(async move |this, cx| {
             let (a, i) = (api.clone(), id.clone());
             let r = api::call_api(&rt, move || async move { a.cancel_transfer(&i).await }).await;
-            let _ = this.update(cx, |this, cx| { if let Err(e) = r { this.toast(cx, ToastKind::Error, e.message()); } });
+            let _ = this.update(cx, |this, cx| {
+                if let Err(e) = r { this.toast(cx, ToastKind::Error, e.message()); } else {
+                    cx.global::<Backend>().ws.request_snapshot();
+                    cx.notify();
+                }
+            });
         }).detach();
     }
 
@@ -78,7 +80,17 @@ impl TransfersView {
         cx.spawn(async move |this, cx| {
             let (a, i) = (api.clone(), id.clone());
             let r = api::call_api(&rt, move || async move { a.delete_transfer(&i).await }).await;
-            let _ = this.update(cx, |this, cx| { if let Err(e) = r { this.toast(cx, ToastKind::Error, e.message()); } });
+            let id = id.clone();
+            let _ = this.update(cx, |this, cx| {
+                match r {
+                    Ok(_) => {
+                        cx.update_global::<TaskCache, _>(|c, _| { c.transfers.remove(&id); });
+                        cx.global::<Backend>().ws.request_snapshot();
+                        cx.notify();
+                    }
+                    Err(e) => this.toast(cx, ToastKind::Error, e.message()),
+                }
+            });
         }).detach();
     }
 
@@ -98,7 +110,7 @@ impl TransfersView {
         let id_cancel = id.clone();
         let id_del = id.clone();
 
-        let mut row = v_flex().gap_1().px_4().py_2().border_b_1().border_color(theme.border);
+        let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
         let mut top = h_flex().gap_2().items_center();
         top = top.child(Icon::new(IconName::FolderInput).size(px(18.)).text_color(theme.primary));
         top = top.child(div().flex_1().truncate().child(title));
@@ -128,15 +140,15 @@ impl Render for TransfersView {
         let mut rows: Vec<Value> = cx.global::<TaskCache>().transfers.values().cloned().collect();
         rows.sort_by(|a, b| v_u64(b, "created_at").cmp(&v_u64(a, "created_at")));
 
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child("转存管理"))
-            .child(Button::new("tf-new").primary().small().icon(IconName::FolderInput).label("新建转存").on_click(cx.listener(|this, _, _, cx| this.open_transfer_dialog(false, cx))))
-            .child(Button::new("tf-direct").small().icon(IconName::Download).label("分享直下").on_click(cx.listener(|this, _, _, cx| this.open_transfer_dialog(true, cx))))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个转存任务", rows.len())))
+            .child(Button::new("tf-new").primary().small().icon(IconName::FolderInput).label("新建转存").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(false, window, cx))))
+            .child(Button::new("tf-direct").small().icon(IconName::Download).label("分享直下").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(true, window, cx))))
             .child(Button::new("tf-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|_, _, _, cx| { cx.global::<Backend>().ws.request_snapshot(); })));
 
-        let mut list = v_flex().overflow_y_scrollbar();
+        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
         if rows.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child("暂无转存任务"));
+            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无转存任务"));
         }
         for t in &rows {
             list = list.child(self.render_row(t, cx));

@@ -81,44 +81,41 @@ impl AutoBackupView {
         }).detach();
     }
 
-    fn open_create(&mut self, cx: &mut Context<Self>) {
+    fn open_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().clone();
         let name = self.name_input.clone();
         let local = self.local_input.clone();
         let remote = self.remote_input.clone();
         let dir = self.direction;
         let enc = self.encrypt;
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let v2 = view.clone();
-            let v3 = view.clone();
-            let v4 = view.clone();
-            window.open_dialog(cx, move |d: Dialog, _, _| {
-                let v5 = v2.clone();
-                let v6 = v3.clone();
-                let v7 = v4.clone();
-                d.title("新建备份配置").width(px(520.))
-                    .child(v_flex().gap_3()
-                        .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name)))
-                        .child(h_flex().gap_2().items_center().child("本地目录").child(Input::new(&local)))
-                        .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&remote)))
-                        .child(h_flex().gap_2().items_center().child("方向").child(
-                            RadioGroup::new("ab-dir").children(DIR_LABELS).selected_index(Some(dir))
-                                .on_change(move |i, _, cx| { v5.update(cx, |this, cx| { this.direction = *i; cx.notify(); }); })))
-                        .child(Switch::new("ab-enc").label("启用加密").checked(enc)
-                            .on_change(move |c, _, cx| { v6.update(cx, |this, cx| { this.encrypt = *c; cx.notify(); }); })))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("ab-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("ab-create").primary().label("创建").on_click(move |_, _, cx| { v7.update(cx, |this, cx| this.create(cx)); })))
-            });
+        let v2 = view.clone();
+        let v3 = view.clone();
+        let v4 = view.clone();
+        window.open_dialog(cx, move |d: Dialog, _, _| {
+            let v5 = v2.clone();
+            let v6 = v3.clone();
+            let v7 = v4.clone();
+            d.title("新建备份配置").width(px(520.))
+                .child(v_flex().gap_3()
+                    .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name)))
+                    .child(h_flex().gap_2().items_center().child("本地目录").child(Input::new(&local)))
+                    .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&remote)))
+                    .child(h_flex().gap_2().items_center().child("方向").child(
+                        RadioGroup::new("ab-dir").children(DIR_LABELS).selected_index(Some(dir))
+                            .on_change(move |i, _, cx| { v5.update(cx, |this, cx| { this.direction = *i; cx.notify(); }); })))
+                    .child(Switch::new("ab-enc").label("启用加密").checked(enc)
+                        .on_change(move |c, _, cx| { v6.update(cx, |this, cx| { this.encrypt = *c; cx.notify(); }); })))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("ab-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("ab-create").primary().label("创建").on_click(move |_, window, cx| { v7.update(cx, |this, cx| this.create(window, cx)); })))
         });
     }
 
-    fn create(&mut self, cx: &mut Context<Self>) {
+    fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.name_input.read(cx).value().trim().to_string();
         let local = self.local_input.read(cx).value().trim().to_string();
         let remote = self.remote_input.read(cx).value().trim().to_string();
-        if name.is_empty() || local.is_empty() { self.toast(cx, ToastKind::Warning, "请填写名称和本地目录"); return; }
+        if name.is_empty() || local.is_empty() { toast::show(window, cx, ToastKind::Warning, "请填写名称和本地目录"); return; }
         let body = json!({
             "name": name, "local_path": local, "remote_path": remote,
             "direction": DIRS[self.direction], "encrypt_enabled": self.encrypt,
@@ -177,22 +174,19 @@ impl AutoBackupView {
         }).detach();
     }
 
-    fn open_detail(&mut self, config_id: &str, cx: &mut Context<Self>) {
+    fn open_detail(&mut self, config_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let config_id = config_id.to_string();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let detail = cx.new(|cx| BackupDetail::new(config_id.clone(), cx));
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title("备份任务详情").width(px(680.)).child(detail.clone()));
-        });
+        let detail = cx.new(|cx| BackupDetail::new(config_id.clone(), cx));
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title("备份任务详情").width(px(680.)).child(detail.clone()));
     }
 }
 
 impl Render for AutoBackupView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child(format!("自动备份 · {} 个配置", self.configs.len())))
-            .child(Button::new("ab-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, _, cx| this.open_create(cx))))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个备份配置", self.configs.len())))
+            .child(Button::new("ab-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_create(window, cx))))
             .child(Button::new("ab-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
         let mut list = v_flex().gap_2().p_4().overflow_y_scrollbar();
@@ -210,7 +204,7 @@ impl Render for AutoBackupView {
             let id_detail = id.clone();
             let id_del = id.clone();
             list = list.child(
-                v_flex().gap_2().p_3().border_1().border_color(theme.border).rounded_lg()
+                v_flex().gap_2().p_3().bg(theme.secondary).rounded_lg()
                     .child(h_flex().gap_2().items_center()
                         .child(Icon::new(IconName::RefreshCw).size(px(18.)).text_color(theme.primary))
                         .child(div().flex_1().child(c.name.clone()))
@@ -221,7 +215,7 @@ impl Render for AutoBackupView {
                     .child(h_flex().gap_2()
                         .child(Button::new(format!("ab-trigger-{id}")).small().label("手动备份").on_click(cx.listener(move |this, _, _, cx| this.trigger(&id_trigger, cx))))
                         .child(Button::new(format!("ab-toggle-{id}")).small().label(if enabled { "停用" } else { "启用" }).on_click(cx.listener(move |this, _, _, cx| this.toggle_enabled(&id_toggle, enabled, cx))))
-                        .child(Button::new(format!("ab-detail-{id}")).small().label("详情").on_click(cx.listener(move |this, _, _, cx| this.open_detail(&id_detail, cx))))
+                        .child(Button::new(format!("ab-detail-{id}")).small().label("详情").on_click(cx.listener(move |this, _, window, cx| this.open_detail(&id_detail, window, cx))))
                         .child(Button::new(format!("ab-del-{id}")).danger().small().label("删除").on_click(cx.listener(move |this, _, _, cx| this.delete(&id_del, cx))))),
             );
         }

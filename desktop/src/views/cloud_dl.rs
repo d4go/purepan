@@ -67,32 +67,29 @@ impl CloudDlView {
         }).detach();
     }
 
-    fn open_add(&mut self, cx: &mut Context<Self>) {
+    fn open_add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().clone();
         let url = self.url_input.clone();
         let save = self.save_input.clone();
-        let wh = self.window_handle;
         let auto_dl = self.auto_download;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let v2 = view.clone();
-            window.open_dialog(cx, move |d: Dialog, _, _| {
-                let v4 = v2.clone();
-                d.title("新建离线下载").width(px(500.))
-                    .child(v_flex().gap_3()
-                        .child(h_flex().gap_2().items_center().child("链接").child(Input::new(&url)))
-                        .child(h_flex().gap_2().items_center().child("保存路径").child(Input::new(&save)))
-                        .child(Switch::new("cd-auto").label("完成后自动下载到本地").checked(auto_dl)
-                            .on_change(move |c, _, cx| { v4.update(cx, |this, cx| { this.auto_download = *c; cx.notify(); }); })))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("cd-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("cd-add").primary().label("添加").on_click({ let v = v2.clone(); move |_, _, cx| { v.update(cx, |this, cx| this.add_task(cx)); } })))
-            });
+        let v2 = view.clone();
+        window.open_dialog(cx, move |d: Dialog, _, _| {
+            let v4 = v2.clone();
+            d.title("新建离线下载").width(px(500.))
+                .child(v_flex().gap_3()
+                    .child(h_flex().gap_2().items_center().child("链接").child(Input::new(&url)))
+                    .child(h_flex().gap_2().items_center().child("保存路径").child(Input::new(&save)))
+                    .child(Switch::new("cd-auto").label("完成后自动下载到本地").checked(auto_dl)
+                        .on_change(move |c, _, cx| { v4.update(cx, |this, cx| { this.auto_download = *c; cx.notify(); }); })))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("cd-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("cd-add").primary().label("添加").on_click({ let v = v2.clone(); move |_, window, cx| { v.update(cx, |this, cx| this.add_task(window, cx)); } })))
         });
     }
 
-    fn add_task(&mut self, cx: &mut Context<Self>) {
+    fn add_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let url = self.url_input.read(cx).value().trim().to_string();
-        if url.is_empty() { self.toast(cx, ToastKind::Warning, "请输入链接"); return; }
+        if url.is_empty() { toast::show(window, cx, ToastKind::Warning, "请输入链接"); return; }
         let save = self.save_input.read(cx).value().trim().to_string();
         let req = AddTaskRequest {
             source_url: url,
@@ -154,15 +151,15 @@ impl CloudDlView {
 impl Render for CloudDlView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child("离线下载"))
-            .child(Button::new("cd-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, _, cx| this.open_add(cx))))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个离线任务", self.tasks.len())))
+            .child(Button::new("cd-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_add(window, cx))))
             .child(Button::new("cd-clear").small().label("清空").on_click(cx.listener(|this, _, _, cx| this.clear(cx))))
             .child(Button::new("cd-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
-        let mut list = v_flex().overflow_y_scrollbar();
+        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
         if self.tasks.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child("暂无离线任务"));
+            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无离线任务"));
         }
         for t in &self.tasks {
             let id = t.task_id as u64;
@@ -176,7 +173,7 @@ impl Render for CloudDlView {
             let cancellable = t.status == 0 || t.status == 1;
             let id_cancel = id;
             let id_del = id;
-            let mut row = v_flex().gap_1().px_4().py_2().border_b_1().border_color(theme.border);
+            let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
             let mut top = h_flex().gap_2().items_center();
             top = top.child(Icon::new(IconName::CloudDownload).size(px(18.)).text_color(theme.primary));
             top = top.child(div().flex_1().truncate().child(name));

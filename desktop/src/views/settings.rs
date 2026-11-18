@@ -45,8 +45,24 @@ pub struct SettingsView {
     _subscriptions: Vec<Subscription>,
 }
 
-fn section_title(title: &str) -> impl IntoElement {
-    div().text_size(px(15.)).child(title.to_string())
+fn section_title(title: &str, cx: &App) -> impl IntoElement {
+    div()
+        .text_size(px(12.))
+        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+        .text_color(cx.theme().muted_foreground)
+        .child(title.to_string())
+}
+
+fn field_label(text: &str, cx: &App) -> impl IntoElement {
+    div().w(px(88.)).text_color(cx.theme().muted_foreground).child(text.to_string())
+}
+
+fn num_field(label: &str, input: &Entity<InputState>, cx: &App) -> impl IntoElement {
+    h_flex()
+        .gap_1p5()
+        .items_center()
+        .child(div().text_color(cx.theme().muted_foreground).text_size(px(12.)).child(label.to_string()))
+        .child(Input::new(input).small().w(px(84.)))
 }
 
 impl SettingsView {
@@ -251,64 +267,113 @@ impl SettingsView {
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut page = v_flex().gap_4().p_4().overflow_y_scrollbar();
+        // 桌面端表单:内容限宽居中、统一控件尺寸,避免宽屏下拉满与高矮不齐
+        let mut page = v_flex().w_full().max_w(px(820.)).gap_6().p_6();
 
-        // 账号管理
-        let mut acc = v_flex().gap_2().child(section_title("账号管理"));
+        // 账号
+        let mut acc = v_flex().gap_2().child(section_title("账号", cx));
         for a in &self.accounts {
             let uid = a.uid;
             let active = a.is_active;
             let name = a.nickname.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| a.username.clone());
             let uid_switch = uid;
             let uid_del = uid;
-            acc = acc.child(h_flex().gap_2().items_center().px_2().py_1().border_1().border_color(theme.border).rounded_md()
-                .child(div().flex_1().child(format!("{name} (UID {uid})")))
-                .child(Tag::new().small().child(if active { "活跃" } else { "未激活" }))
-                .when(!active, |this| this.child(Button::new(format!("set-switch-{uid}")).small().label("切换").on_click(cx.listener(move |this, _, _, cx| this.switch_account(uid_switch, cx)))))
-                .child(Button::new(format!("set-del-{uid}")).danger().small().label("删除").on_click(cx.listener(move |this, _, _, cx| this.delete_account(uid_del, cx)))));
+            acc = acc.child(
+                h_flex().gap_3().items_center().px_3().py_1p5().rounded_lg().bg(theme.secondary)
+                    .child(div().flex_1().truncate().child(format!("{name}  ·  UID {uid}")))
+                    .child(Tag::new().small().child(if active { "活跃" } else { "未激活" }))
+                    .when(!active, |this| this.child(
+                        Button::new(format!("set-switch-{uid}")).small().label("切换")
+                            .on_click(cx.listener(move |this, _, _, cx| this.switch_account(uid_switch, cx)))))
+                    .child(
+                        Button::new(format!("set-del-{uid}")).ghost().small().icon(IconName::Trash)
+                            .on_click(cx.listener(move |this, _, _, cx| this.delete_account(uid_del, cx)))),
+            );
         }
-        acc = acc.child(Button::new("set-add-account").small().icon(IconName::Plus).label("添加账号").on_click(cx.listener(|this, _, _, cx| { this.controller.update(cx, |c, cx| c.add_account(cx)); })));
+        acc = acc.child(
+            h_flex().child(
+                Button::new("set-add-account").small().icon(IconName::Plus).label("添加账号")
+                    .on_click(cx.listener(|this, _, _, cx| { this.controller.update(cx, |c, cx| c.add_account(cx)); })),
+            ),
+        );
         page = page.child(acc);
 
-        // 下载设置
-        page = page.child(v_flex().gap_2().child(section_title("下载设置"))
-            .child(h_flex().gap_2().items_center().child("下载目录").child(Input::new(&self.download_dir)))
-            .child(Switch::new("set-ask").label("每次询问下载目录").checked(self.ask_each_time).on_change(cx.listener(|this, c, _, cx| { this.ask_each_time = *c; cx.notify(); })))
-            .child(h_flex().gap_2().items_center().child("线程").child(Input::new(&self.dl_threads)).child("并发").child(Input::new(&self.dl_concurrent)).child("重试").child(Input::new(&self.dl_retries))));
+        // 下载
+        let mut dl = v_flex().gap_3().child(section_title("下载", cx));
+        dl = dl.child(h_flex().gap_3().items_center()
+            .child(field_label("下载目录", cx))
+            .child(div().flex_1().max_w(px(440.)).child(Input::new(&self.download_dir).small()))
+            .child(Switch::new("set-ask").small().label("每次询问").checked(self.ask_each_time)
+                .on_change(cx.listener(|this, c, _, cx| { this.ask_each_time = *c; cx.notify(); }))));
+        dl = dl.child(h_flex().gap_3().items_center()
+            .child(field_label("并发与重试", cx))
+            .child(h_flex().gap_3().items_center()
+                .child(num_field("线程", &self.dl_threads, cx))
+                .child(num_field("并发", &self.dl_concurrent, cx))
+                .child(num_field("重试", &self.dl_retries, cx))));
+        page = page.child(dl);
 
-        // 上传设置
-        page = page.child(v_flex().gap_2().child(section_title("上传设置"))
-            .child(h_flex().gap_2().items_center().child("线程").child(Input::new(&self.ul_threads)).child("并发").child(Input::new(&self.ul_concurrent)).child("重试").child(Input::new(&self.ul_retries)))
-            .child(Switch::new("set-hidden").label("跳过隐藏文件").checked(self.skip_hidden).on_change(cx.listener(|this, c, _, cx| { this.skip_hidden = *c; cx.notify(); }))));
+        // 上传
+        let mut ul = v_flex().gap_3().child(section_title("上传", cx));
+        ul = ul.child(h_flex().gap_3().items_center()
+            .child(field_label("并发与重试", cx))
+            .child(h_flex().gap_3().items_center()
+                .child(num_field("线程", &self.ul_threads, cx))
+                .child(num_field("并发", &self.ul_concurrent, cx))
+                .child(num_field("重试", &self.ul_retries, cx))));
+        ul = ul.child(h_flex().gap_3().items_center()
+            .child(field_label("文件过滤", cx))
+            .child(Switch::new("set-hidden").small().label("跳过隐藏文件").checked(self.skip_hidden)
+                .on_change(cx.listener(|this, c, _, cx| { this.skip_hidden = *c; cx.notify(); }))));
+        page = page.child(ul);
 
         // 加密
         let enc_text = match &self.enc {
             Some(e) if e.has_key => format!("已启用 · {}", e.algorithm),
             _ => "未配置密钥".to_string(),
         };
-        page = page.child(v_flex().gap_2().child(section_title("加密"))
-            .child(div().text_color(theme.muted_foreground).child(enc_text))
+        let mut enc = v_flex().gap_3().child(section_title("加密", cx));
+        enc = enc.child(h_flex().gap_3().items_center()
+            .child(field_label("密钥", cx))
+            .child(div().flex_1().text_color(theme.muted_foreground).child(enc_text))
             .child(h_flex().gap_2()
-                .child(Button::new("set-gen-key").small().label("生成密钥").on_click(cx.listener(|this, _, _, cx| this.gen_key(cx))))
-                .child(Button::new("set-export-key").small().label("导出密钥").on_click(cx.listener(|this, _, _, cx| this.export_key(cx))))
-                .child(Button::new("set-del-key").danger().small().label("删除密钥").on_click(cx.listener(|this, _, _, cx| this.delete_key(cx))))));
+                .child(Button::new("set-gen-key").small().label("生成").on_click(cx.listener(|this, _, _, cx| this.gen_key(cx))))
+                .child(Button::new("set-export-key").small().label("导出").on_click(cx.listener(|this, _, _, cx| this.export_key(cx))))
+                .child(Button::new("set-del-key").danger().small().label("删除").on_click(cx.listener(|this, _, _, cx| this.delete_key(cx))))));
+        page = page.child(enc);
 
         // 代理
-        page = page.child(v_flex().gap_2().child(section_title("网络代理"))
-            .child(div().text_color(theme.muted_foreground).child(format!("运行状态: {}", if self.proxy_status.is_empty() { "未知" } else { &self.proxy_status })))
+        let mut net = v_flex().gap_3().child(section_title("网络", cx));
+        net = net.child(h_flex().gap_3().items_center()
+            .child(field_label("代理", cx))
+            .child(div().flex_1().text_color(theme.muted_foreground)
+                .child(format!("运行状态: {}", if self.proxy_status.is_empty() { "未知" } else { &self.proxy_status })))
             .child(Button::new("set-test-proxy").small().label("测试连接").on_click(cx.listener(|this, _, _, cx| this.test_proxy(cx)))));
+        page = page.child(net);
 
         // 界面
-        page = page.child(v_flex().gap_2().child(section_title("界面"))
-            .child(h_flex().gap_2().items_center().child("关闭按钮").child(
-                RadioGroup::new("set-close").children(["退出程序", "最小化到托盘"]).selected_index(Some(self.close_behavior))
-                    .on_change(cx.listener(|this, i, _, cx| { this.close_behavior = *i; cx.notify(); })))));
+        let mut win = v_flex().gap_3().child(section_title("窗口", cx));
+        win = win.child(h_flex().gap_3().items_center()
+            .child(field_label("关闭按钮", cx))
+            .child(RadioGroup::new("set-close").children(["退出程序", "最小化到托盘"]).selected_index(Some(self.close_behavior))
+                .on_change(cx.listener(|this, i, _, cx| { this.close_behavior = *i; cx.notify(); }))));
+        page = page.child(win);
 
-        // 关于 + 保存
-        page = page.child(v_flex().gap_2().child(section_title("关于"))
+        // 关于
+        let mut about = v_flex().gap_3().child(section_title("关于", cx));
+        about = about.child(h_flex().gap_3().items_center()
+            .child(field_label("版本", cx))
             .child(div().text_color(theme.muted_foreground).child("PurePan v0.1.5 · Apache-2.0")));
-        page = page.child(Button::new("set-save").primary().loading(self.saving).label("保存设置").on_click(cx.listener(|this, _, _, cx| this.save(cx))));
+        page = page.child(about);
 
-        v_flex().flex_1().overflow_hidden().child(page)
+        page = page.child(h_flex().justify_end().pt_2().child(
+            Button::new("set-save").primary().label("保存设置").loading(self.saving)
+                .on_click(cx.listener(|this, _, _, cx| this.save(cx))),
+        ));
+
+        v_flex().flex_1().overflow_hidden().child(
+            div().flex_1().overflow_y_scrollbar()
+                .child(div().flex().justify_center().w_full().child(page)),
+        )
     }
 }

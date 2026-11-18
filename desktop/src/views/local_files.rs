@@ -9,7 +9,7 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::table::{Column, DataTable, TableDelegate, TableState};
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyWindowHandle, App, AppContext as _, Context, Div, Entity, InteractiveElement as _,
@@ -27,6 +27,7 @@ use crate::util;
 pub struct LocalDelegate {
     pub entries: Vec<FileEntry>,
     pub selected: HashSet<String>,
+    pub active_path: Option<String>,
     pub current_dir: String,
     parent: Option<String>,
     has_more: bool,
@@ -43,6 +44,7 @@ impl LocalDelegate {
         Self {
             entries: Vec::new(),
             selected: HashSet::new(),
+            active_path: None,
             current_dir: String::new(),
             parent: None,
             has_more: false,
@@ -112,23 +114,48 @@ impl TableDelegate for LocalDelegate {
             _ => Column::new("x", ""),
         }
     }
-    fn render_tr(&mut self, row_ix: usize, _: &mut Window, _: &mut Context<TableState<Self>>) -> Stateful<Div> {
+    fn render_tr(&mut self, row_ix: usize, _: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
+        let theme = cx.theme().clone();
         let view = self.view.clone();
-        let target = self.entries.get(row_ix).map(|e| (e.entry_type == EntryType::Directory, e.path.clone()));
-        div().id(("local-row", row_ix)).on_click(move |_, _, cx| {
-            if let Some((true, path)) = &target {
+        let Some((is_dir, path)) = self.entries.get(row_ix)
+            .map(|e| (e.entry_type == EntryType::Directory, e.path.clone()))
+        else {
+            return div().id(("local-row", row_ix));
+        };
+        let active = self.active_path.as_deref() == Some(path.as_str());
+        let view_click = view.clone();
+        let view_dbl = view.clone();
+        div()
+            .id(("local-row", row_ix))
+            .when(active, |d| d.bg(theme.accent))
+            // 桌面端习惯:单击选中,双击打开目录 / 用系统程序打开文件
+            .on_click({
                 let path = path.clone();
-                let _ = view.update(cx, |v, cx| v.navigate(path, cx));
-            }
-        })
+                move |_, _, cx| {
+                    let path = path.clone();
+                    let _ = view_click.update(cx, |v, cx| {
+                        v.table.update(cx, |state, cx| {
+                            state.delegate_mut().active_path = Some(path);
+                            cx.notify();
+                        });
+                    });
+                }
+            })
+            .on_double_click(move |_, _, cx| {
+                if is_dir {
+                    let _ = view_dbl.update(cx, |v, cx| v.navigate(path.clone(), cx));
+                } else {
+                    let _ = open::that(&path);
+                }
+            })
     }
     fn context_menu(&mut self, row_ix: usize, menu: PopupMenu, _: &mut Window, _: &mut Context<TableState<Self>>) -> PopupMenu {
         let Some(e) = self.entries.get(row_ix).cloned() else { return menu };
         let view = self.view.clone();
         menu.item(
-            PopupMenuItem::new("删除").icon(IconName::Trash).on_click(move |_, _, cx| {
+            PopupMenuItem::new("删除").icon(IconName::Trash).on_click(move |_, window, cx| {
                 let e = e.clone();
-                let _ = view.update(cx, |v, cx| v.open_delete(vec![e], cx));
+                let _ = view.update(cx, |v, cx| v.open_delete(vec![e], window, cx));
             }),
         )
     }
@@ -215,24 +242,21 @@ impl LocalFilesView {
         let _ = wh.update(cx, |_, w, cx| toast::show(w, cx, kind, msg.clone()));
     }
 
-    fn open_delete(&mut self, files: Vec<FileEntry>, cx: &mut Context<Self>) {
+    fn open_delete(&mut self, files: Vec<FileEntry>, window: &mut Window, cx: &mut Context<Self>) {
         self.delete_targets = files;
         let count = self.delete_targets.len();
         let view = cx.entity().clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let view2 = view.clone();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
-                let view3 = view2.clone();
-                dialog.title("删除本地文件").width(px(460.))
-                    .child(format!("确定删除选中的 {count} 项吗?本地文件删除后不可恢复!"))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("ld-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("ld-ok").danger().label("删除").on_click(move |_, _, cx| {
-                            view3.update(cx, |v, cx| v.confirm_delete(cx));
-                        })))
-                    .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(cx)); true } })
-            });
+        let view2 = view.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view3 = view2.clone();
+            dialog.title("删除本地文件").width(px(460.))
+                .child(format!("确定删除选中的 {count} 项吗?本地文件删除后不可恢复!"))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("ld-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("ld-ok").danger().label("删除").on_click(move |_, _, cx| {
+                        view3.update(cx, |v, cx| v.confirm_delete(cx));
+                    })))
+                .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(cx)); true } })
         });
     }
 
@@ -266,22 +290,22 @@ impl Render for LocalFilesView {
             let d = self.table.read(cx).delegate();
             (d.current_dir.clone(), d.entries.len(), d.selected.len())
         };
-        let toolbar = h_flex().gap_3().items_center().px_4().py_2().border_b_1().border_color(theme.border)
+        let toolbar = h_flex().gap_3().items_center().px_4().py_1p5()
             .child(div().flex_1().child(breadcrumb::render(&dir, |target| {
                 cx.listener(move |this, _, _, cx| this.navigate(target.clone(), cx))
             })))
             .child(h_flex().gap_2()
                 .when(sel > 0, |this| this.child(
-                    Button::new("local-del").danger().icon(IconName::Trash).label("删除")
-                        .on_click(cx.listener(|this, _, _, cx| { let f = this.table.read(cx).delegate().selected_entries(); this.open_delete(f, cx); }))
+                    Button::new("local-del").danger().small().icon(IconName::Trash).label("删除")
+                        .on_click(cx.listener(|this, _, window, cx| { let f = this.table.read(cx).delegate().selected_entries(); this.open_delete(f, window, cx); }))
                 ))
-                .child(Button::new("local-refresh").icon(IconName::RefreshCw).label("刷新")
+                .child(Button::new("local-refresh").small().icon(IconName::RefreshCw).label("刷新")
                     .on_click(cx.listener(|this, _, _, cx| { let d = this.table.read(cx).delegate().current_dir.clone(); this.navigate(d, cx); }))));
 
         v_flex().flex_1().overflow_hidden()
             .child(toolbar)
             .child(div().flex_1().child(DataTable::new(&self.table).stripe(true)))
-            .child(h_flex().justify_between().px_4().py_1().border_t_1().border_color(theme.border).text_color(theme.muted_foreground)
+            .child(h_flex().justify_between().px_4().py_1p5().text_color(theme.muted_foreground).text_size(px(12.))
                 .child(format!("{count} 项"))
                 .child(dir))
     }

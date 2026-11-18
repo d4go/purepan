@@ -5,12 +5,13 @@
 //! 切换时重建(Global 状态存活),对齐 Vue 的 windowManager 行为。
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, h_flex};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex};
 use gpui_kit::{
     AnyView, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Context, Entity,
     IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window, WindowBounds,
@@ -21,6 +22,7 @@ use purepan_backend::server::websocket::WsServerMessage;
 
 use crate::api::{self, ApiClient};
 use crate::bridge::{ConnectionState, EventHub, ToastKind, UiEvent};
+use crate::components::dialogs::transfer_dialog::TransferDialog;
 use crate::components::{app_sidebar, app_sidebar::Nav, app_title_bar, toast};
 use crate::state::{AuthStore, Backend, BackendHealth, WebAuthState};
 use crate::views::{login::LoginView, placeholder::Placeholder, web_login::WebLoginView};
@@ -51,6 +53,7 @@ pub struct AppController {
     _pump: Task<()>,
     _health: Task<()>,
     _refresh: Task<()>,
+    _clipboard: Task<()>,
 }
 
 impl AppController {
@@ -121,6 +124,53 @@ impl AppController {
             }
         });
 
+        // 剪贴板监听:复制了新的百度分享链接时,直接弹出预填的转存对话框。
+        // 以启动时的剪贴板为基线,只对之后的复制动作做出反应。
+        let clipboard = cx.spawn(async move |this, cx| {
+            let mut last = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text()));
+            loop {
+                cx.background_executor().timer(Duration::from_millis(1200)).await;
+                let Some(text) = cx.update(|cx| cx.read_from_clipboard().and_then(|i| i.text())) else {
+                    continue;
+                };
+                if last.as_deref() == Some(text.as_str()) {
+                    continue;
+                }
+                let Some((url, pwd)) = crate::util::parse_share_link(&text) else {
+                    last = Some(text);
+                    continue;
+                };
+                let opened = this.update(cx, |this, cx| {
+                    if this.screen != Screen::Main {
+                        return false;
+                    }
+                    let Some(handle) = this.window else {
+                        return false;
+                    };
+                    let active = handle.update(cx, |_, w, _| w.is_window_active()).unwrap_or(false);
+                    if !active {
+                        // 窗口不活跃时不消费:切回应用后会再次检测并提示
+                        return false;
+                    }
+                    let (url, pwd) = (url.clone(), pwd.clone());
+                    let _ = handle.update(cx, |_, window, cx| {
+                        let on_success: Rc<dyn Fn(&mut Window, &mut App)> = Rc::new(|_w, cx| {
+                            cx.global::<Backend>().ws.request_snapshot();
+                        });
+                        let dlg = cx.new(|cx| TransferDialog::new(false, "/", on_success, window, cx));
+                        dlg.update(cx, |d, cx| d.set_share(&url, pwd.as_deref(), window, cx));
+                        window.open_dialog(cx, move |d, _, _| {
+                            d.title("转存分享链接").width(px(600.)).child(dlg.clone())
+                        });
+                    });
+                    true
+                }).unwrap_or(false);
+                if opened {
+                    last = Some(text);
+                }
+            }
+        });
+
         Self {
             screen: Screen::Boot,
             nav: Nav::Files,
@@ -138,6 +188,7 @@ impl AppController {
             _pump: pump,
             _health: health,
             _refresh: refresh,
+            _clipboard: clipboard,
         }
     }
 
@@ -559,8 +610,13 @@ impl Render for AppShell {
                 let controller = self.controller.clone();
                 root = root
                     .child(
-                        h_flex()
+                        // 不能用 h_flex():它默认 items_center,内容页会按固有高度居中,
+                        // 表格的 flex_1 收缩为 0(行不渲染)。
+                        div()
+                            .flex()
+                            .flex_row()
                             .flex_1()
+                            .min_h_0()
                             .overflow_hidden()
                             .child(app_sidebar::build(nav, move |n| {
                                 let controller = controller.clone();
@@ -624,6 +680,7 @@ fn open_app_window(
             is_resizable: false,
             titlebar: Some(TitleBar::title_bar_options()),
             app_id: Some("com.d4go.PurePan".into()),
+            icon: Some(crate::util::app_icon()),
             ..Default::default()
         },
         _ => WindowOptions {
@@ -634,6 +691,7 @@ fn open_app_window(
             ))),
             window_min_size: Some(size(px(960.), px(640.))),
             app_id: Some("com.d4go.PurePan".into()),
+            icon: Some(crate::util::app_icon()),
             ..TitleBar::window_options()
         },
     };

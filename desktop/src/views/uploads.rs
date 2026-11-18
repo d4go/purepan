@@ -9,7 +9,7 @@ use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _,
+    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement, ParentElement as _,
     Render, Styled as _, Subscription, Window, div, px,
 };
 use serde_json::Value;
@@ -79,8 +79,16 @@ impl UploadsView {
         cx.spawn(async move |this, cx| {
             let (api2, id2) = (api.clone(), id.clone());
             let result = api::call_api(&rt, move || async move { api2.delete_upload(&id2).await }).await;
+            let id = id.clone();
             let _ = this.update(cx, |this, cx| {
-                if let Err(e) = result { this.toast(cx, ToastKind::Error, e.message()); }
+                match result {
+                    Ok(_) => {
+                        cx.update_global::<TaskCache, _>(|c, _| { c.uploads.remove(&id); });
+                        cx.global::<Backend>().ws.request_snapshot();
+                        cx.notify();
+                    }
+                    Err(e) => this.toast(cx, ToastKind::Error, e.message()),
+                }
             });
         }).detach();
     }
@@ -98,7 +106,16 @@ impl UploadsView {
             };
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => this.toast(cx, ToastKind::Success, "操作完成"),
+                    Ok(_) => {
+                        cx.update_global::<TaskCache, _>(|c, _| match op {
+                            "clear_completed" => { c.uploads.retain(|_, v| v_str(v, "status") != "completed"); }
+                            "clear_failed" => { c.uploads.retain(|_, v| v_str(v, "status") != "failed"); }
+                            _ => {}
+                        });
+                        cx.global::<Backend>().ws.request_snapshot();
+                        this.toast(cx, ToastKind::Success, "操作完成");
+                        cx.notify();
+                    }
                     Err(e) => this.toast(cx, ToastKind::Error, e.message()),
                 }
             });
@@ -125,7 +142,7 @@ impl UploadsView {
         let id_del = id.clone();
         let id_retry = id.clone();
 
-        let mut row = v_flex().gap_1().px_4().py_2().border_b_1().border_color(theme.border);
+        let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
         let mut top = h_flex().gap_2().items_center();
         top = top.child(Icon::new(IconName::FileText).size(px(18.)).text_color(theme.primary));
         top = top.child(div().flex_1().truncate().child(name));
@@ -166,17 +183,17 @@ impl Render for UploadsView {
         let rows = self.rows(cx);
         let active_count = rows.iter().filter(|t| is_active(&v_str(t, "status"))).count();
 
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child(format!("上传管理 · {active_count} 个活跃")))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{active_count} 个活跃任务")))
             .child(Button::new("ul-pause-all").small().label("全部暂停").on_click(cx.listener(|this, _, _, cx| this.batch_op("pause", cx))))
             .child(Button::new("ul-resume-all").small().label("全部继续").on_click(cx.listener(|this, _, _, cx| this.batch_op("resume", cx))))
             .child(Button::new("ul-clear-done").small().label("清除已完成").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_completed", cx))))
             .child(Button::new("ul-clear-fail").small().label("清除失败").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_failed", cx))))
             .child(Button::new("ul-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|_, _, _, cx| { cx.global::<Backend>().ws.request_snapshot(); })));
 
-        let mut list = v_flex().overflow_y_scrollbar();
+        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
         if rows.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child("暂无上传任务"));
+            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无上传任务"));
         }
         for t in &rows {
             list = list.child(self.render_row(t, cx));

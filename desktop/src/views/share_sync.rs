@@ -65,36 +65,33 @@ impl ShareSyncView {
         }).detach();
     }
 
-    fn open_create(&mut self, cx: &mut Context<Self>) {
+    fn open_create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().clone();
         let name = self.name_input.clone();
         let url = self.url_input.clone();
         let pwd = self.pwd_input.clone();
         let path = self.path_input.clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let v2 = view.clone();
-            window.open_dialog(cx, move |d: Dialog, _, _| {
-                let v3 = v2.clone();
-                d.title("新建分享订阅").width(px(520.))
-                    .child(v_flex().gap_3()
-                        .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name)))
-                        .child(h_flex().gap_2().items_center().child("分享链接").child(Input::new(&url)))
-                        .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&pwd)))
-                        .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&path))))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("ss-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("ss-create").primary().label("创建").on_click(move |_, _, cx| { v3.update(cx, |this, cx| this.create(cx)); })))
-            });
+        let v2 = view.clone();
+        window.open_dialog(cx, move |d: Dialog, _, _| {
+            let v3 = v2.clone();
+            d.title("新建分享订阅").width(px(520.))
+                .child(v_flex().gap_3()
+                    .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name)))
+                    .child(h_flex().gap_2().items_center().child("分享链接").child(Input::new(&url)))
+                    .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&pwd)))
+                    .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&path))))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("ss-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("ss-create").primary().label("创建").on_click(move |_, window, cx| { v3.update(cx, |this, cx| this.create(window, cx)); })))
         });
     }
 
-    fn create(&mut self, cx: &mut Context<Self>) {
+    fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.name_input.read(cx).value().trim().to_string();
         let url = self.url_input.read(cx).value().trim().to_string();
         let pwd = self.pwd_input.read(cx).value().trim().to_string();
         let path = self.path_input.read(cx).value().trim().to_string();
-        if name.is_empty() || url.is_empty() { self.toast(cx, ToastKind::Warning, "请填写名称和分享链接"); return; }
+        if name.is_empty() || url.is_empty() { toast::show(window, cx, ToastKind::Warning, "请填写名称和分享链接"); return; }
         let body = json!({
             "name": name, "share_url": url,
             "password": if pwd.is_empty() { None } else { Some(pwd) },
@@ -175,9 +172,9 @@ fn run_row(run: &RunRecord) -> impl IntoElement {
 impl Render for ShareSyncView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child(format!("分享同步 · {} 个订阅", self.subs.len())))
-            .child(Button::new("ss-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, _, cx| this.open_create(cx))))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个订阅", self.subs.len())))
+            .child(Button::new("ss-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_create(window, cx))))
             .child(Button::new("ss-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
 
         let mut list = v_flex().gap_2().p_4().overflow_y_scrollbar();
@@ -194,7 +191,7 @@ impl Render for ShareSyncView {
             let id_runs = id.clone();
             let id_del = id.clone();
             list = list.child(
-                v_flex().gap_2().p_3().border_1().border_color(theme.border).rounded_lg()
+                v_flex().gap_2().p_3().bg(theme.secondary).rounded_lg()
                     .child(h_flex().gap_2().items_center()
                         .child(Icon::new(IconName::FolderSync).size(px(18.)).text_color(theme.primary))
                         .child(div().flex_1().child(s.name.clone()))

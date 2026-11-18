@@ -54,3 +54,5 @@ node_modules
 skills-lock.json
 decrypt-cli/target/
 target/
+# 本地打包产物
+/dist/

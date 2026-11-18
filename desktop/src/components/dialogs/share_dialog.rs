@@ -45,14 +45,12 @@ impl ShareDialog {
         let _ = wh.update(cx, |_, w, cx| toast::show(w, cx, kind, msg.clone()));
     }
 
-    fn random_pwd(&mut self, cx: &mut Context<Self>) {
+    fn random_pwd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use rand::Rng;
         const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
         let mut rng = rand::thread_rng();
         let pwd: String = (0..4).map(|_| CHARS[rng.gen_range(0..CHARS.len())] as char).collect();
-        let input = self.pwd.clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, |_, w, cx| input.update(cx, |s, cx| s.set_value(pwd, w, cx)));
+        self.pwd.update(cx, |s, cx| s.set_value(pwd, window, cx));
     }
 
     fn create(&mut self, cx: &mut Context<Self>) {
@@ -77,9 +75,9 @@ impl ShareDialog {
         }).detach();
     }
 
-    fn copy(&self, text: String, cx: &mut Context<Self>) {
+    fn copy(&self, text: String, window: &mut Window, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text));
-        self.toast(cx, ToastKind::Success, "已复制");
+        toast::show(window, cx, ToastKind::Success, "已复制");
     }
 }
 
@@ -95,8 +93,8 @@ impl Render for ShareDialog {
                 .child(div().px_2().py_1().bg(theme.secondary).rounded_md().child(link.clone()))
                 .when(!pwd.is_empty(), |this| this.child(div().child(format!("提取码: {pwd}"))))
                 .child(h_flex().gap_2().justify_end()
-                    .child(Button::new("sh-copy-link").label("复制链接").on_click(cx.listener(move |this, _, _, cx| this.copy(link2.clone(), cx))))
-                    .child(Button::new("sh-copy-both").primary().label("复制全部").on_click(cx.listener(move |this, _, _, cx| this.copy(both.clone(), cx))))
+                    .child(Button::new("sh-copy-link").label("复制链接").on_click(cx.listener(move |this, _, window, cx| this.copy(link2.clone(), window, cx))))
+                    .child(Button::new("sh-copy-both").primary().label("复制全部").on_click(cx.listener(move |this, _, window, cx| this.copy(both.clone(), window, cx))))
                     .child(Button::new("sh-close").label("关闭").on_click(|_, w, cx| w.close_dialog(cx))));
             return form;
         }
@@ -108,7 +106,7 @@ impl Render for ShareDialog {
                     .on_change(cx.listener(|this, idx, _, cx| { this.period = *idx; cx.notify(); })),
             ))
             .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&self.pwd))
-                .child(Button::new("sh-random").small().label("随机").on_click(cx.listener(|this, _, _, cx| this.random_pwd(cx)))))
+                .child(Button::new("sh-random").small().label("随机").on_click(cx.listener(|this, _, window, cx| this.random_pwd(window, cx)))))
             .child(h_flex().gap_2().justify_end()
                 .child(Button::new("sh-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
                 .child(Button::new("sh-create").primary().loading(self.creating).label("创建分享").on_click(cx.listener(|this, _, _, cx| this.create(cx)))));

@@ -81,7 +81,7 @@ impl DownloadsView {
         (folders, files)
     }
 
-    fn pause_resume(&mut self, id: &str, status: &str, cx: &mut Context<Self>) {
+    fn pause_resume(&mut self, id: &str, status: &str, is_folder: bool, cx: &mut Context<Self>) {
         let b = cx.global::<Backend>();
         let (rt, api) = (b.rt.clone(), b.api.clone());
         let id = id.to_string();
@@ -89,9 +89,13 @@ impl DownloadsView {
         cx.spawn(async move |this, cx| {
             let (api2, id2) = (api.clone(), id.clone());
             let result = if pause {
-                api::call_api(&rt, move || async move { api2.pause_download(&id2).await }).await
+                api::call_api(&rt, move || async move {
+                    if is_folder { api2.pause_folder_download(&id2).await } else { api2.pause_download(&id2).await }
+                }).await
             } else {
-                api::call_api(&rt, move || async move { api2.resume_download(&id2).await }).await
+                api::call_api(&rt, move || async move {
+                    if is_folder { api2.resume_folder_download(&id2).await } else { api2.resume_download(&id2).await }
+                }).await
             };
             let _ = this.update(cx, |this, cx| {
                 if let Err(e) = result { this.toast(cx, ToastKind::Error, e.message()); }
@@ -99,28 +103,25 @@ impl DownloadsView {
         }).detach();
     }
 
-    fn open_delete(&mut self, id: &str, is_folder: bool, cx: &mut Context<Self>) {
+    fn open_delete(&mut self, id: &str, is_folder: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.delete_target = Some((id.to_string(), is_folder));
         let view = cx.entity().clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let v2 = view.clone();
-            let v3 = view.clone();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
-                let v4 = v2.clone();
-                let v_files = v3.clone();
-                dialog.title("删除下载任务").width(px(460.))
-                    .child("请选择删除方式:")
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("dl-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("dl-task").label("仅删除任务").on_click(move |_, _, cx| {
-                            v4.update(cx, |v, cx| v.confirm_delete(false, cx));
-                        }))
-                        .child(Button::new("dl-files").danger().label("删除任务和本地文件").on_click(move |_, _, cx| {
-                            v_files.update(cx, |v, cx| v.confirm_delete(true, cx));
-                        })))
-                    .on_ok({ let v = v2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(false, cx)); true } })
-            });
+        let v2 = view.clone();
+        let v3 = view.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let v4 = v2.clone();
+            let v_files = v3.clone();
+            dialog.title("删除下载任务").width(px(460.))
+                .child("请选择删除方式:")
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("dl-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("dl-task").label("仅删除任务").on_click(move |_, _, cx| {
+                        v4.update(cx, |v, cx| v.confirm_delete(false, cx));
+                    }))
+                    .child(Button::new("dl-files").danger().label("删除任务和本地文件").on_click(move |_, _, cx| {
+                        v_files.update(cx, |v, cx| v.confirm_delete(true, cx));
+                    })))
+                .on_ok({ let v = v2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(false, cx)); true } })
         });
     }
 
@@ -130,18 +131,31 @@ impl DownloadsView {
         let (rt, api) = (b.rt.clone(), b.api.clone());
         cx.spawn(async move |this, cx| {
             let result = if is_folder {
-                // 文件夹删除走 batch delete(按 group)
-                let req = BatchOperationRequest { task_ids: Some(vec![id.clone()]), delete_files: Some(delete_files), ..Default::default() };
-                let (api2, req2) = (api.clone(), req.clone());
-                api::call_api(&rt, move || async move { api2.batch_delete_downloads(req2).await.map(|_| ()) }).await
+                // 文件夹任务由独立的 folder_manager 管理
+                let (api2, id2) = (api.clone(), id.clone());
+                api::call_api(&rt, move || async move { api2.cancel_folder_download(&id2, delete_files).await }).await
             } else {
                 let (api2, id2) = (api.clone(), id.clone());
-                api::call_api(&rt, move || async move { api2.delete_download(&id2, delete_files).await.map(|_| ()) }).await
+                api::call_api(&rt, move || async move { api2.delete_download(&id2, delete_files).await }).await
             };
+            let id = id.clone();
             let _ = this.update(cx, |this, cx| {
                 let _ = this.window_handle.update(cx, |_, w, cx| w.close_all_dialogs(cx));
                 match result {
-                    Ok(_) => this.toast(cx, ToastKind::Success, "已删除"),
+                    Ok(_) => {
+                        // 不依赖 WS 事件:立即从缓存移除并请服务器快照兜底
+                        cx.update_global::<TaskCache, _>(|c, _| {
+                            if is_folder {
+                                c.folders.remove(&id);
+                                c.downloads.retain(|_, v| v_str(v, "group_id") != id);
+                            } else {
+                                c.downloads.remove(&id);
+                            }
+                        });
+                        cx.global::<Backend>().ws.request_snapshot();
+                        this.toast(cx, ToastKind::Success, if delete_files { "任务和本地文件已删除" } else { "任务已删除" });
+                        cx.notify();
+                    }
                     Err(e) => this.toast(cx, ToastKind::Error, e.message()),
                 }
             });
@@ -161,23 +175,36 @@ impl DownloadsView {
             };
             let _ = this.update(cx, |this, cx| {
                 match result {
-                    Ok(_) => this.toast(cx, ToastKind::Success, "操作完成"),
+                    Ok(_) => {
+                        // 清除类操作后端不逐条发 deleted 事件,本地立即合并 + 快照兜底
+                        cx.update_global::<TaskCache, _>(|c, _| match op {
+                            "clear_completed" => {
+                                c.downloads.retain(|_, v| v_str(v, "status") != "completed");
+                                c.folders.retain(|_, v| v_str(v, "status") != "completed");
+                            }
+                            "clear_failed" => {
+                                c.downloads.retain(|_, v| v_str(v, "status") != "failed");
+                                c.folders.retain(|_, v| v_str(v, "status") != "failed");
+                            }
+                            _ => {}
+                        });
+                        cx.global::<Backend>().ws.request_snapshot();
+                        this.toast(cx, ToastKind::Success, "操作完成");
+                        cx.notify();
+                    }
                     Err(e) => this.toast(cx, ToastKind::Error, e.message()),
                 }
             });
         }).detach();
     }
 
-    fn open_folder_detail(&mut self, folder_id: &str, cx: &mut Context<Self>) {
+    fn open_folder_detail(&mut self, folder_id: &str, window: &mut Window, cx: &mut Context<Self>) {
         let folder_id = folder_id.to_string();
         let hub = self.hub.clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let detail = cx.new(|cx| FolderDetail::new(folder_id.clone(), hub.clone(), cx));
-            let title = cx.global::<TaskCache>().folders.get(&folder_id)
-                .map(|f| v_str(f, "name")).unwrap_or_else(|| "文件夹详情".into());
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title(title.clone()).width(px(640.)).child(detail.clone()));
-        });
+        let detail = cx.new(|cx| FolderDetail::new(folder_id.clone(), hub.clone(), cx));
+        let title = cx.global::<TaskCache>().folders.get(&folder_id)
+            .map(|f| v_str(f, "name")).unwrap_or_else(|| "文件夹详情".into());
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title(title.clone()).width(px(640.)).child(detail.clone()));
     }
 
     fn render_row(&self, task: &Value, is_folder: bool, cx: &mut Context<Self>) -> impl IntoElement {
@@ -201,7 +228,7 @@ impl DownloadsView {
         let id_open = id.clone();
         let local_path = v_str(task, "local_path");
 
-        let mut row = v_flex().gap_1().px_4().py_2().border_b_1().border_color(theme.border);
+        let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
         // 第一行:图标 + 名称 + 状态 + 操作
         let mut top = h_flex().gap_2().items_center();
         top = top.child(Icon::new(if is_folder { IconName::Folder } else { IconName::FileText }).size(px(18.)).text_color(theme.primary));
@@ -211,11 +238,11 @@ impl DownloadsView {
         if !terminal {
             top = top.child(Button::new(format!("dl-pr-{id}")).ghost().small()
                 .icon(if active { IconName::Pause } else { IconName::Play })
-                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_pause, &status_pause, cx))));
+                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_pause, &status_pause, is_folder, cx))));
         } else if status == "failed" {
             let id_r = id.clone();
             top = top.child(Button::new(format!("dl-retry-{id}")).ghost().small().icon(IconName::RotateCw)
-                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_r, "paused", cx))));
+                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_r, "paused", is_folder, cx))));
         }
         if !is_folder && !local_path.is_empty() {
             top = top.child(Button::new(format!("dl-open-{id_open}")).ghost().small().icon(IconName::FolderOpen)
@@ -224,10 +251,10 @@ impl DownloadsView {
         if is_folder {
             let id_detail = id.clone();
             top = top.child(Button::new(format!("dl-detail-{id}")).ghost().small().icon(IconName::ListTree)
-                .on_click(cx.listener(move |this, _, _, cx| this.open_folder_detail(&id_detail, cx))));
+                .on_click(cx.listener(move |this, _, window, cx| this.open_folder_detail(&id_detail, window, cx))));
         }
         top = top.child(Button::new(format!("dl-del-{id_del}")).ghost().small().icon(IconName::Trash)
-            .on_click(cx.listener(move |this, _, _, cx| this.open_delete(&id_del, is_folder, cx))));
+            .on_click(cx.listener(move |this, _, window, cx| this.open_delete(&id_del, is_folder, window, cx))));
         row = row.child(top);
         // 远程路径
         row = row.child(div().text_color(theme.muted_foreground).truncate().child(v_str(task, "remote_path")));
@@ -256,17 +283,17 @@ impl Render for DownloadsView {
         let (folders, files) = self.rows(cx);
         let active_count = folders.iter().chain(files.iter()).filter(|t| is_active(&v_str(t, "status"))).count();
 
-        let toolbar = h_flex().gap_2().items_center().px_4().py_2().border_b_1().border_color(theme.border)
-            .child(div().flex_1().child(format!("下载管理 · {active_count} 个活跃")))
+        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
+            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{active_count} 个活跃任务")))
             .child(Button::new("dl-pause-all").small().label("全部暂停").on_click(cx.listener(|this, _, _, cx| this.batch_op("pause", cx))))
             .child(Button::new("dl-resume-all").small().label("全部继续").on_click(cx.listener(|this, _, _, cx| this.batch_op("resume", cx))))
             .child(Button::new("dl-clear-done").small().label("清除已完成").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_completed", cx))))
             .child(Button::new("dl-clear-fail").small().label("清除失败").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_failed", cx))))
             .child(Button::new("dl-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|_, _, _, cx| { cx.global::<Backend>().ws.request_snapshot(); })));
 
-        let mut list = v_flex().overflow_y_scrollbar();
+        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
         if folders.is_empty() && files.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child("暂无下载任务"));
+            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无下载任务"));
         }
         for f in &folders {
             list = list.child(self.render_row(f, true, cx));
@@ -285,17 +312,27 @@ impl Render for DownloadsView {
 
 struct FolderDetail {
     folder_id: String,
+    ws: crate::ws::WsHandle,
     _sub: Subscription,
 }
 
 impl FolderDetail {
     fn new(folder_id: String, hub: Entity<EventHub>, cx: &mut Context<Self>) -> Self {
+        let ws = cx.global::<Backend>().ws.clone();
+        // 子任务事件带 group_id,后端只推给订阅了 `download:<gid>` 的连接
+        ws.subscribe(vec![format!("download:{folder_id}")]);
         let sub = cx.subscribe(&hub, |_, _, ev, cx| {
             if matches!(ev, UiEvent::WsMessage(_) | UiEvent::AccountChanged { .. }) {
                 cx.notify();
             }
         });
-        Self { folder_id, _sub: sub }
+        Self { folder_id, ws, _sub: sub }
+    }
+}
+
+impl Drop for FolderDetail {
+    fn drop(&mut self) {
+        self.ws.unsubscribe(vec![format!("download:{}", self.folder_id)]);
     }
 }
 
@@ -329,7 +366,7 @@ impl Render for FolderDetail {
                 if rel.is_empty() { crate::api::file::basename(&v_str(c, "remote_path")) } else { rel }
             };
             list = list.child(
-                v_flex().gap_1().px_2().py_1p5().border_b_1().border_color(theme.border)
+                v_flex().gap_1().px_2().py_1p5().rounded_md().bg(theme.secondary)
                     .child(h_flex().gap_2().items_center()
                         .child(div().flex_1().truncate().child(name))
                         .child(Tag::new().small().child(status_label(&v_str(c, "status"))))

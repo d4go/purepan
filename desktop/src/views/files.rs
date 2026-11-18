@@ -14,7 +14,7 @@ use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
 use gpui_kit::component::tag::Tag;
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
@@ -39,6 +39,7 @@ const MAX_WARMUP_RETRIES: u32 = 120;
 pub struct FilesDelegate {
     pub files: Vec<FileItemWithEncryption>,
     pub selected: HashSet<u64>,
+    pub active_fs_id: Option<u64>,
     pub current_dir: String,
     pub has_more: bool,
     pub loading: bool,
@@ -62,6 +63,7 @@ impl FilesDelegate {
         Self {
             files: Vec::new(),
             selected: HashSet::new(),
+            active_fs_id: None,
             current_dir: "/".into(),
             has_more: true,
             loading: false,
@@ -310,15 +312,39 @@ impl TableDelegate for FilesDelegate {
         cx.notify();
     }
 
-    fn render_tr(&mut self, row_ix: usize, _window: &mut Window, _cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
+    fn render_tr(&mut self, row_ix: usize, _window: &mut Window, cx: &mut Context<TableState<Self>>) -> Stateful<Div> {
+        let theme = cx.theme().clone();
         let view = self.view.clone();
-        let target = self.files.get(row_ix).map(|f| (f.file.isdir, f.file.path.clone()));
+        let Some((fs_id, is_dir, path)) = self.files.get(row_ix)
+            .map(|f| (f.file.fs_id, f.file.isdir == 1, f.file.path.clone()))
+        else {
+            return div().id(("file-row", row_ix));
+        };
+        let active = self.active_fs_id == Some(fs_id);
+        let view_click = view.clone();
+        let view_dbl = view.clone();
         div()
             .id(("file-row", row_ix))
+            .when(active, |d| d.bg(theme.accent))
+            // 桌面端习惯:单击选中,双击打开目录 / 下载文件
             .on_click(move |_, _, cx| {
-                if let Some((1, path)) = &target {
-                    let path = path.clone();
-                    let _ = view.update(cx, |v, cx| v.navigate_to_dir(path, cx));
+                let _ = view_click.update(cx, |v, cx| {
+                    v.table.update(cx, |state, cx| {
+                        state.delegate_mut().active_fs_id = Some(fs_id);
+                        cx.notify();
+                    });
+                });
+            })
+            .on_double_click(move |_, window, cx| {
+                if is_dir {
+                    let _ = view_dbl.update(cx, |v, cx| v.navigate_to_dir(path.clone(), cx));
+                } else {
+                    let _ = view_dbl.update(cx, |v, cx| {
+                        let f = v.delegate(cx).files.iter().find(|f| f.file.fs_id == fs_id).cloned();
+                        if let Some(f) = f {
+                            v.download_files(vec![f], window, cx);
+                        }
+                    });
                 }
             })
     }
@@ -337,9 +363,9 @@ impl TableDelegate for FilesDelegate {
             let f = f.clone();
             PopupMenuItem::new(label)
                 .icon(icon)
-                .on_click(move |_, _, cx| {
+                .on_click(move |_, window, cx| {
                     let f = f.clone();
-                    let _ = view.update(cx, |v, cx| v.handle_file_action(action, f, cx));
+                    let _ = view.update(cx, |v, cx| v.handle_file_action(action, f, window, cx));
                 })
         };
         menu.item(mk("打开", IconName::FolderOpen, FileAction::Open))
@@ -567,58 +593,61 @@ impl FilesView {
         let _ = wh.update(cx, |_, window, cx| toast::show(window, cx, kind, msg.clone()));
     }
 
-    pub fn handle_file_action(&mut self, action: FileAction, f: FileItemWithEncryption, cx: &mut Context<Self>) {
+    /// 同步(点击/对话框回调)上下文里不能重入 `AnyWindowHandle::update`,
+    /// 必须用回调提供的 window 直接弹 toast。
+    pub fn toast_sync(&self, window: &mut Window, cx: &mut Context<Self>, kind: ToastKind, msg: impl Into<String>) {
+        toast::show(window, cx, kind, msg.into());
+    }
+
+    pub fn handle_file_action(&mut self, action: FileAction, f: FileItemWithEncryption, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             FileAction::Open => {
                 if f.file.isdir == 1 {
                     self.navigate_to_dir(f.file.path.clone(), cx);
                 }
             }
-            FileAction::Rename => self.open_rename_dialog(f, cx),
-            FileAction::Delete => self.open_delete_confirm(vec![f], cx),
-            FileAction::Download => self.download_files(vec![f], cx),
-            FileAction::Copy => self.open_copy_move_picker(false, vec![f], cx),
-            FileAction::Move => self.open_copy_move_picker(true, vec![f], cx),
-            FileAction::Share => self.open_share_dialog(vec![f], cx),
+            FileAction::Rename => self.open_rename_dialog(f, window, cx),
+            FileAction::Delete => self.open_delete_confirm(vec![f], window, cx),
+            FileAction::Download => self.download_files(vec![f], window, cx),
+            FileAction::Copy => self.open_copy_move_picker(false, vec![f], window, cx),
+            FileAction::Move => self.open_copy_move_picker(true, vec![f], window, cx),
+            FileAction::Share => self.open_share_dialog(vec![f], window, cx),
         }
     }
 
     // ── 新建文件夹 ──
-    fn open_new_folder_dialog(&mut self, cx: &mut Context<Self>) {
+    fn open_new_folder_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().clone();
         let input = self.new_folder_input.clone();
         let dir = self.delegate(cx).current_dir.clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            input.update(cx, |s, cx| s.clean(window, cx));
-            let view2 = view.clone();
-            let input2 = input.clone();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
-                let view3 = view2.clone();
-                dialog
-                    .title("新建文件夹")
-                    .width(px(500.))
-                    .child(
-                        v_flex().gap_3()
-                            .child(h_flex().gap_2().items_center().child("文件夹名").child(Input::new(&input2)))
-                            .child(h_flex().gap_2().child("当前路径").child(dir.clone())),
-                    )
-                    .footer(
-                        h_flex().gap_2().justify_end()
-                            .child(Button::new("nf-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                            .child(Button::new("nf-ok").primary().label("创建").on_click(move |_, _, cx| {
-                                view3.update(cx, |v, cx| v.create_folder(cx));
-                            })),
-                    )
-                    .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.create_folder(cx)); true } })
-            });
+        input.update(cx, |s, cx| s.clean(window, cx));
+        let view2 = view.clone();
+        let input2 = input.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view3 = view2.clone();
+            dialog
+                .title("新建文件夹")
+                .width(px(500.))
+                .child(
+                    v_flex().gap_3()
+                        .child(h_flex().gap_2().items_center().child("文件夹名").child(Input::new(&input2)))
+                        .child(h_flex().gap_2().child("当前路径").child(dir.clone())),
+                )
+                .footer(
+                    h_flex().gap_2().justify_end()
+                        .child(Button::new("nf-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                        .child(Button::new("nf-ok").primary().label("创建").on_click(move |_, window, cx| {
+                            view3.update(cx, |v, cx| v.create_folder(window, cx));
+                        })),
+                )
+                .on_ok({ let v = view2.clone(); move |_, window, cx| { v.update(cx, |v, cx| v.create_folder(window, cx)); true } })
         });
     }
 
-    fn create_folder(&mut self, cx: &mut Context<Self>) {
+    fn create_folder(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.new_folder_input.read(cx).value().trim().to_string();
         if let Some(err) = file::validate_filename(&name) {
-            self.toast(cx, ToastKind::Error, err);
+            self.toast_sync(window, cx, ToastKind::Error, err);
             return;
         }
         let dir = self.delegate(cx).current_dir.clone();
@@ -643,40 +672,37 @@ impl FilesView {
     }
 
     // ── 重命名 ──
-    fn open_rename_dialog(&mut self, f: FileItemWithEncryption, cx: &mut Context<Self>) {
+    fn open_rename_dialog(&mut self, f: FileItemWithEncryption, window: &mut Window, cx: &mut Context<Self>) {
         self.rename_target = Some(f.clone());
         let name = util::display_name(&f);
         let input = self.rename_input.clone();
         let view = cx.entity().clone();
         let original = name.clone();
         let dir = file::dirname(&f.file.path);
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            input.update(cx, |s, cx| s.set_value(name.clone(), window, cx));
-            let view2 = view.clone();
-            let input2 = input.clone();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
-                let view3 = view2.clone();
-                dialog.title("重命名").width(px(500.))
-                    .child(v_flex().gap_3()
-                        .child(h_flex().gap_2().child("原名称").child(original.clone()))
-                        .child(h_flex().gap_2().items_center().child("新名称").child(Input::new(&input2)))
-                        .child(h_flex().gap_2().child("所在目录").child(dir.clone())))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("rn-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("rn-ok").primary().label("确定").on_click(move |_, _, cx| {
-                            view3.update(cx, |v, cx| v.confirm_rename(cx));
-                        })))
-                    .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_rename(cx)); true } })
-            });
+        input.update(cx, |s, cx| s.set_value(name.clone(), window, cx));
+        let view2 = view.clone();
+        let input2 = input.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view3 = view2.clone();
+            dialog.title("重命名").width(px(500.))
+                .child(v_flex().gap_3()
+                    .child(h_flex().gap_2().child("原名称").child(original.clone()))
+                    .child(h_flex().gap_2().items_center().child("新名称").child(Input::new(&input2)))
+                    .child(h_flex().gap_2().child("所在目录").child(dir.clone())))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("rn-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("rn-ok").primary().label("确定").on_click(move |_, window, cx| {
+                        view3.update(cx, |v, cx| v.confirm_rename(window, cx));
+                    })))
+                .on_ok({ let v = view2.clone(); move |_, window, cx| { v.update(cx, |v, cx| v.confirm_rename(window, cx)); true } })
         });
     }
 
-    fn confirm_rename(&mut self, cx: &mut Context<Self>) {
+    fn confirm_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(target) = self.rename_target.clone() else { return };
         let newname = self.rename_input.read(cx).value().trim().to_string();
         if let Some(err) = file::validate_filename(&newname) {
-            self.toast(cx, ToastKind::Error, err);
+            self.toast_sync(window, cx, ToastKind::Error, err);
             return;
         }
         let item = file::RenameItem { path: target.file.path.clone(), newname, id: target.file.fs_id };
@@ -701,24 +727,21 @@ impl FilesView {
     }
 
     // ── 删除 ──
-    fn open_delete_confirm(&mut self, files: Vec<FileItemWithEncryption>, cx: &mut Context<Self>) {
+    fn open_delete_confirm(&mut self, files: Vec<FileItemWithEncryption>, window: &mut Window, cx: &mut Context<Self>) {
         self.delete_targets = files;
         let count = self.delete_targets.len();
         let view = cx.entity().clone();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let view2 = view.clone();
-            window.open_dialog(cx, move |dialog: Dialog, _, _| {
-                let view3 = view2.clone();
-                dialog.title("删除确认").width(px(460.))
-                    .child(format!("确定删除选中的 {count} 项吗?删除后将移入回收站。"))
-                    .footer(h_flex().gap_2().justify_end()
-                        .child(Button::new("del-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
-                        .child(Button::new("del-ok").danger().label("删除").on_click(move |_, _, cx| {
-                            view3.update(cx, |v, cx| v.confirm_delete(cx));
-                        })))
-                    .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(cx)); true } })
-            });
+        let view2 = view.clone();
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let view3 = view2.clone();
+            dialog.title("删除确认").width(px(460.))
+                .child(format!("确定删除选中的 {count} 项吗?删除后将移入回收站。"))
+                .footer(h_flex().gap_2().justify_end()
+                    .child(Button::new("del-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
+                    .child(Button::new("del-ok").danger().label("删除").on_click(move |_, _, cx| {
+                        view3.update(cx, |v, cx| v.confirm_delete(cx));
+                    })))
+                .on_ok({ let v = view2.clone(); move |_, _, cx| { v.update(cx, |v, cx| v.confirm_delete(cx)); true } })
         });
     }
 
@@ -753,9 +776,9 @@ impl FilesView {
     }
 
     // ── 复制 / 移动 ──
-    fn open_copy_move_picker(&mut self, move_op: bool, files: Vec<FileItemWithEncryption>, cx: &mut Context<Self>) {
+    fn open_copy_move_picker(&mut self, move_op: bool, files: Vec<FileItemWithEncryption>, window: &mut Window, cx: &mut Context<Self>) {
         if files.is_empty() {
-            self.toast(cx, ToastKind::Warning, "请先选择文件或文件夹");
+            self.toast_sync(window, cx, ToastKind::Warning, "请先选择文件或文件夹");
             return;
         }
         // 禁选:同源父目录(精确);移动时还禁选源文件夹子树
@@ -774,15 +797,12 @@ impl FilesView {
             let files = files.clone();
             let _ = view.update(cx, move |v, cx| v.do_copy_move(move_op, files, dest, cx));
         });
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let picker = cx.new(|cx| {
-                crate::components::dialogs::netdisk_picker::NetdiskPicker::new(
-                    &initial, blocked_paths, blocked_exact, on_confirm, window, cx,
-                )
-            });
-            window.open_dialog(cx, move |dialog: Dialog, _, _| dialog.title(title).child(picker.clone()));
+        let picker = cx.new(|cx| {
+            crate::components::dialogs::netdisk_picker::NetdiskPicker::new(
+                &initial, blocked_paths, blocked_exact, on_confirm, window, cx,
+            )
         });
+        window.open_dialog(cx, move |dialog: Dialog, _, _| dialog.title(title).width(px(560.)).child(picker.clone()));
     }
 
     fn do_copy_move(&mut self, move_op: bool, files: Vec<FileItemWithEncryption>, dest: String, cx: &mut Context<Self>) {
@@ -823,9 +843,9 @@ impl FilesView {
     }
 
     // ── 下载(支持 ask_each_time 目录选择) ──
-    fn download_files(&mut self, files: Vec<FileItemWithEncryption>, cx: &mut Context<Self>) {
+    fn download_files(&mut self, files: Vec<FileItemWithEncryption>, window: &mut Window, cx: &mut Context<Self>) {
         if files.is_empty() {
-            self.toast(cx, ToastKind::Warning, "请先选择要下载的文件或文件夹");
+            self.toast_sync(window, cx, ToastKind::Warning, "请先选择要下载的文件或文件夹");
             return;
         }
         let b = cx.global::<Backend>();
@@ -857,7 +877,7 @@ impl FilesView {
                                 Some(initial), on_confirm, window, cx,
                             )
                         });
-                        window.open_dialog(cx, move |d: Dialog, _, _| d.title("选择下载目录").child(picker.clone()));
+                        window.open_dialog(cx, move |d: Dialog, _, _| d.title("选择下载目录").width(px(640.)).child(picker.clone()));
                     });
                 } else {
                     this.do_download_batch(files.clone(), default_dir, cx);
@@ -899,22 +919,19 @@ impl FilesView {
     }
 
     // ── 上传 ──
-    fn open_upload_picker(&mut self, cx: &mut Context<Self>) {
+    fn open_upload_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let view = cx.entity().downgrade();
         let on_confirm: std::rc::Rc<dyn Fn(Vec<String>, &mut Window, &mut App)> =
             std::rc::Rc::new(move |paths, _w, cx| {
                 let _ = view.update(cx, move |v, cx| v.upload_paths(paths, cx));
             });
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let picker = cx.new(|cx| {
-                crate::components::dialogs::file_picker::LocalFilePicker::new(
-                    crate::components::dialogs::file_picker::PickerMode::Files,
-                    None, on_confirm, window, cx,
-                )
-            });
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title("选择上传文件").child(picker.clone()));
+        let picker = cx.new(|cx| {
+            crate::components::dialogs::file_picker::LocalFilePicker::new(
+                crate::components::dialogs::file_picker::PickerMode::Files,
+                None, on_confirm, window, cx,
+            )
         });
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title("选择上传文件").width(px(640.)).child(picker.clone()));
     }
 
     fn upload_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
@@ -950,28 +967,22 @@ impl FilesView {
         }).detach();
     }
     // ── 分享 / 转存 ──
-    fn open_share_dialog(&mut self, files: Vec<FileItemWithEncryption>, cx: &mut Context<Self>) {
-        if files.is_empty() { self.toast(cx, ToastKind::Warning, "请先选择要分享的文件"); return; }
+    fn open_share_dialog(&mut self, files: Vec<FileItemWithEncryption>, window: &mut Window, cx: &mut Context<Self>) {
+        if files.is_empty() { self.toast_sync(window, cx, ToastKind::Warning, "请先选择要分享的文件"); return; }
         let paths: Vec<String> = files.iter().map(|f| f.file.path.clone()).collect();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let dlg = cx.new(|cx| crate::components::dialogs::share_dialog::ShareDialog::new(paths.clone(), window, cx));
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title("分享").child(dlg.clone()));
-        });
+        let dlg = cx.new(|cx| crate::components::dialogs::share_dialog::ShareDialog::new(paths.clone(), window, cx));
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title("分享").width(px(560.)).child(dlg.clone()));
     }
 
-    fn open_transfer_dialog(&mut self, direct: bool, cx: &mut Context<Self>) {
+    fn open_transfer_dialog(&mut self, direct: bool, window: &mut Window, cx: &mut Context<Self>) {
         let initial = self.delegate(cx).current_dir.clone();
         let view = cx.entity().downgrade();
-        let wh = self.window_handle;
-        let _ = wh.update(cx, move |_, window, cx| {
-            let on_success: std::rc::Rc<dyn Fn(&mut Window, &mut App)> = std::rc::Rc::new(move |_w, cx| {
-                let _ = view.update(cx, |v, cx| { let dir = v.delegate(cx).current_dir.clone(); v.navigate_to_dir(dir, cx); });
-            });
-            let dlg = cx.new(|cx| crate::components::dialogs::transfer_dialog::TransferDialog::new(direct, &initial, on_success, window, cx));
-            let title = if direct { "分享直下" } else { "转存" };
-            window.open_dialog(cx, move |d: Dialog, _, _| d.title(title).child(dlg.clone()));
+        let on_success: std::rc::Rc<dyn Fn(&mut Window, &mut App)> = std::rc::Rc::new(move |_w, cx| {
+            let _ = view.update(cx, |v, cx| { let dir = v.delegate(cx).current_dir.clone(); v.navigate_to_dir(dir, cx); });
         });
+        let dlg = cx.new(|cx| crate::components::dialogs::transfer_dialog::TransferDialog::new(direct, &initial, on_success, window, cx));
+        let title = if direct { "分享直下" } else { "转存" };
+        window.open_dialog(cx, move |d: Dialog, _, _| d.title(title).width(px(600.)).child(dlg.clone()));
     }
 }
 
@@ -983,7 +994,7 @@ impl Render for FilesView {
             (d.current_dir.clone(), d.is_search, d.search_keyword.clone(), d.files.len(), d.selected.len(), d.warming_up, d.loading_more, d.hasMore())
         };
 
-        let mut toolbar = h_flex().gap_3().items_center().px_4().py_2().border_b_1().border_color(theme.border);
+        let mut toolbar = h_flex().gap_3().items_center().px_4().py_1p5();
         // 面包屑
         toolbar = toolbar.child(div().flex_1().child(breadcrumb::render(&dir, |target| {
             cx.listener(move |this, _, _, cx| this.navigate_to_dir(target.clone(), cx))
@@ -1000,18 +1011,18 @@ impl Render for FilesView {
         // 操作按钮
         let actions = if sel_count > 0 {
             h_flex().gap_2()
-                .child(Button::new("batch-dl").icon(IconName::Download).label("下载").on_click(cx.listener(|this, _, _, cx| { let f = this.delegate(cx).selected_files(); this.download_files(f, cx); })))
-                .child(Button::new("batch-copy").icon(IconName::Copy).label("复制").on_click(cx.listener(|this, _, _, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(false, f, cx); })))
-                .child(Button::new("batch-move").icon(IconName::Move).label("移动").on_click(cx.listener(|this, _, _, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(true, f, cx); })))
-                .child(Button::new("batch-share").icon(IconName::Share2).label("分享").on_click(cx.listener(|this, _, _, cx| { let f = this.delegate(cx).selected_files(); this.open_share_dialog(f, cx); })))
-                .child(Button::new("batch-del").danger().icon(IconName::Trash).label("删除").on_click(cx.listener(|this, _, _, cx| { let f = this.delegate(cx).selected_files(); this.open_delete_confirm(f, cx); })))
+                .child(Button::new("batch-dl").small().icon(IconName::Download).label("下载").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.download_files(f, window, cx); })))
+                .child(Button::new("batch-copy").small().icon(IconName::Copy).label("复制").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(false, f, window, cx); })))
+                .child(Button::new("batch-move").small().icon(IconName::Move).label("移动").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(true, f, window, cx); })))
+                .child(Button::new("batch-share").small().icon(IconName::Share2).label("分享").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_share_dialog(f, window, cx); })))
+                .child(Button::new("batch-del").danger().small().icon(IconName::Trash).label("删除").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_delete_confirm(f, window, cx); })))
         } else {
             h_flex().gap_2()
-                .child(Button::new("new-folder").primary().icon(IconName::FolderPlus).label("新建").on_click(cx.listener(|this, _, _, cx| this.open_new_folder_dialog(cx))))
-                .child(Button::new("upload").success().icon(IconName::Upload).label("上传").on_click(cx.listener(|this, _, _, cx| this.open_upload_picker(cx))))
-                .child(Button::new("transfer").warning().icon(IconName::FolderInput).label("转存").on_click(cx.listener(|this, _, _, cx| this.open_transfer_dialog(false, cx))))
-                .child(Button::new("share-direct").warning().icon(IconName::Download).label("分享直下").on_click(cx.listener(|this, _, _, cx| this.open_transfer_dialog(true, cx))))
-                .child(Button::new("refresh").icon(IconName::RefreshCw).label("刷新").on_click(cx.listener(|this, _, _, cx| { let dir = this.delegate(cx).current_dir.clone(); this.navigate_to_dir(dir, cx); })))
+                .child(Button::new("new-folder").primary().small().icon(IconName::FolderPlus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_new_folder_dialog(window, cx))))
+                .child(Button::new("upload").success().small().icon(IconName::Upload).label("上传").on_click(cx.listener(|this, _, window, cx| this.open_upload_picker(window, cx))))
+                .child(Button::new("transfer").warning().small().icon(IconName::FolderInput).label("转存").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(false, window, cx))))
+                .child(Button::new("share-direct").warning().small().icon(IconName::Download).label("分享直下").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(true, window, cx))))
+                .child(Button::new("refresh").small().icon(IconName::RefreshCw).label("刷新").on_click(cx.listener(|this, _, _, cx| { let dir = this.delegate(cx).current_dir.clone(); this.navigate_to_dir(dir, cx); })))
         };
         toolbar = toolbar.child(actions);
 
@@ -1022,7 +1033,7 @@ impl Render for FilesView {
             content = content.child(div().flex_1().child(DataTable::new(&self.table).stripe(true)));
         }
         // 状态栏
-        let status = h_flex().justify_between().px_4().py_1().border_t_1().border_color(theme.border).text_color(theme.muted_foreground)
+        let status = h_flex().justify_between().px_4().py_1p5().text_color(theme.muted_foreground).text_size(px(12.))
             .child(h_flex().gap_2().child(format!("{item_count} 项")).when(sel_count > 0, |this| this.child(format!("· 已选择 {sel_count} 项"))))
             .child(h_flex().gap_2().when(is_search, |this| this.child(format!("搜索结果: \"{keyword}\""))).child(dir.clone()));
         content = content.child(status);
