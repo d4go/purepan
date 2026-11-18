@@ -18,7 +18,7 @@
 
 ## 📖 简介
 
-PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方客户端，提供简洁的界面和高效的上传/下载功能。
+PurePan 是一个使用 Rust 和 GPUI（gpui-kit 组件库）构建的现代化百度网盘第三方桌面客户端，提供简洁的界面和高效的上传/下载功能。
 
 ## ⭐ 支持项目发展
 
@@ -317,227 +317,37 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 </details>
 
-### 使用 Docker（推荐）
+### 从源码构建桌面端
 
-#### 方式一：使用预构建镜像（最简单）
-
-**使用 docker run（推荐）**：
-
-```bash
-# 1. 创建必要的目录
-mkdir -p baidupcs-rust/{config,downloads,data,logs,wal}
-cd baidupcs-rust
-
-# 2. 运行容器（使用预构建镜像）
-docker run -d \
-  --name PurePan \
-  -p 18888:18888 \
-  -v $(pwd)/config:/app/config \
-  -v $(pwd)/downloads:/app/downloads \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/wal:/app/wal \
-  --restart unless-stopped \
-  komorebicarry/baidupcs-rust:latest
-
-# 3. 访问应用
-open http://localhost:18888
-```
-
-**使用 docker-compose：**
-
-```bash
-# 1. 创建必要的目录
-mkdir -p baidupcs-rust/{config,downloads,data,logs,wal}
-cd baidupcs-rust
-
-# 2. 下载 docker-compose 配置文件
-# 从项目仓库下载 docker-compose.image.yml 文件
-
-# 3. 启动服务（使用预构建镜像）
-docker-compose -f docker-compose.image.yml up -d
-
-# 4. 访问应用
-open http://localhost:18888
-```
-
-#### 方式二：从源码构建
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/d4go/purepan.git
-cd purepan
-
-# 2. 构建并启动服务
-docker-compose up -d
-
-# 3. 访问应用
-open http://localhost:18888
-```
-
-<details>
-<summary><b>📋 Docker 详细说明</b>（点击展开）</summary>
-
-**说明**：
-- Docker 容器内，后端 API 服务和前端静态文件服务运行在同一个进程中
-- 只需要暴露一个端口（18888）即可访问完整应用
-- 前端页面和 API 调用都通过 `http://localhost:18888` 访问
-- 前端在容器内部通过 `http://localhost:18888/api/v1` 调用后端 API
-- **挂载目录说明**：
-    - `config`：配置文件目录，包含以下重要文件：
-        - `encryption.json`：加密密钥文件
-        - `baidu-pcs.db`：SQLite 数据库（历史记录、加密映射表等）
-        - `autobackup_configs.json`：自动备份配置
-    - `downloads`：下载文件保存目录
-    - `data`：会话数据目录（登录信息、会话持久化）
-    - `logs`：日志文件目录（应用运行日志，支持滚动）
-    - `wal`：WAL 目录（任务持久化数据，支持断点恢复）
-- ⚠️ **重要提示**：如果启用了客户端侧加密功能，请务必备份以下文件：
-    - `config/encryption.json`：加密密钥，**丢失后将无法解密已加密的文件**！
-    - `config/baidu-pcs.db`：包含加密文件映射表，用于解密时查找原始文件名
-- 预构建镜像自动发布在以下位置：
-    - [GitHub Container Registry](https://github.com/komorebiCarry/BaiduPCS-Rust/pkgs/container/baidupcs-rust) - `ghcr.io/komorebicarry/baidupcs-rust:latest`（推荐，无需额外注册）
-    - [Docker Hub](https://hub.docker.com/r/komorebicarry/baidupcs-rust) - `komorebicarry/baidupcs-rust:latest`（可选，需要配置 secrets）
-- 当创建 Git 标签（如 `v1.0.0`）时，GitHub Actions 会自动构建并推送 Docker 镜像
-- **Linux 用户推荐使用 Docker Hub 镜像**（更通用，无需登录）：`komorebicarry/baidupcs-rust:latest`
-- **如果镜像拉取较慢**，也可以从 [GitHub Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面直接下载 Docker 镜像文件（`BaiduPCS-Rust-{版本号}-docker.tar.gz`），然后使用以下命令加载：
-  ```bash
-  # 下载镜像文件后，加载镜像
-  docker load < BaiduPCS-Rust-v1.7.0-docker.tar.gz
-  
-  # 加载后可以使用镜像运行容器
-  docker run -d \
-    --name PurePan \
-    -p 18888:18888 \
-    -v $(pwd)/config:/app/config \
-    -v $(pwd)/downloads:/app/downloads \
-    -v $(pwd)/data:/app/data \
-    -v $(pwd)/logs:/app/logs \
-    -v $(pwd)/wal:/app/wal \
-    --restart unless-stopped \
-    baidupcs-rust:v1.7.0
-  ```
-
-**docker-compose 文件说明**：
-
-本项目提供三个 Docker Compose 配置文件，适用于不同场景：
-
-| 文件 | 用途 | 适用场景 |
-|------|------|----------|
-| `docker-compose.yml` | 从源码构建 | 本地源码构建部署 |
-| `docker-compose.dev.yml` | 开发环境 | 前后端分离热重载开发 |
-| `docker-compose.image.yml` | 预构建镜像 | 生产环境直接使用官方镜像 |
-
-**docker-compose.dev.yml（开发环境）**：
-- 后端服务使用 `cargo watch` 实现热重载，代码变更自动重新编译
-- 前端服务使用 Vite 开发服务器，支持 HMR 热更新
-- 后端端口 `18888`，前端端口 `5173`
-- 需要 `backend/Dockerfile.dev` 和 `frontend/Dockerfile.dev`
-
-```bash
-# 启动开发环境
-docker-compose -f docker-compose.dev.yml up -d
-```
-
-**docker-compose.image.yml（预构建镜像）**：
-- 直接使用官方预构建镜像，无需本地编译
-- 适合快速部署到生产环境
-- 支持健康检查、资源限制和自动重启
-
-```bash
-# 使用预构建镜像
-docker-compose -f docker-compose.image.yml up -d
-```
-
-</details>
-
-### 手动安装
+PurePan 桌面端使用 Rust + [GPUI](https://gpui.rs)（[gpui-kit](https://gpui-kit.com) 组件库）构建，内嵌 axum 后端，无需 Node.js / 浏览器运行时。
 
 #### 前提条件
 
-- Rust 1.87（项目通过 `rust-toolchain.toml` 固定为 1.87.0，本地 / Docker / CI 保持一致）
-- Node.js 18+
-- npm 或 pnpm
+- Rust 工具链 1.92+（`rustup`）
+- 系统依赖：
+  - **Linux**：`libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1`，以及可用的 Vulkan 驱动；图形会话（Wayland/X11）
+  - **macOS**：Xcode Command Line Tools（macOS 15+）
+  - **Windows**：Visual Studio 2022 C++ 生成工具 + CMake（MSVC 工具链）
 
-#### 后端
-
-```bash
-cd backend
-cargo build --release
-cargo run --release
-```
-
-#### 前端
+#### 开发模式
 
 ```bash
-cd frontend
-npm install
-npm run build
-# 或者开发模式
-npm run dev
+cargo run -p purepan-desktop
 ```
 
-访问 http://localhost:5173（开发模式）或 http://localhost:18888（生产模式）
+#### 生产构建
+
+```bash
+cargo build --release -p purepan-desktop
+```
+
+二进制位于 `target/release/purepan`（Windows 为 `purepan.exe`）。
+
+#### 数据目录
+
+release 模式下数据存放于 `~/.local/share/com.d4go.PurePan`（Linux），可用 `PUREPAN_DATA_DIR` 环境变量覆盖。
 
 ---
-
-## 🖥️ Tauri 桌面端构建
-
-项目支持使用 [Tauri 2.x](https://tauri.app/) 构建跨平台桌面应用。
-
-### 前提条件
-
-- 安装 Rust 工具链（1.87+）
-- 安装 Node.js 18+ 和 npm
-- 安装系统依赖（根据平台）：
-  - **Windows**：Microsoft Visual C++ Build Tools
-  - **Linux**：`libgtk-3-dev`, `libwebkit2gtk-4.0-dev` 等
-  - **macOS**：Xcode Command Line Tools
-
-### 安装 Tauri CLI
-
-```bash
-cargo install tauri-cli
-```
-
-### 安装前端依赖
-
-```bash
-cd frontend
-npm install
-```
-
-### 开发模式
-
-```bash
-# 在项目根目录执行
-cargo tauri dev
-```
-
-这会同时启动前端开发服务器和 Tauri 桌面窗口，支持热重载。
-
-### 生产构建
-
-```bash
-# 在项目根目录执行
-cargo tauri build
-```
-
-构建完成后，安装包位于 `src-tauri/target/release/bundle/` 目录下：
-- **Windows**：`.msi` 和 `.exe` 安装程序
-- **Linux**：`.deb`、`.rpm` 和 `.AppImage`
-- **macOS**：`.dmg` 和 `.app`
-
-### 项目配置
-
-Tauri 配置文件位于 `src-tauri/tauri.conf.json`，主要配置项：
-- 应用窗口尺寸、标题等外观属性
-- 前端构建产物路径（`frontendDist`）
-- 开发服务器 URL
-- 打包图标和分发目标
-
----
-
 ## 📝 平台支持说明
 
 ### 测试平台

@@ -1,0 +1,49 @@
+[workspace]
+members = ["backend", "desktop", "decrypt-cli"]
+resolver = "2"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.dev.build-override]
+debug = 0
+
+# GPUI 及其布局/渲染依赖在 dev 下也优化,否则界面卡顿(官方安装指南建议)
+[profile.dev.package.gpui-pre]
+opt-level = 3
+
+[profile.dev.package.gpui-pre-platform]
+opt-level = 3
+
+[profile.dev.package.gpui-component]
+opt-level = 3
+
+[profile.dev.package.gpui-kit]
+opt-level = 3
+
+[profile.dev.package.gpui-kit-assets]
+opt-level = 3
+
+[profile.dev.package.gpui-base]
+opt-level = 3
+
+[profile.dev.package.taffy]
+opt-level = 3
+
+[profile.dev.package.rustybuzz]
+opt-level = 3
+
+[profile.dev.package.ttf-parser]
+opt-level = 3
+
+[profile.dev.package.image]
+opt-level = 3
+
+[profile.dev.package.resvg]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

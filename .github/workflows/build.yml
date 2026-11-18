@@ -26,84 +26,79 @@ jobs:
             runner: windows-latest
             release_platform: windows
             rust-target: x86_64-pc-windows-msvc
-            tauri-args: -- --locked
+            artifact: purepan.exe
           - name: Linux x64
             runner: ubuntu-22.04
             release_platform: linux
             rust-target: x86_64-unknown-linux-gnu
-            tauri-args: -- --locked
+            artifact: purepan
           - name: Linux ARM64
             runner: ubuntu-24.04-arm
             release_platform: linux
             rust-target: aarch64-unknown-linux-gnu
-            tauri-args: -- --locked
+            artifact: purepan
           - name: macOS Apple Silicon
             runner: macos-latest
             release_platform: mac
             rust-target: aarch64-apple-darwin
-            tauri-args: --target aarch64-apple-darwin -- --locked
+            artifact: purepan
           - name: macOS Intel
             runner: macos-latest
             release_platform: mac
             rust-target: x86_64-apple-darwin
-            tauri-args: --target x86_64-apple-darwin -- --locked
+            artifact: purepan
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
+      - name: Install Linux system dependencies (GPUI)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            libwebkit2gtk-4.1-dev \
-            libappindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            rpm \
-            xdg-utils
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 22
-          cache: npm
-          cache-dependency-path: |
-            package-lock.json
-            frontend/package-lock.json
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libx11-xcb-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan1 \
+            mesa-vulkan-drivers
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.87.0
+          toolchain: 1.92.0
           targets: ${{ matrix.rust-target }}
 
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: src-tauri -> target
           cache-on-failure: true
 
-      - name: Install JavaScript dependencies
+      - name: Build PurePan desktop
+        shell: bash
+        run: cargo build --release --locked -p purepan-desktop --target ${{ matrix.rust-target }}
+
+      - name: Stage artifact
         shell: bash
         run: |
-          npm ci
-          npm ci --prefix frontend
+          mkdir -p dist
+          cp "target/${{ matrix.rust-target }}/release/${{ matrix.artifact }}" "dist/PurePan-${{ matrix.release_platform }}-${{ matrix.rust-target }}${{ runner.os == 'Windows' && '.exe' || '' }}"
 
-      - name: Build and package PurePan
-        uses: tauri-apps/tauri-action@v1
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PurePan-${{ matrix.release_platform }}-${{ matrix.rust-target }}
+          path: dist/*
+
+      - name: Upload release asset
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          args: ${{ matrix.tauri-args }}
-          tagName: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
-          releaseName: ${{ startsWith(github.ref, 'refs/tags/v') && format('PurePan {0}', github.ref_name) || '' }}
-          releaseBody: "See the assets below to download and install PurePan."
-          releaseDraft: true
-          prerelease: false
-          generateReleaseNotes: true
-          uploadWorkflowArtifacts: true
-          workflowArtifactNamePattern: "PurePan-${{ matrix.release_platform }}-[arch]-[bundle]"
-          releaseAssetNamePattern: "PurePan_[version]_${{ matrix.release_platform }}_[arch][setup][ext]"
