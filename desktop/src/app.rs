@@ -146,8 +146,28 @@ impl AppController {
         }
     }
 
-    fn sync_storage_account(&mut self, cx: &mut Context<Self>) {
-        let uid = cx.global::<AuthStore>().signed_in_uid();
+    /// 从托盘/程序坞激活:有窗口则聚焦,窗口已关闭则按当前屏幕重建。
+    pub fn restore_window(&mut self, cx: &mut Context<Self>) {
+        if let Some(handle) = self.window {
+            let activated = handle
+                .update(cx, |_, window, _| window.activate_window())
+                .is_ok();
+            if activated {
+                return;
+            }
+        }
+        let screen = if self.screen == Screen::Boot {
+            Screen::Login
+        } else {
+            self.screen
+        };
+        let controller = cx.entity();
+        let (handle, _) = open_app_window(cx, screen, controller);
+        self.window = Some(handle);
+        cx.notify();
+    }
+
+    fn sync_storage_account(&mut self, cx: &mut Context<Self>) {        let uid = cx.global::<AuthStore>().signed_in_uid();
         if uid == self.storage_uid {
             return;
         }
@@ -383,13 +403,7 @@ impl AppController {
             UiEvent::AccountChanged { .. } => {}
             UiEvent::Navigate(_) => {}
             UiEvent::Toast { kind, message } => self.toast(cx, kind, message),
-            UiEvent::ActivateWindow => {
-                if let Some(handle) = self.window {
-                    let _ = handle.update(cx, |_, window, _| {
-                        window.activate_window();
-                    });
-                }
-            }
+            UiEvent::ActivateWindow => self.restore_window(cx),
             UiEvent::Quit => cx.quit(),
         }
     }
@@ -742,7 +756,7 @@ fn open_app_window(
         },
     };
     gpui_kit::open_window(options, cx, |window, cx| {
-        window.on_window_should_close(cx, |window, _| shell::window::should_close(window));
+        window.on_window_should_close(cx, |window, cx| shell::window::should_close(window, cx));
         cx.new(|cx| AppShell::new(controller.clone(), window, cx))
     })
     .expect("无法打开窗口")
