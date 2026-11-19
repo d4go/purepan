@@ -1,10 +1,11 @@
-//! 本地文件系统浏览 API(移植 frontend/src/api/filesystem.ts)。
+//! 本地文件系统浏览 API(进程内直调)。
 //! 后端线缆字段为 camelCase(entryType/currentPath/...),桌面侧镜像对齐。
 
-use reqwest::Method;
 use serde::Deserialize;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -76,15 +77,6 @@ pub struct GotoResponse {
     pub message: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ValidateResponse {
-    pub valid: bool,
-    pub exists: bool,
-    #[serde(rename = "entryType")]
-    pub entry_type: Option<EntryType>,
-    pub message: Option<String>,
-}
-
 /// FS 错误码 → 友好提示(移植 getFriendlyErrorMessage)。
 pub fn friendly_error(code: i64, fallback: &str) -> String {
     match code {
@@ -103,21 +95,7 @@ pub fn friendly_error(code: i64, fallback: &str) -> String {
     .to_string()
 }
 
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
 impl ApiClient {
-    /// GET /fs/list
     pub async fn list_directory(
         &self,
         path: &str,
@@ -125,37 +103,24 @@ impl ApiClient {
         page_size: usize,
         sort_field: &str,
         sort_order: &str,
-        keyword: Option<&str>,
+        _keyword: Option<&str>,
     ) -> Result<ListDirectoryResponse, ApiError> {
-        let mut url = format!(
-            "/fs/list?path={}&page={page}&page_size={page_size}&sort_field={sort_field}&sort_order={sort_order}",
-            urlencode(path)
-        );
-        if let Some(k) = keyword {
-            url.push_str(&format!("&keyword={}", urlencode(k)));
-        }
-        self.request(Method::GET, &url, None).await
+        let path = path.to_string();
+        let sort_field = sort_field.to_string();
+        let sort_order = sort_order.to_string();
+        self.request(move |s| {
+            inproc::filesystem::list_directory(s, path, page, page_size, sort_field, sort_order)
+        })
+        .await
     }
 
-    /// GET /fs/goto
     pub async fn goto_path(&self, path: &str) -> Result<GotoResponse, ApiError> {
-        self.request(Method::GET, &format!("/fs/goto?path={}", urlencode(path)), None).await
+        let path = path.to_string();
+        self.request(move |s| inproc::filesystem::goto(s, path))
+            .await
     }
 
-    /// GET /fs/validate
-    pub async fn validate_path(&self, path: &str, entry_type: Option<EntryType>) -> Result<ValidateResponse, ApiError> {
-        let mut url = format!("/fs/validate?path={}", urlencode(path));
-        if let Some(t) = entry_type {
-            url.push_str(match t {
-                EntryType::File => "&type=file",
-                EntryType::Directory => "&type=directory",
-            });
-        }
-        self.request(Method::GET, &url, None).await
-    }
-
-    /// GET /fs/roots
     pub async fn get_roots(&self) -> Result<RootsResponse, ApiError> {
-        self.request(Method::GET, "/fs/roots", None).await
+        self.request(inproc::filesystem::roots).await
     }
 }

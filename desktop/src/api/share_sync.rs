@@ -1,10 +1,11 @@
-//! 分享同步(订阅)API(移植 frontend/src/api/shareSync.ts)。{success,data,error} 信封。
+//! 分享同步(订阅)API(进程内直调)。
 
-use reqwest::Method;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 pub use purepan_backend::share_sync::config::ShareSubscription;
 pub use purepan_backend::share_sync::persistence::RunRecord;
@@ -19,59 +20,41 @@ pub struct TriggerSubscriptionResponse {
 
 impl ApiClient {
     pub async fn list_subscriptions(&self) -> Result<Vec<ShareSubscription>, ApiError> {
-        self.request_success(Method::GET, "/share-sync/subscriptions", None).await
-    }
-
-    pub async fn get_subscription(&self, id: &str) -> Result<ShareSubscription, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/subscriptions/{id}"), None).await
+        self.request(inproc::share_sync::list_subscriptions).await
     }
 
     pub async fn create_subscription(&self, body: Value) -> Result<ShareSubscription, ApiError> {
-        self.request_success(Method::POST, "/share-sync/subscriptions", Some(body)).await
-    }
-
-    pub async fn update_subscription(&self, id: &str, body: Value) -> Result<ShareSubscription, ApiError> {
-        self.request_success(Method::PUT, &format!("/share-sync/subscriptions/{id}"), Some(body)).await
+        self.request(move |s| inproc::share_sync::create_subscription(s, body))
+            .await
     }
 
     pub async fn delete_subscription(&self, id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::DELETE, &format!("/share-sync/subscriptions/{id}"), None).await
+        let id = id.to_string();
+        self.request(move |s| inproc::share_sync::delete_subscription(s, id))
+            .await
     }
 
     pub async fn set_subscription_enabled(&self, id: &str, enabled: bool) -> Result<Value, ApiError> {
-        let path = if enabled { "enable" } else { "disable" };
-        self.request_success(Method::POST, &format!("/share-sync/subscriptions/{id}/{path}"), Some(json!({}))).await
+        let id = id.to_string();
+        self.request(move |s| inproc::share_sync::set_enabled(s, id, enabled))
+            .await
     }
 
     pub async fn trigger_subscription(&self, id: &str) -> Result<TriggerSubscriptionResponse, ApiError> {
-        self.request_success(Method::POST, &format!("/share-sync/subscriptions/{id}/trigger"), Some(json!({}))).await
+        let id = id.to_string();
+        self.request(move |s| inproc::share_sync::trigger(s, id))
+            .await
     }
 
     pub async fn resume_subscription(&self, id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, &format!("/share-sync/subscriptions/{id}/resume"), Some(json!({}))).await
+        let id = id.to_string();
+        self.request(move |s| inproc::share_sync::resume(s, id))
+            .await
     }
 
     pub async fn list_runs(&self, id: &str, page: usize) -> Result<Vec<RunRecord>, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/subscriptions/{id}/runs?page={page}&page_size=20"), None).await
-    }
-
-    pub async fn get_run(&self, run_id: &str, page: usize) -> Result<Value, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/runs/{run_id}?page={page}&page_size=100"), None).await
-    }
-
-    pub async fn list_run_items(&self, run_id: &str, page: usize) -> Result<Value, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/runs/{run_id}/items?page={page}&page_size=100"), None).await
-    }
-
-    pub async fn list_subtasks(&self, id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/subscriptions/{id}/subtasks"), None).await
-    }
-
-    pub async fn latest_snapshot(&self, id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::GET, &format!("/share-sync/subscriptions/{id}/snapshots/latest"), None).await
-    }
-
-    pub async fn preview_tree(&self, body: Value) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, "/share-sync/preview-tree", Some(body)).await
+        let id = id.to_string();
+        self.request(move |s| inproc::share_sync::list_runs(s, id, page))
+            .await
     }
 }

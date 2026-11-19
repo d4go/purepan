@@ -1,10 +1,11 @@
-//! 分享管理 API(移植 frontend/src/api/share.ts)。
+//! 分享管理 API(进程内直调)。
 
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateShareRequest {
@@ -61,24 +62,23 @@ pub struct ShareDetailData {
 }
 
 impl ApiClient {
-    /// POST /shares(period: 0=永久,1/7/30 天)
     pub async fn create_share(&self, paths: &[String], period: i32, pwd: Option<&str>) -> Result<ShareResult, ApiError> {
         let req = CreateShareRequest { paths: paths.to_vec(), period, pwd: pwd.map(String::from) };
-        self.request(Method::POST, "/shares", Some(json!(req))).await
+        let body = json!(req);
+        self.request(move |s| inproc::share::create(s, body)).await
     }
 
-    /// POST /shares/cancel
     pub async fn cancel_share(&self, share_ids: &[u64]) -> Result<CancelShareResult, ApiError> {
-        self.request(Method::POST, "/shares/cancel", Some(json!({ "share_ids": share_ids }))).await
+        let body = json!({ "share_ids": share_ids });
+        self.request(move |s| inproc::share::cancel(s, body)).await
     }
 
-    /// GET /shares?page=
     pub async fn list_shares(&self, page: u32) -> Result<ShareListData, ApiError> {
-        self.request(Method::GET, &format!("/shares?page={page}"), None).await
+        self.request(move |s| inproc::share::list(s, page)).await
     }
 
-    /// GET /shares/:id
     pub async fn get_share_detail(&self, share_id: u64) -> Result<ShareDetailData, ApiError> {
-        self.request(Method::GET, &format!("/shares/{share_id}"), None).await
+        self.request(move |s| inproc::share::detail(s, share_id))
+            .await
     }
 }

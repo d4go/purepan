@@ -1,10 +1,11 @@
-//! 网盘文件 API(移植 frontend/src/api/file.ts)。
+//! 网盘文件 API(进程内直调)。
 
-use reqwest::Method;
 use serde::Deserialize;
 use serde_json::json;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 pub use purepan_backend::netdisk::FileItem;
 
@@ -26,12 +27,6 @@ pub struct FileListData {
     pub page: u32,
     pub total: u64,
     pub has_more: bool,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct DownloadUrlData {
-    pub fs_id: u64,
-    pub url: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,45 +92,30 @@ pub enum FileOperationOutcome {
 }
 
 impl ApiClient {
-    /// GET /files?dir=&page=&page_size=
     pub async fn file_list(
         &self,
         dir: &str,
         page: u32,
         page_size: u32,
     ) -> Result<FileListData, ApiError> {
-        self.request(
-            Method::GET,
-            &format!(
-                "/files?dir={}&page={page}&page_size={page_size}",
-                urlencode(dir)
-            ),
-            None,
-        )
-        .await
+        let dir = dir.to_string();
+        self.request(move |s| inproc::file::list(s, dir, page, page_size))
+            .await
     }
 
-    /// GET /files/download?fs_id=
-    pub async fn download_url(&self, fs_id: u64) -> Result<String, ApiError> {
-        let data: DownloadUrlData = self
-            .request(Method::GET, &format!("/files/download?fs_id={fs_id}"), None)
-            .await?;
-        Ok(data.url)
-    }
-
-    /// POST /files/folder
     pub async fn create_folder(&self, path: &str) -> Result<CreateFolderData, ApiError> {
-        self.request(Method::POST, "/files/folder", Some(json!({ "path": path })))
+        let path = path.to_string();
+        self.request(move |s| inproc::file::create_folder(s, path))
             .await
     }
 
-    /// POST /files/delete(业务错误码经 ApiError::Business.code 透出,如 errno 132 风控)
+    /// 业务错误码经 ApiError::Business.code 透出(如 errno 132 风控)。
     pub async fn delete_files(&self, paths: &[String]) -> Result<DeleteFilesData, ApiError> {
-        self.request(Method::POST, "/files/delete", Some(json!({ "paths": paths })))
+        let paths = paths.to_vec();
+        self.request(move |s| inproc::file::delete_files(s, paths))
             .await
     }
 
-    /// GET /files/search?key=&page=&num=&recursion=
     pub async fn search_files(
         &self,
         key: &str,
@@ -143,38 +123,32 @@ impl ApiClient {
         num: u32,
         recursion: u32,
     ) -> Result<SearchData, ApiError> {
-        self.request(
-            Method::GET,
-            &format!(
-                "/files/search?key={}&page={page}&num={num}&recursion={recursion}",
-                urlencode(key)
-            ),
-            None,
-        )
-        .await
+        let key = key.to_string();
+        self.request(move |s| inproc::file::search(s, key, page, num, recursion as i32))
+            .await
     }
 
-    /// POST /files/copy(长轮询,后端最多 ~310s;客户端超时需足够长)
     pub async fn copy_files(
         &self,
         items: &[FileOperationItem],
     ) -> Result<FileOperationOutcome, ApiError> {
-        self.request_long(Method::POST, "/files/copy", Some(json!({ "items": items })))
+        let body = json!({ "items": items });
+        self.request(move |s| inproc::file::copy_files(s, body))
             .await
     }
 
-    /// POST /files/move
     pub async fn move_files(
         &self,
         items: &[FileOperationItem],
     ) -> Result<FileOperationOutcome, ApiError> {
-        self.request_long(Method::POST, "/files/move", Some(json!({ "items": items })))
+        let body = json!({ "items": items });
+        self.request(move |s| inproc::file::move_files(s, body))
             .await
     }
 
-    /// POST /files/rename
     pub async fn rename_file(&self, item: &RenameItem) -> Result<FileOperationOutcome, ApiError> {
-        self.request_long(Method::POST, "/files/rename", Some(json!({ "item": item })))
+        let body = json!({ "item": item });
+        self.request(move |s| inproc::file::rename_file(s, body))
             .await
     }
 }
@@ -250,17 +224,4 @@ pub fn dirname(p: &str) -> String {
         Some(idx) if idx > 0 => norm[..idx].to_string(),
         _ => "/".into(),
     }
-}
-
-fn urlencode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }

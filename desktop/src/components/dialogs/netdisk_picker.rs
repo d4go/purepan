@@ -193,7 +193,7 @@ impl Render for NetdiskPicker {
             }))
             .child(
                 h_flex().gap_2().items_center()
-                    .child(Input::new(&self.new_folder_input).small())
+                    .child(Input::new(&self.new_folder_input).large())
                     .child(Button::new("np-mkdir").small().icon(IconName::FolderPlus).on_click(cx.listener(|this, _, _, cx| this.create_folder(cx)))),
             )
             .child(list)

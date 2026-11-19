@@ -550,16 +550,19 @@ impl QRCodeAuth {
                     Ok(QRCodeStatus::Scanned)
                 }
                 2 => {
-                    // 没有 v 字段就拿不到 BDUSS，无法构成真正登录，不要伪造临时用户
-                    warn!("收到 status=2 但无 v 字段，无法换取 BDUSS");
-                    Ok(QRCodeStatus::Failed {
-                        reason: "登录状态异常(status=2)，请重新扫码".to_string(),
-                    })
+                    // status=2 但没有 v:用户在手机端取消/拒绝了本次登录
+                    warn!("收到 status=2 但无 v 字段,按用户取消登录处理");
+                    Ok(QRCodeStatus::Canceled)
                 }
                 -1 | -2 => {
                     // 二维码过期
                     warn!("二维码已过期");
                     Ok(QRCodeStatus::Expired)
+                }
+                4 => {
+                    // 用户取消登录
+                    info!("用户在手机端取消了登录");
+                    Ok(QRCodeStatus::Canceled)
                 }
                 _ => {
                     // 其他状态或错误

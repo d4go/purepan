@@ -176,11 +176,11 @@ impl Render for TransferDialog {
         let theme = cx.theme().clone();
         let mut form = v_flex().gap_3().w(px(520.));
         form = form
-            .child(h_flex().gap_2().items_center().child("分享链接").child(Input::new(&self.share_url)))
-            .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&self.password)));
+            .child(h_flex().gap_2().items_center().child("分享链接").child(Input::new(&self.share_url).large()))
+            .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&self.password).large()));
         if !self.direct_mode {
             form = form.child(h_flex().gap_2().items_center()
-                .child("保存路径").child(Input::new(&self.save_path))
+                .child("保存路径").child(Input::new(&self.save_path).large())
                 .child(Button::new("td-pick").small().icon(IconName::Folder).on_click(cx.listener(|this, _, window, cx| this.pick_save_path(window, cx)))));
         }
         form = form.child(

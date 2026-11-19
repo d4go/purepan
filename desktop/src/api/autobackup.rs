@@ -1,10 +1,11 @@
-//! 自动备份 + 加密 API(移植 frontend/src/api/autobackup.ts)。{success,data,error} 信封。
+//! 自动备份 + 加密 API(进程内直调)。
 
-use reqwest::Method;
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 pub use purepan_backend::autobackup::config::BackupConfig;
 pub use purepan_backend::autobackup::task::{BackupFileTask, BackupTask};
@@ -45,87 +46,82 @@ pub struct TriggerResponse {
 
 impl ApiClient {
     pub async fn list_backup_configs(&self) -> Result<Vec<BackupConfig>, ApiError> {
-        self.request_success(Method::GET, "/autobackup/configs", None).await
-    }
-
-    pub async fn get_backup_config(&self, id: &str) -> Result<BackupConfig, ApiError> {
-        self.request_success(Method::GET, &format!("/autobackup/configs/{id}"), None).await
+        self.request(inproc::autobackup::list_configs).await
     }
 
     pub async fn create_backup_config(&self, body: Value) -> Result<BackupConfig, ApiError> {
-        self.request_success(Method::POST, "/autobackup/configs", Some(body)).await
-    }
-
-    pub async fn update_backup_config(&self, id: &str, body: Value) -> Result<BackupConfig, ApiError> {
-        self.request_success(Method::PUT, &format!("/autobackup/configs/{id}"), Some(body)).await
+        self.request(move |s| inproc::autobackup::create_config(s, body))
+            .await
     }
 
     pub async fn delete_backup_config(&self, id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::DELETE, &format!("/autobackup/configs/{id}"), None).await
+        let id = id.to_string();
+        self.request(move |s| inproc::autobackup::delete_config(s, id))
+            .await
     }
 
     pub async fn enable_backup_config(&self, id: &str) -> Result<BackupConfig, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/configs/{id}/enable"), Some(json!({}))).await
+        let id = id.to_string();
+        self.request(move |s| inproc::autobackup::enable_config(s, id))
+            .await
     }
 
     pub async fn disable_backup_config(&self, id: &str) -> Result<BackupConfig, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/configs/{id}/disable"), Some(json!({}))).await
+        let id = id.to_string();
+        self.request(move |s| inproc::autobackup::disable_config(s, id))
+            .await
     }
 
     pub async fn trigger_backup(&self, config_id: &str) -> Result<TriggerResponse, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/configs/{config_id}/trigger"), Some(json!({}))).await
-    }
-
-    pub async fn get_backup_task(&self, task_id: &str) -> Result<BackupTask, ApiError> {
-        self.request_success(Method::GET, &format!("/autobackup/tasks/{task_id}"), None).await
+        let config_id = config_id.to_string();
+        self.request(move |s| inproc::autobackup::trigger(s, config_id))
+            .await
     }
 
     pub async fn list_backup_tasks(&self, config_id: &str, page: usize) -> Result<BackupTasksResponse, ApiError> {
-        self.request_success(Method::GET, &format!("/autobackup/configs/{config_id}/tasks?page={page}&page_size=20"), None).await
-    }
-
-    pub async fn cancel_backup_task(&self, task_id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/tasks/{task_id}/cancel"), Some(json!({}))).await
-    }
-
-    pub async fn pause_backup_task(&self, task_id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/tasks/{task_id}/pause"), Some(json!({}))).await
-    }
-
-    pub async fn resume_backup_task(&self, task_id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/tasks/{task_id}/resume"), Some(json!({}))).await
+        let config_id = config_id.to_string();
+        self.request(move |s| inproc::autobackup::list_tasks(s, config_id, page))
+            .await
     }
 
     pub async fn list_file_tasks(&self, task_id: &str, page: usize) -> Result<FileTasksResponse, ApiError> {
-        self.request_success(Method::GET, &format!("/autobackup/tasks/{task_id}/files?page={page}&page_size=20"), None).await
+        let task_id = task_id.to_string();
+        self.request(move |s| inproc::autobackup::list_file_tasks(s, task_id, page))
+            .await
     }
 
     pub async fn retry_file_task(&self, task_id: &str, file_task_id: &str) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, &format!("/autobackup/tasks/{task_id}/files/{file_task_id}/retry"), Some(json!({}))).await
+        let (task_id, file_task_id) = (task_id.to_string(), file_task_id.to_string());
+        self.request(move |s| inproc::autobackup::retry_file_task(s, task_id, file_task_id))
+            .await
     }
 
     // ── 加密 ──
     pub async fn encryption_status(&self) -> Result<EncryptionStatusResponse, ApiError> {
-        self.request_success(Method::GET, "/encryption/status", None).await
+        self.request(inproc::autobackup::encryption_status).await
     }
 
     pub async fn generate_encryption_key(&self, algorithm: Option<&str>) -> Result<String, ApiError> {
-        let body = json!({ "algorithm": algorithm });
-        let resp: GenerateKeyResponse = self.request_success(Method::POST, "/encryption/key/generate", Some(body)).await?;
+        let algorithm = algorithm.map(String::from);
+        let resp: GenerateKeyResponse = self
+            .request(move |s| inproc::autobackup::generate_key(s, algorithm))
+            .await?;
         Ok(resp.key)
     }
 
     pub async fn import_encryption_key(&self, key: &str, algorithm: Option<&str>) -> Result<Value, ApiError> {
-        self.request_success(Method::POST, "/encryption/key/import", Some(json!({ "key": key, "algorithm": algorithm }))).await
+        let (key, algorithm) = (key.to_string(), algorithm.map(String::from));
+        self.request(move |s| inproc::autobackup::import_key(s, key, algorithm))
+            .await
     }
 
     pub async fn export_encryption_key(&self) -> Result<String, ApiError> {
-        let resp: GenerateKeyResponse = self.request_success(Method::GET, "/encryption/key/export", None).await?;
+        let resp: GenerateKeyResponse = self.request(inproc::autobackup::export_key).await?;
         Ok(resp.key)
     }
 
     pub async fn delete_encryption_key(&self, force: bool) -> Result<Value, ApiError> {
-        let path = if force { "/encryption/key/force" } else { "/encryption/key" };
-        self.request_success(Method::DELETE, path, None).await
+        self.request(move |s| inproc::autobackup::delete_key(s, force))
+            .await
     }
 }

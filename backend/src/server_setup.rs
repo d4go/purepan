@@ -209,19 +209,24 @@ async fn init_web_auth_state(config: &crate::config::WebAuthConfig) -> Arc<WebAu
     state
 }
 
-/// 启动 HTTP/WebSocket 服务器
+/// 进程内后端引导结果：日志 guard 必须与 AppState 同生命周期存活。
+pub struct Bootstrap {
+    pub state: AppState,
+    pub log_guard: logging::LogGuard,
+}
+
+/// 初始化日志与 AppState，但不绑定任何端口。
 ///
-/// 此函数包含完整的服务器初始化和启动逻辑：
-/// 日志、配置、AppState、代理探测、Web 认证、路由、绑定、优雅关闭。
-/// 可被独立二进制（backend/src/main.rs）和 Tauri 应用（src-tauri/src/main.rs）共用。
-pub async fn start_server() -> anyhow::Result<()> {
+/// 桌面端（GPUI）进程内直接调用，避免拉起 HTTP 服务器；
+/// `start_server` 也复用同一套初始化逻辑。
+pub async fn bootstrap() -> anyhow::Result<Bootstrap> {
     // 🔥 先尝试加载日志配置，失败时使用默认配置
     let log_config = load_log_config().await;
 
-    // 🔥 初始化日志系统（必须保持 _log_guard 存活）
-    let _log_guard = logging::init_logging(&log_config);
+    // 🔥 初始化日志系统（必须保持 log_guard 存活）
+    let log_guard = logging::init_logging(&log_config);
 
-    info!("PurePan v0.1.5 启动中...");
+    info!("PurePan v0.1.6 启动中...");
 
     // 创建应用状态
     let app_state = AppState::new().await?;
@@ -273,6 +278,34 @@ pub async fn start_server() -> anyhow::Result<()> {
             }
         }
     }
+
+    // 🔥 先加载会话和初始化所有管理器，确保调用方访问时一切就绪
+    app_state.load_initial_session().await?;
+    info!("应用状态初始化完成");
+
+    // 多账号 ClientPool 预热（非活跃账号 Semaphore=3 + 2s 错峰）
+    // 活跃账号客户端已在 load_initial_session 中注入；本步为非活跃账号补齐
+    if let Err(e) = app_state.preheat_inactive_clients().await {
+        tracing::warn!("ClientPool 预热出现非致命错误: {}", e);
+    }
+
+    Ok(Bootstrap {
+        state: app_state,
+        log_guard,
+    })
+}
+
+/// 启动 HTTP/WebSocket 服务器
+///
+/// 此函数包含完整的服务器初始化和启动逻辑：
+/// 日志、配置、AppState、代理探测、Web 认证、路由、绑定、优雅关闭。
+/// 可被独立二进制（backend/src/main.rs）和 Tauri 应用（src-tauri/src/main.rs）共用。
+pub async fn start_server() -> anyhow::Result<()> {
+    let Bootstrap {
+        state: app_state,
+        // 服务器生命周期内保持日志 guard 存活
+        log_guard: _log_guard,
+    } = bootstrap().await?;
 
     // 获取配置
     let config = app_state.config.read().await.clone();
@@ -538,16 +571,6 @@ pub async fn start_server() -> anyhow::Result<()> {
             status: "ok".to_string(),
             service: "PurePan".to_string(),
         })
-    }
-
-    // 🔥 先加载会话和初始化所有管理器，确保前端访问时一切就绪
-    app_state.load_initial_session().await?;
-    info!("应用状态初始化完成");
-
-    // 多账号 ClientPool 预热（非活跃账号 Semaphore=3 + 2s 错峰）
-    // 活跃账号客户端已在 load_initial_session 中注入；本步为非活跃账号补齐
-    if let Err(e) = app_state.preheat_inactive_clients().await {
-        tracing::warn!("ClientPool 预热出现非致命错误: {}", e);
     }
 
     // 构建完整应用

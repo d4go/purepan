@@ -1,4 +1,5 @@
-//! 自动备份页(移植 AutoBackupView.vue):配置卡 CRUD、手动触发、启停、任务详情(逐文件重试)。
+//! 自动备份页:总览头部 + 三段式配置卡片(方向图标、状态胶囊、路径、操作),
+//! 新建 / 手动备份 / 启停 / 详情(逐文件重试) / 删除。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -8,18 +9,22 @@ use gpui_kit::component::radio::RadioGroup;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _,
-    Render, Styled as _, Subscription, Window, div, px,
+    AnyElement, AnyWindowHandle, AppContext as _, Context, Entity, Hsla, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window, div, px, rgb,
 };
 use serde_json::json;
 
 use crate::api::autobackup::{BackupConfig, BackupFileTask, BackupTask};
 use crate::api::{self};
 use crate::bridge::{EventHub, ToastKind, UiEvent};
+use crate::components::task_ui::{
+    circle_button, empty_state, soft_pill, status_tag, task_card,
+};
 use crate::components::toast;
+use crate::design::{self, Palette};
 use crate::state::Backend;
 use crate::util;
 
@@ -30,8 +35,21 @@ fn dir_label(d: &serde_json::Value) -> String {
     let s = d.as_str().unwrap_or("");
     match s { "upload" => "上传备份", "download" => "下载备份", "sync" => "双向同步", _ => s }.to_string()
 }
+
 fn status_str(v: &serde_json::Value) -> String {
     v.as_str().unwrap_or("").to_string()
+}
+
+/// 备份方向 → (图标, 底色, 前景色)。
+fn direction_visual(dir: &str, p: &Palette) -> (IconName, Hsla, Hsla) {
+    let (icon, bg, fg): (IconName, u32, u32) = match dir {
+        "upload" => (IconName::CloudUpload, 0xDBEAFE, 0x2563EB),
+        "download" => (IconName::CloudDownload, 0xD1FAE5, 0x059669),
+        _ => (IconName::FolderSync, 0xEDE9FE, 0x7C3AED),
+    };
+    let fg: Hsla = rgb(fg).into();
+    let bg: Hsla = if p.is_dark { fg.alpha(0.16) } else { rgb(bg).into() };
+    (icon, bg, fg)
 }
 
 pub struct AutoBackupView {
@@ -97,9 +115,9 @@ impl AutoBackupView {
             let v7 = v4.clone();
             d.title("新建备份配置").width(px(520.))
                 .child(v_flex().gap_3()
-                    .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name)))
-                    .child(h_flex().gap_2().items_center().child("本地目录").child(Input::new(&local)))
-                    .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&remote)))
+                    .child(h_flex().gap_2().items_center().child("名称").child(Input::new(&name).large()))
+                    .child(h_flex().gap_2().items_center().child("本地目录").child(Input::new(&local).large()))
+                    .child(h_flex().gap_2().items_center().child("网盘目录").child(Input::new(&remote).large()))
                     .child(h_flex().gap_2().items_center().child("方向").child(
                         RadioGroup::new("ab-dir").children(DIR_LABELS).selected_index(Some(dir))
                             .on_change(move |i, _, cx| { v5.update(cx, |this, cx| { this.direction = *i; cx.notify(); }); })))
@@ -179,47 +197,168 @@ impl AutoBackupView {
         let detail = cx.new(|cx| BackupDetail::new(config_id.clone(), cx));
         window.open_dialog(cx, move |d: Dialog, _, _| d.title("备份任务详情").width(px(680.)).child(detail.clone()));
     }
+
+    fn render_row(&self, c: &BackupConfig, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let id = c.id.clone();
+        let dir = dir_label(&serde_json::to_value(&c.direction).unwrap_or_default());
+        let dir_key = serde_json::to_value(&c.direction).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default();
+        let enabled = c.enabled;
+        let encrypt = c.encrypt_enabled;
+
+        let (icon, bg, fg) = direction_visual(&dir_key, p);
+        let tile = div()
+            .size(px(44.))
+            .rounded(px(12.))
+            .bg(bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .child(Icon::new(icon).size(px(20.)).text_color(fg))
+            .into_any_element();
+
+        let mut title = h_flex().gap(px(8.)).items_center().min_w_0().overflow_hidden();
+        title = title.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(c.name.clone()),
+        );
+        title = title.child(soft_pill(dir, p.selected_bg, p.muted));
+        title = title.child(if enabled {
+            soft_pill(
+                "已启用",
+                if p.is_dark { p.primary.alpha(0.16) } else { rgb(0xD1FAE5).into() },
+                if p.is_dark { rgb(0x34D399).into() } else { rgb(0x059669).into() },
+            )
+        } else {
+            soft_pill("已停用", p.selected_bg, p.muted)
+        });
+        if encrypt {
+            title = title.child(div().text_size(px(11.)).child("🔒"));
+        }
+
+        let mut mid = v_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden().child(title);
+
+        let mut meta = h_flex()
+            .gap(px(6.))
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .text_size(px(12.))
+            .text_color(p.faint);
+        meta = meta.child(div().truncate().child(c.local_path.display().to_string()));
+        meta = meta.child(div().text_color(p.faint.alpha(0.8)).child("→"));
+        meta = meta.child(div().truncate().child(c.remote_path.clone()));
+        mid = mid.child(meta);
+
+        let mut actions = h_flex().gap(px(2.)).items_center().flex_shrink_0();
+        let call = |key: &str| gpui_kit::SharedString::from(format!("{key}:{id}"));
+        let id_trigger = id.clone();
+        actions = actions.child(circle_button(p, call("ab-trigger"), IconName::Play, move |this, _, cx| {
+            this.trigger(&id_trigger, cx)
+        }, cx));
+        let id_toggle = id.clone();
+        actions = actions.child(circle_button(p, call("ab-toggle"), if enabled { IconName::CirclePause } else { IconName::CirclePlay }, move |this, _, cx| {
+            this.toggle_enabled(&id_toggle, enabled, cx)
+        }, cx));
+        let id_detail = id.clone();
+        actions = actions.child(circle_button(p, call("ab-detail"), IconName::ListTree, move |this, window, cx| {
+            this.open_detail(&id_detail, window, cx)
+        }, cx));
+        let id_del = id.clone();
+        actions = actions.child(circle_button(p, call("ab-del"), IconName::Trash, move |this, _, cx| {
+            this.delete(&id_del, cx)
+        }, cx));
+
+        task_card(p, tile, mid.into_any_element(), actions.into_any_element())
+    }
 }
 
 impl Render for AutoBackupView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
-            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个备份配置", self.configs.len())))
-            .child(Button::new("ab-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_create(window, cx))))
-            .child(Button::new("ab-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
+        let p = design::palette(cx);
+        let enabled_count = self.configs.iter().filter(|c| c.enabled).count();
 
-        let mut list = v_flex().gap_2().p_4().overflow_y_scrollbar();
-        if self.configs.is_empty() {
-            list = list.child(div().py_8().text_center().text_color(theme.muted_foreground).child("暂无备份配置"));
-        }
-        for c in &self.configs {
-            let id = c.id.clone();
-            let dir = dir_label(&serde_json::to_value(&c.direction).unwrap_or_default());
-            let enabled = c.enabled;
-            let encrypt = c.encrypt_enabled;
-            let paths = format!("{} → {}", c.local_path.display(), c.remote_path);
-            let id_trigger = id.clone();
-            let id_toggle = id.clone();
-            let id_detail = id.clone();
-            let id_del = id.clone();
-            list = list.child(
-                v_flex().gap_2().p_3().bg(theme.secondary).rounded_lg()
-                    .child(h_flex().gap_2().items_center()
-                        .child(Icon::new(IconName::RefreshCw).size(px(18.)).text_color(theme.primary))
-                        .child(div().flex_1().child(c.name.clone()))
-                        .child(Tag::new().small().child(dir))
-                        .child(Tag::new().small().child(if enabled { "已启用" } else { "已停用" }))
-                        .when(encrypt, |this| this.child(Tag::new().small().child("🔒"))))
-                    .child(div().text_color(theme.muted_foreground).truncate().child(paths))
-                    .child(h_flex().gap_2()
-                        .child(Button::new(format!("ab-trigger-{id}")).small().label("手动备份").on_click(cx.listener(move |this, _, _, cx| this.trigger(&id_trigger, cx))))
-                        .child(Button::new(format!("ab-toggle-{id}")).small().label(if enabled { "停用" } else { "启用" }).on_click(cx.listener(move |this, _, _, cx| this.toggle_enabled(&id_toggle, enabled, cx))))
-                        .child(Button::new(format!("ab-detail-{id}")).small().label("详情").on_click(cx.listener(move |this, _, window, cx| this.open_detail(&id_detail, window, cx))))
-                        .child(Button::new(format!("ab-del-{id}")).danger().small().label("删除").on_click(cx.listener(move |this, _, _, cx| this.delete(&id_del, cx))))),
-            );
-        }
-        v_flex().flex_1().overflow_hidden().child(toolbar).child(div().flex_1().child(list))
+        let status_pill = if enabled_count > 0 {
+            soft_pill(format!("{enabled_count} 个已启用"), p.primary_soft, p.primary)
+        } else if !self.configs.is_empty() {
+            soft_pill(format!("{} 个配置", self.configs.len()), p.primary_soft, p.primary)
+        } else {
+            Tag::new().small().rounded_full().child("暂无配置")
+        };
+
+        let header = h_flex()
+            .h(px(68.))
+            .px(px(32.))
+            .gap(px(12.))
+            .items_center()
+            .flex_shrink_0()
+            .child(div().text_size(px(18.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child("自动备份"))
+            .child(status_pill)
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(
+                        Button::new("ab-new")
+                            .primary()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("新建")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_create(window, cx))),
+                    )
+                    .child(
+                        Button::new("ab-refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RefreshCw)
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
+            )
+            .into_any_element();
+
+        let body: AnyElement = if self.configs.is_empty() {
+            empty_state(
+                &p,
+                IconName::RefreshCw,
+                "暂无备份配置",
+                "为本地目录与网盘目录建立自动备份关系",
+                Some(
+                    Button::new("ab-empty-new")
+                        .small()
+                        .icon(IconName::Plus)
+                        .label("新建配置")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_create(window, cx)))
+                        .into_any_element(),
+                ),
+            )
+        } else {
+            let mut list = v_flex()
+                .id("ab-scroll")
+                .flex_1()
+                .min_h_0()
+                .gap(px(10.))
+                .px(px(32.))
+                .py(px(16.))
+                .overflow_y_scrollbar();
+            for c in &self.configs {
+                list = list.child(self.render_row(c, &p, cx));
+            }
+            list.into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 }
 
@@ -281,15 +420,15 @@ impl BackupDetail {
         cx.spawn(async move |this, cx| {
             let (a, t, f) = (api.clone(), tid.clone(), fid.clone());
             let _ = api::call_api(&rt, move || async move { a.retry_file_task(&t, &f).await }).await;
-            let _ = this.update(cx, |this, cx| { this.load_files(tid, cx); });
+            let _ = this.update(cx, |this, cx| { this.load_files(tid.clone(), cx); });
         }).detach();
     }
 }
 
 impl Render for BackupDetail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let mut tasks_sel = h_flex().gap_1().overflow_x_scrollbar();
+        let p = design::palette(cx);
+        let mut tasks_sel = h_flex().gap(px(6.)).overflow_x_scrollbar();
         for t in &self.tasks {
             let tid = t.id.clone();
             let selected = self.selected_task.as_deref() == Some(t.id.as_str());
@@ -303,22 +442,29 @@ impl Render for BackupDetail {
         }
         let mut files = v_flex().max_h(px(360.)).overflow_y_scrollbar();
         if self.file_tasks.is_empty() {
-            files = files.child(div().py_4().text_center().text_color(theme.muted_foreground).child("暂无文件任务"));
+            files = files.child(div().py_4().text_center().text_color(p.muted).child("暂无文件任务"));
         }
         for f in &self.file_tasks {
             let fid = f.id.clone();
             let status = status_str(&serde_json::to_value(&f.status).unwrap_or_default());
             let name = crate::api::file::basename(&f.remote_path);
             let failed = status == "failed";
+            let failed_retry = failed;
             files = files.child(
-                h_flex().gap_2().items_center().px_2().py_1().border_b_1().border_color(theme.border)
+                h_flex().gap(px(8.)).items_center().px(px(10.)).py(px(8.))
+                    .border_b_1().border_color(p.border)
                     .child(div().flex_1().truncate().child(name))
-                    .child(Tag::new().small().child(status))
-                    .child(div().text_color(theme.muted_foreground).child(util::format_size(f.file_size)))
-                    .when(failed, |this| this.child(Button::new(format!("bd-retry-{}", f.id)).ghost().small().icon(IconName::RotateCw)
-                        .on_click(cx.listener(move |this, _, _, cx| this.retry(&fid, cx))))),
+                    .child(status_tag(&status, &p))
+                    .child(div().text_size(px(12.)).text_color(p.faint).child(util::format_size(f.file_size)))
+                    .when(failed_retry, |this| this.child(circle_button(
+                        &p,
+                        gpui_kit::SharedString::from(format!("bd-retry-{}", f.id)),
+                        IconName::RotateCw,
+                        move |this, _, cx| this.retry(&fid, cx),
+                        cx,
+                    ))),
             );
         }
-        v_flex().gap_3().child(tasks_sel).child(files)
+        v_flex().gap(px(12.)).child(tasks_sel).child(files)
     }
 }

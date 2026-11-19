@@ -272,7 +272,7 @@ async fn handle_client_message(state: &AppState, connection_id: &str, text: &str
 }
 
 /// 获取当前任务状态快照
-async fn get_snapshot(state: &AppState) -> WsServerMessage {
+pub(crate) async fn get_snapshot(state: &AppState) -> WsServerMessage {
     // 获取下载任务
     let downloads: Vec<serde_json::Value> = match state.download_manager_for_active().await {
         Some(dm) => dm
