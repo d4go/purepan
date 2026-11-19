@@ -1,44 +1,31 @@
-//! 下载管理页(移植 DownloadsView.vue):文件夹聚合行 + 单文件行,实时进度,
-//! 暂停/恢复/重试/删除(三向)/文件夹详情,批量操作。数据来自 TaskCache(WS 驱动)。
+//! 下载管理页:总览头部(活跃数 / 实时总速度) + 三段式任务卡片(类型图标、进度、
+//! 元信息、操作),文件夹聚合行 + 单文件行,实时进度来自 TaskCache(WS 驱动)。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Context, Entity, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
+    AnyElement, AnyWindowHandle, AppContext as _, BorrowAppContext as _, Context, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
+    Window, div, px, rgb,
 };
 use serde_json::Value;
 
 use crate::api::{self, download::BatchOperationRequest};
 use crate::bridge::{EventHub, ToastKind, UiEvent};
+use crate::components::app_sidebar::Nav;
+use crate::components::task_ui::{
+    circle_button, progress_bar, sep_dot, soft_pill, status_label, status_tag, task_card,
+};
 use crate::components::toast;
+use crate::design::{self, Palette};
+use crate::state::task_cache::{v_bool, v_f64, v_str, v_u64};
 use crate::state::{Backend, TaskCache};
 use crate::util;
-use crate::state::task_cache::{v_bool, v_f64, v_str, v_u64};
-
-pub fn status_label(status: &str) -> &'static str {
-    match status {
-        "pending" => "等待中",
-        "downloading" => "下载中",
-        "uploading" => "上传中",
-        "checking_rapid" => "秒传检查",
-        "scanning" => "扫描中",
-        "decrypting" => "解密中",
-        "encrypting" => "加密中",
-        "paused" => "已暂停",
-        "completed" => "已完成",
-        "rapid_upload_success" => "秒传成功",
-        "failed" => "失败",
-        "cancelled" => "已取消",
-        _ => "未知",
-    }
-}
 
 fn is_active(status: &str) -> bool {
     matches!(status, "pending" | "downloading" | "uploading" | "decrypting" | "encrypting" | "scanning" | "checking_rapid")
@@ -69,7 +56,7 @@ impl DownloadsView {
         let _ = wh.update(cx, |_, w, cx| toast::show(w, cx, kind, msg.clone()));
     }
 
-    fn rows(&self, cx: &App) -> (Vec<Value>, Vec<Value>) {
+    fn rows(&self, cx: &Context<Self>) -> (Vec<Value>, Vec<Value>) {
         let cache = cx.global::<TaskCache>();
         let mut folders: Vec<Value> = cache.folders.values().cloned().collect();
         folders.sort_by(|a, b| v_u64(b, "created_at").cmp(&v_u64(a, "created_at")));
@@ -207,104 +194,348 @@ impl DownloadsView {
         window.open_dialog(cx, move |d: Dialog, _, _| d.title(title.clone()).width(px(640.)).child(detail.clone()));
     }
 
-    fn render_row(&self, task: &Value, is_folder: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+    /// 打开下载文件所在目录(不是文件本身),失败时给出提示而非静默。
+    fn open_in_folder(&mut self, local_path: &str, cx: &mut Context<Self>) {
+        let path = std::path::PathBuf::from(local_path);
+        let dir = if path.is_dir() {
+            path
+        } else {
+            match path.parent() {
+                Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+                _ => {
+                    self.toast(cx, ToastKind::Warning, "无法确定文件所在目录");
+                    return;
+                }
+            }
+        };
+        if !dir.exists() {
+            self.toast(cx, ToastKind::Error, format!("目录不存在: {}", dir.display()));
+            return;
+        }
+        if let Err(e) = open::that(&dir) {
+            self.toast(cx, ToastKind::Error, format!("打开文件夹失败: {e}"));
+        }
+    }
+
+    fn render_row(&self, task: &Value, is_folder: bool, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
         let id = v_str(task, "id");
         let status = v_str(task, "status");
         let name = if is_folder { v_str(task, "name") } else { crate::api::file::basename(&v_str(task, "remote_path")) };
         let total = v_u64(task, "total_size");
         let done = v_u64(task, "downloaded_size");
-        let speed = v_u64(task, "speed");
-        let progress = if total > 0 { (done as f64 / total as f64 * 100.0) as f32 } else { 0.0 };
+        let speed = if is_folder {
+            // 文件夹自身没有速度字段,汇总子任务速度
+            cx.global::<TaskCache>().downloads.values()
+                .filter(|v| v_str(v, "group_id") == id)
+                .map(|v| v_u64(v, "speed"))
+                .sum()
+        } else {
+            v_u64(task, "speed")
+        };
         let error = v_str(task, "error");
+        let local_path = if is_folder { v_str(task, "local_root") } else { v_str(task, "local_path") };
         let active = is_active(&status);
-        let terminal = matches!(status.as_str(), "completed" | "failed" | "cancelled");
+        let paused = status == "paused";
+        let completed = status == "completed";
+        let failed = status == "failed";
         let decrypting = status == "decrypting";
-        let decrypt_progress = v_f64(task, "decrypt_progress");
+        let pct = if total > 0 { (done as f64 / total as f64) as f32 } else { 0.0 };
+        let bar_pct = if decrypting {
+            (v_f64(task, "decrypt_progress") as f32).clamp(0.0, 1.0)
+        } else {
+            pct
+        };
 
-        let id_pause = id.clone();
-        let status_pause = status.clone();
-        let id_del = id.clone();
-        let id_open = id.clone();
-        let local_path = v_str(task, "local_path");
+        // ── 左:文件类型图标 ──
+        let tile: AnyElement = if is_folder {
+            div()
+                .size(px(44.))
+                .rounded(px(12.))
+                .bg(p.folder_tile(false))
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .child(Icon::new(IconName::Folder).size(px(22.)).text_color(rgb(0xFFFFFF).alpha(0.92)))
+                .into_any_element()
+        } else {
+            let (icon, bg, fg) = design::file_visual(&name, p.is_dark);
+            div()
+                .size(px(44.))
+                .rounded(px(12.))
+                .bg(bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .flex_shrink_0()
+                .child(Icon::new(icon).size(px(20.)).text_color(fg))
+                .into_any_element()
+        };
 
-        let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
-        // 第一行:图标 + 名称 + 状态 + 操作
-        let mut top = h_flex().gap_2().items_center();
-        top = top.child(Icon::new(if is_folder { IconName::Folder } else { IconName::FileText }).size(px(18.)).text_color(theme.primary));
-        top = top.child(div().flex_1().truncate().child(name));
-        top = top.child(Tag::new().small().child(status_label(&status)));
-        if v_bool(task, "is_encrypted") { top = top.child(Tag::new().small().child("🔒")); }
-        if !terminal {
-            top = top.child(Button::new(format!("dl-pr-{id}")).ghost().small()
-                .icon(if active { IconName::Pause } else { IconName::Play })
-                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_pause, &status_pause, is_folder, cx))));
-        } else if status == "failed" {
+        // ── 中:名称 / 进度条 / 元信息 ──
+        let mut title = h_flex().gap(px(8.)).items_center().min_w_0().overflow_hidden();
+        title = title.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(name),
+        );
+        if v_bool(task, "is_encrypted") {
+            title = title.child(div().text_size(px(11.)).child("🔒"));
+        }
+        title = title.child(status_tag(&status, p));
+
+        let mut mid = v_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden().child(title);
+
+        if !completed {
+            let fill = if active { p.primary } else { p.faint.alpha(0.5) };
+            let track = p.faint.alpha(0.18);
+            mid = mid.child(progress_bar(bar_pct, fill, track));
+        }
+
+        let mut meta = h_flex()
+            .gap(px(6.))
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .text_size(px(12.))
+            .text_color(p.faint);
+        if completed {
+            meta = meta.child(format!("共 {}", util::format_size(total)));
+        } else {
+            if is_folder {
+                meta = meta.child(format!(
+                    "{}/{} 文件",
+                    v_u64(task, "completed_count"),
+                    v_u64(task, "total_files"),
+                ));
+                meta = meta.child(sep_dot(p));
+            }
+            meta = meta.child(format!("{} / {}", util::format_size(done), util::format_size(total)));
+            if active && speed > 0 {
+                meta = meta.child(sep_dot(p));
+                meta = meta.child(
+                    div()
+                        .text_color(p.primary)
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(format!("↓ {}", util::format_speed(speed))),
+                );
+                let remaining = total.saturating_sub(done) / speed.max(1);
+                meta = meta.child(sep_dot(p));
+                meta = meta.child(format!("剩余 {}", util::format_eta(Some(remaining))));
+            }
+        }
+        if failed && !error.is_empty() {
+            meta = meta.child(sep_dot(p));
+            meta = meta.child(div().truncate().text_color(p.danger).child(error));
+        }
+        mid = mid.child(meta);
+
+        // ── 右:操作区 ──
+        let mut actions = h_flex().gap(px(2.)).items_center().flex_shrink_0();
+        let can_open = !local_path.is_empty();
+        let call = |key: &str| gpui_kit::SharedString::from(format!("{key}:{id}"));
+
+        if active || paused {
+            let icon = if paused { IconName::Play } else { IconName::Pause };
+            let id_p = id.clone();
+            let status_p = status.clone();
+            actions = actions.child(circle_button(p, call("dl-pr"), icon, move |this, _, cx| {
+                this.pause_resume(&id_p, &status_p, is_folder, cx)
+            }, cx));
+        } else if failed {
             let id_r = id.clone();
-            top = top.child(Button::new(format!("dl-retry-{id}")).ghost().small().icon(IconName::RotateCw)
-                .on_click(cx.listener(move |this, _, _, cx| this.pause_resume(&id_r, "paused", is_folder, cx))));
+            actions = actions.child(circle_button(p, call("dl-retry"), IconName::RotateCw, move |this, _, cx| {
+                this.pause_resume(&id_r, "paused", is_folder, cx)
+            }, cx));
         }
-        if !is_folder && !local_path.is_empty() {
-            top = top.child(Button::new(format!("dl-open-{id_open}")).ghost().small().icon(IconName::FolderOpen)
-                .on_click(cx.listener(move |_, _, _, _| { let _ = open::that(&local_path); })));
-        }
+
         if is_folder {
             let id_detail = id.clone();
-            top = top.child(Button::new(format!("dl-detail-{id}")).ghost().small().icon(IconName::ListTree)
-                .on_click(cx.listener(move |this, _, window, cx| this.open_folder_detail(&id_detail, window, cx))));
+            actions = actions.child(circle_button(p, call("dl-detail"), IconName::ListTree, move |this, window, cx| {
+                this.open_folder_detail(&id_detail, window, cx)
+            }, cx));
         }
-        top = top.child(Button::new(format!("dl-del-{id_del}")).ghost().small().icon(IconName::Trash)
-            .on_click(cx.listener(move |this, _, window, cx| this.open_delete(&id_del, is_folder, window, cx))));
-        row = row.child(top);
-        // 远程路径
-        row = row.child(div().text_color(theme.muted_foreground).truncate().child(v_str(task, "remote_path")));
-        // 进度
-        row = row.child(Progress::new(format!("dl-prog-{id}")).value(progress));
-        // 统计
-        let stats = if is_folder {
-            format!("{}/{} 文件 · {} / {} · {}", v_u64(task, "completed_count"), v_u64(task, "total_files"), util::format_size(done), util::format_size(total), util::format_speed(speed))
-        } else {
-            format!("{} / {} · {}", util::format_size(done), util::format_size(total), util::format_speed(speed))
-        };
-        row = row.child(div().text_color(theme.muted_foreground).child(stats));
-        if decrypting {
-            row = row.child(Progress::new(format!("dl-dec-{id}")).value((decrypt_progress * 100.0) as f32));
+
+        if can_open && completed {
+            // 已完成:把「打开文件夹」提权为带文字的次级按钮
+            let open_path = local_path.clone();
+            actions = actions.child(
+                Button::new(call("dl-open-folder"))
+                    .secondary()
+                    .small()
+                    .icon(IconName::FolderOpen)
+                    .label("打开文件夹")
+                    .on_click(cx.listener(move |this, _, _, cx| this.open_in_folder(&open_path, cx))),
+            );
+        } else if can_open {
+            let open_path = local_path.clone();
+            actions = actions.child(circle_button(p, call("dl-open"), IconName::FolderOpen, move |this, _, cx| {
+                this.open_in_folder(&open_path, cx)
+            }, cx));
         }
-        if !error.is_empty() {
-            row = row.child(div().text_color(theme.danger).child(error));
-        }
-        row
+
+        let id_del = id.clone();
+        actions = actions.child(circle_button(p, call("dl-del"), IconName::Trash, move |this, window, cx| {
+            this.open_delete(&id_del, is_folder, window, cx)
+        }, cx));
+
+        task_card(p, tile, mid.into_any_element(), actions.into_any_element())
     }
 }
 
 impl Render for DownloadsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        let p = design::palette(cx);
         let (folders, files) = self.rows(cx);
-        let active_count = folders.iter().chain(files.iter()).filter(|t| is_active(&v_str(t, "status"))).count();
 
-        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
-            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{active_count} 个活跃任务")))
-            .child(Button::new("dl-pause-all").small().label("全部暂停").on_click(cx.listener(|this, _, _, cx| this.batch_op("pause", cx))))
-            .child(Button::new("dl-resume-all").small().label("全部继续").on_click(cx.listener(|this, _, _, cx| this.batch_op("resume", cx))))
-            .child(Button::new("dl-clear-done").small().label("清除已完成").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_completed", cx))))
-            .child(Button::new("dl-clear-fail").small().label("清除失败").on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_failed", cx))))
-            .child(Button::new("dl-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|_, _, _, cx| { cx.global::<Backend>().ws.request_snapshot(); })));
+        let (active_count, paused_count, completed_count, failed_count, total_speed) = {
+            let all = folders.iter().chain(files.iter());
+            let mut active = 0usize;
+            let mut paused = 0usize;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            for t in all {
+                match v_str(t, "status").as_str() {
+                    "paused" => paused += 1,
+                    "completed" => completed += 1,
+                    "failed" => failed += 1,
+                    s if is_active(s) => active += 1,
+                    _ => {}
+                }
+            }
+            let speed: u64 = cx.global::<TaskCache>().downloads.values()
+                .filter(|v| is_active(&v_str(v, "status")))
+                .map(|v| v_u64(v, "speed"))
+                .sum();
+            (active, paused, completed, failed, speed)
+        };
 
-        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
-        if folders.is_empty() && files.is_empty() {
-            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无下载任务"));
-        }
-        for f in &folders {
-            list = list.child(self.render_row(f, true, cx));
-        }
-        for f in &files {
-            list = list.child(self.render_row(f, false, cx));
-        }
+        let status_pill = if active_count > 0 {
+            soft_pill(format!("{active_count} 个活跃任务"), p.primary_soft, p.primary)
+        } else {
+            Tag::new().small().rounded_full().child("无活跃任务")
+        };
 
-        v_flex().flex_1().overflow_hidden()
-            .child(toolbar)
-            .child(div().flex_1().child(list))
+        let speed_chip = (total_speed > 0).then(|| {
+            h_flex()
+                .gap(px(4.))
+                .items_center()
+                .text_size(px(13.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .text_color(p.primary)
+                .child("↓")
+                .child(util::format_speed(total_speed))
+        });
+
+        let header = h_flex()
+            .h(px(68.))
+            .px(px(32.))
+            .gap(px(12.))
+            .items_center()
+            .flex_shrink_0()
+            .child(div().text_size(px(18.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child("下载"))
+            .child(status_pill)
+            .when_some(speed_chip, |this, chip| this.child(chip))
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(
+                        Button::new("dl-pause-all")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Pause)
+                            .label("全部暂停")
+                            .disabled(active_count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.batch_op("pause", cx))),
+                    )
+                    .child(
+                        Button::new("dl-resume-all")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Play)
+                            .label("全部继续")
+                            .disabled(paused_count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.batch_op("resume", cx))),
+                    )
+                    .child(
+                        Button::new("dl-clear-done")
+                            .ghost()
+                            .small()
+                            .icon(IconName::CircleCheck)
+                            .label("清除已完成")
+                            .disabled(completed_count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_completed", cx))),
+                    )
+                    .child(
+                        Button::new("dl-clear-fail")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Trash)
+                            .label("清除失败")
+                            .disabled(failed_count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.batch_op("clear_failed", cx))),
+                    )
+                    .child(
+                        Button::new("dl-refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RefreshCw)
+                            .on_click(cx.listener(|_, _, _, cx| {
+                                cx.global::<Backend>().ws.request_snapshot();
+                            })),
+                    ),
+            )
+            .into_any_element();
+
+        let body: AnyElement = if folders.is_empty() && files.is_empty() {
+            let hub = self.hub.clone();
+            crate::components::task_ui::empty_state(
+                &p,
+                IconName::Download,
+                "暂无下载任务",
+                "在文件页选择文件下载后,进度会实时显示在这里",
+                Some(
+                    Button::new("dl-goto-files")
+                        .small()
+                        .icon(IconName::Folder)
+                        .label("去下载文件")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            hub.update(cx, |_, cx| cx.emit(UiEvent::Navigate(Nav::Files)));
+                        }))
+                        .into_any_element(),
+                ),
+            )
+        } else {
+            let mut list = v_flex()
+                .id("dl-scroll")
+                .flex_1()
+                .min_h_0()
+                .gap(px(10.))
+                .px(px(32.))
+                .py(px(16.))
+                .overflow_y_scrollbar();
+            for f in &folders {
+                list = list.child(self.render_row(f, true, &p, cx));
+            }
+            for f in &files {
+                list = list.child(self.render_row(f, false, &p, cx));
+            }
+            list.into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 }
 
@@ -338,7 +569,7 @@ impl Drop for FolderDetail {
 
 impl Render for FolderDetail {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
+        let p = design::palette(cx);
         let cache = cx.global::<TaskCache>();
         let folder = cache.folders.get(&self.folder_id).cloned().unwrap_or(Value::Null);
         let mut children: Vec<Value> = cache.downloads.values()
@@ -355,28 +586,31 @@ impl Render for FolderDetail {
 
         let mut list = v_flex().max_h(px(400.)).overflow_y_scrollbar();
         if children.is_empty() {
-            list = list.child(div().py_4().text_center().text_color(theme.muted_foreground).child("暂无子任务"));
+            list = list.child(div().py_4().text_center().text_color(p.muted).child("暂无子任务"));
         }
         for c in &children {
             let total = v_u64(c, "total_size");
             let done = v_u64(c, "downloaded_size");
-            let pct = if total > 0 { (done as f64 / total as f64 * 100.0) as f32 } else { 0.0 };
+            let pct = if total > 0 { (done as f64 / total as f64) as f32 } else { 0.0 };
             let name = {
                 let rel = v_str(c, "relative_path");
                 if rel.is_empty() { crate::api::file::basename(&v_str(c, "remote_path")) } else { rel }
             };
             list = list.child(
-                v_flex().gap_1().px_2().py_1p5().rounded_md().bg(theme.secondary)
-                    .child(h_flex().gap_2().items_center()
-                        .child(div().flex_1().truncate().child(name))
-                        .child(Tag::new().small().child(status_label(&v_str(c, "status"))))
-                        .child(div().text_color(theme.muted_foreground).child(util::format_size(total))))
-                    .child(Progress::new(format!("fd-{}", v_str(c, "id"))).value(pct)),
+                v_flex().gap(px(6.)).px(px(12.)).py(px(8.)).rounded(px(10.)).bg(p.sidebar)
+                    .child(
+                        h_flex().gap(px(8.)).items_center()
+                            .child(div().flex_1().min_w_0().truncate().child(name))
+                            .child(status_tag(&v_str(c, "status"), &p))
+                            .child(div().text_size(px(12.)).text_color(p.faint).child(util::format_size(total))),
+                    )
+                    .child(progress_bar(pct, p.primary, p.faint.alpha(0.18))),
             );
         }
 
-        v_flex().gap_3()
-            .child(div().text_color(theme.muted_foreground).child(stats))
+        v_flex()
+            .gap(px(12.))
+            .child(div().text_size(px(12.)).text_color(p.muted).child(stats))
             .child(list)
     }
 }

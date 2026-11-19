@@ -23,6 +23,10 @@ impl AuthStore {
         self.user.is_some() || self.active_uid.is_some()
     }
 
+    pub fn signed_in_uid(&self) -> Option<u64> {
+        self.active_uid.or_else(|| self.user.as_ref().map(|user| user.uid))
+    }
+
     pub fn active_account(&self) -> Option<&AccountSummary> {
         let uid = self.active_uid?;
         self.accounts.iter().find(|a| a.uid == uid)

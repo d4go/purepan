@@ -1,30 +1,47 @@
-//! 离线下载页(移植 CloudDlView.vue):任务列表,新建(磁力/HTTP),取消/删除/详情/清空。
+//! 离线下载页:总览头部 + 三段式任务卡片(类型图标、进度、元信息、操作),
+//! 新建(磁力/HTTP)/取消/删除/清空。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputState};
-use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::{Disableable as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, Context, Entity, IntoElement, ParentElement as _,
-    Render, Styled as _, Subscription, Window, div, px,
+    AnyElement, AnyWindowHandle, AppContext as _, Context, Entity, InteractiveElement as _,
+    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
 };
 
 use crate::api::cloud_dl::{AddTaskRequest, CloudDlTaskInfo};
 use crate::api::{self};
 use crate::bridge::{EventHub, ToastKind, UiEvent};
+use crate::components::task_ui::{circle_button, empty_state, progress_bar, sep_dot, soft_pill, status_tag, task_card};
 use crate::components::toast;
+use crate::design::{self, Palette};
 use crate::state::Backend;
 use crate::util;
 
+/// 百度离线任务状态码 → 通用状态键(用于胶囊配色/文案)。
+fn status_key(code: i32) -> &'static str {
+    match code {
+        0 => "downloading",
+        1 => "pending",
+        2 => "paused",
+        3 => "completed",
+        4 => "failed",
+        5 => "cancelled",
+        _ => "unknown",
+    }
+}
+
+fn is_cancellable(code: i32) -> bool {
+    matches!(code, 0 | 1)
+}
+
 pub struct CloudDlView {
     tasks: Vec<CloudDlTaskInfo>,
-    loading: bool,
     url_input: Entity<InputState>,
     save_input: Entity<InputState>,
     auto_download: bool,
@@ -43,7 +60,7 @@ impl CloudDlView {
         let sub = cx.subscribe(&hub, |this, _, ev, cx| {
             if matches!(ev, UiEvent::WsMessage(_) | UiEvent::AccountChanged { .. }) { this.refresh(cx); }
         });
-        let mut v = Self { tasks: Vec::new(), loading: false, url_input, save_input, auto_download: false, window_handle: window.window_handle(), _subscriptions: vec![sub] };
+        let mut v = Self { tasks: Vec::new(), url_input, save_input, auto_download: false, window_handle: window.window_handle(), _subscriptions: vec![sub] };
         v.refresh(cx);
         v
     }
@@ -77,8 +94,8 @@ impl CloudDlView {
             let v4 = v2.clone();
             d.title("新建离线下载").width(px(500.))
                 .child(v_flex().gap_3()
-                    .child(h_flex().gap_2().items_center().child("链接").child(Input::new(&url)))
-                    .child(h_flex().gap_2().items_center().child("保存路径").child(Input::new(&save)))
+                    .child(h_flex().gap_2().items_center().child("链接").child(Input::new(&url).large()))
+                    .child(h_flex().gap_2().items_center().child("保存路径").child(Input::new(&save).large()))
                     .child(Switch::new("cd-auto").label("完成后自动下载到本地").checked(auto_dl)
                         .on_change(move |c, _, cx| { v4.update(cx, |this, cx| { this.auto_download = *c; cx.notify(); }); })))
                 .footer(h_flex().gap_2().justify_end()
@@ -146,50 +163,179 @@ impl CloudDlView {
             let _ = this.update(cx, |this, cx| { if let Err(e) = r { this.toast(cx, ToastKind::Error, e.message()); } else { this.refresh(cx); } });
         }).detach();
     }
+
+    fn render_row(&self, t: &CloudDlTaskInfo, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let id = t.task_id as u64;
+        let key = status_key(t.status);
+        let total = t.file_size.max(0) as u64;
+        let done = t.finished_size.max(0) as u64;
+        let pct = if total > 0 { (done as f64 / total as f64) as f32 } else { 0.0 };
+        let completed = t.status == 3;
+
+        let (icon, bg, fg) = design::file_visual(&t.task_name, p.is_dark);
+        let tile = div()
+            .size(px(44.))
+            .rounded(px(12.))
+            .bg(bg)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .child(Icon::new(icon).size(px(20.)).text_color(fg))
+            .into_any_element();
+
+        let mut title = h_flex().gap(px(8.)).items_center().min_w_0().overflow_hidden();
+        title = title.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(t.task_name.clone()),
+        );
+        title = title.child(status_tag(key, p));
+        if t.file_list.len() > 1 {
+            title = title.child(soft_pill(format!("{} 个文件", t.file_list.len()), p.selected_bg, p.muted));
+        }
+
+        let mut mid = v_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden().child(title);
+
+        if !completed {
+            let fill = if is_cancellable(t.status) { p.primary } else { p.faint.alpha(0.5) };
+            mid = mid.child(progress_bar(pct, fill, p.faint.alpha(0.18)));
+        }
+
+        let mut meta = h_flex()
+            .gap(px(6.))
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .text_size(px(12.))
+            .text_color(p.faint);
+        if completed {
+            meta = meta.child(format!("共 {}", util::format_size(total)));
+        } else {
+            meta = meta.child(format!("{} / {}", util::format_size(done), util::format_size(total)));
+        }
+        if !t.save_path.is_empty() {
+            meta = meta.child(sep_dot(p));
+            meta = meta.child(div().truncate().child(format!("保存至 {}", t.save_path)));
+        }
+        mid = mid.child(meta);
+
+        let mut actions = h_flex().gap(px(2.)).items_center().flex_shrink_0();
+        if is_cancellable(t.status) {
+            actions = actions.child(circle_button(
+                p,
+                gpui_kit::SharedString::from(format!("cd-cancel:{id}")),
+                IconName::CircleStop,
+                move |this, _, cx| this.cancel(id, cx),
+                cx,
+            ));
+        }
+        actions = actions.child(circle_button(
+            p,
+            gpui_kit::SharedString::from(format!("cd-del:{id}")),
+            IconName::Trash,
+            move |this, _, cx| this.delete(id, cx),
+            cx,
+        ));
+
+        task_card(p, tile, mid.into_any_element(), actions.into_any_element())
+    }
 }
 
 impl Render for CloudDlView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
-            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个离线任务", self.tasks.len())))
-            .child(Button::new("cd-new").primary().small().icon(IconName::Plus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_add(window, cx))))
-            .child(Button::new("cd-clear").small().label("清空").on_click(cx.listener(|this, _, _, cx| this.clear(cx))))
-            .child(Button::new("cd-refresh").small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
+        let p = design::palette(cx);
+        let count = self.tasks.len();
+        let active_count = self.tasks.iter().filter(|t| is_cancellable(t.status)).count();
 
-        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
-        if self.tasks.is_empty() {
-            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child("暂无离线任务"));
-        }
-        for t in &self.tasks {
-            let id = t.task_id as u64;
-            let pct = if t.file_size > 0 { (t.finished_size as f64 / t.file_size as f64 * 100.0) as f32 } else { 0.0 };
-            let status_text = t.status_text.clone();
-            let name = t.task_name.clone();
-            let save_path = t.save_path.clone();
-            let size = t.file_size as u64;
-            let finished = t.finished_size as u64;
-            // status 0/1 进行中可取消;其余可删除
-            let cancellable = t.status == 0 || t.status == 1;
-            let id_cancel = id;
-            let id_del = id;
-            let mut row = v_flex().gap_1p5().px_3().py_2().rounded_lg().bg(theme.secondary);
-            let mut top = h_flex().gap_2().items_center();
-            top = top.child(Icon::new(IconName::CloudDownload).size(px(18.)).text_color(theme.primary));
-            top = top.child(div().flex_1().truncate().child(name));
-            top = top.child(Tag::new().small().child(status_text));
-            if cancellable {
-                top = top.child(Button::new(format!("cd-cancel-{id}")).ghost().small().icon(IconName::CircleStop)
-                    .on_click(cx.listener(move |this, _, _, cx| this.cancel(id_cancel, cx))));
+        let status_pill = if active_count > 0 {
+            soft_pill(format!("{active_count} 个进行中"), p.primary_soft, p.primary)
+        } else if count > 0 {
+            soft_pill(format!("{count} 个任务"), p.primary_soft, p.primary)
+        } else {
+            Tag::new().small().rounded_full().child("暂无任务")
+        };
+
+        let header = h_flex()
+            .h(px(68.))
+            .px(px(32.))
+            .gap(px(12.))
+            .items_center()
+            .flex_shrink_0()
+            .child(div().text_size(px(18.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child("离线下载"))
+            .child(status_pill)
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(
+                        Button::new("cd-new")
+                            .primary()
+                            .small()
+                            .icon(IconName::Plus)
+                            .label("新建")
+                            .on_click(cx.listener(|this, _, window, cx| this.open_add(window, cx))),
+                    )
+                    .child(
+                        Button::new("cd-clear")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Eraser)
+                            .label("清空")
+                            .disabled(count == 0)
+                            .on_click(cx.listener(|this, _, _, cx| this.clear(cx))),
+                    )
+                    .child(
+                        Button::new("cd-refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RefreshCw)
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
+            )
+            .into_any_element();
+
+        let body: AnyElement = if self.tasks.is_empty() {
+            empty_state(
+                &p,
+                IconName::CloudDownload,
+                "暂无离线任务",
+                "粘贴磁力或 HTTP 链接,让网盘替你下载",
+                Some(
+                    Button::new("cd-empty-new")
+                        .small()
+                        .icon(IconName::Plus)
+                        .label("新建任务")
+                        .on_click(cx.listener(|this, _, window, cx| this.open_add(window, cx)))
+                        .into_any_element(),
+                ),
+            )
+        } else {
+            let mut list = v_flex()
+                .id("cd-scroll")
+                .flex_1()
+                .min_h_0()
+                .gap(px(10.))
+                .px(px(32.))
+                .py(px(16.))
+                .overflow_y_scrollbar();
+            for t in &self.tasks {
+                list = list.child(self.render_row(t, &p, cx));
             }
-            top = top.child(Button::new(format!("cd-del-{id}")).ghost().small().icon(IconName::Trash)
-                .on_click(cx.listener(move |this, _, _, cx| this.delete(id_del, cx))));
-            row = row.child(top);
-            row = row.child(div().text_color(theme.muted_foreground).truncate().child(format!("保存至: {save_path}")));
-            row = row.child(Progress::new(format!("cd-prog-{id}")).value(pct));
-            row = row.child(div().text_color(theme.muted_foreground).child(format!("{} / {}", util::format_size(finished), util::format_size(size))));
-            list = list.child(row);
-        }
-        v_flex().flex_1().overflow_hidden().child(toolbar).child(div().flex_1().child(list))
+            list.into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 }

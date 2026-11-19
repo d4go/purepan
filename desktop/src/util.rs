@@ -17,24 +17,42 @@ pub fn app_icon() -> Arc<image::RgbaImage> {
     .clone()
 }
 
-/// 应用 logo(GPUI 可渲染),用于标题栏。
+/// 应用 Logo(GPUI 可渲染),用于侧栏品牌区。
 pub fn app_logo() -> Arc<RenderImage> {
     static LOGO: OnceLock<Arc<RenderImage>> = OnceLock::new();
     LOGO.get_or_init(|| {
         let img = image::load_from_memory(include_bytes!("../assets/icons/icon.png"))
             .expect("内置应用图标损坏")
             .to_rgba8();
-        Arc::new(RenderImage::new(vec![image::Frame::new(img)]))
+        into_render_image(img)
     })
     .clone()
 }
 
-/// 把后端返回的 `data:image/png;base64,...` 解码为 GPUI 可渲染的图像。
-pub fn decode_data_uri_image(data_uri: &str) -> Option<Arc<RenderImage>> {
+/// GPUI 的 RenderImage 使用 BGRA 字节序;RGBA 直接塞入会导致红蓝互换(蓝色显示成黄色)。
+fn into_render_image(mut img: image::RgbaImage) -> Arc<RenderImage> {
+    for pixel in img.pixels_mut() {
+        pixel.0.swap(0, 2);
+    }
+    Arc::new(RenderImage::new(vec![image::Frame::new(img)]))
+}
+
+/// 网络图片字节(PNG/JPEG) → GPUI 可渲染图。
+pub fn decode_image_bytes(bytes: &[u8]) -> Option<Arc<RenderImage>> {
+    let img = image::load_from_memory(bytes).ok()?.to_rgba8();
+    Some(into_render_image(img))
+}
+
+/// 同时解码原图与模糊图(扫码成功蒙层用)。
+pub fn decode_data_uri_image_blurred(
+    data_uri: &str,
+    sigma: f32,
+) -> Option<(Arc<RenderImage>, Arc<RenderImage>)> {
     let b64 = data_uri.split_once("base64,")?.1;
     let bytes = base64::engine::general_purpose::STANDARD.decode(b64).ok()?;
     let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(img)])))
+    let blurred = image::imageops::blur(&img, sigma);
+    Some((into_render_image(img), into_render_image(blurred)))
 }
 
 /// 从任意文本中提取百度网盘分享链接与提取码。
@@ -156,6 +174,33 @@ pub fn format_timestamp(ts: i64) -> String {
         .unwrap_or_else(|| "-".into())
 }
 
+/// Unix 秒 → 相对时间(刚刚 / N分钟前 / 昨天 / N天前 / 日期)。
+pub fn format_relative_time(ts: i64) -> String {
+    if ts == 0 {
+        return "-".into();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let diff = now - ts;
+    if diff < 0 {
+        return "刚刚".into();
+    }
+    if diff < 60 {
+        "刚刚".into()
+    } else if diff < 3600 {
+        format!("{}分钟前", diff / 60)
+    } else if diff < 86400 {
+        format!("{}小时前", diff / 3600)
+    } else if diff < 172800 {
+        "昨天".into()
+    } else if diff < 86400 * 30 {
+        format!("{}天前", diff / 86400)
+    } else {
+        chrono::DateTime::from_timestamp(ts, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y/%m/%d").to_string())
+            .unwrap_or_else(|| "-".into())
+    }
+}
+
 /// 扩展名 → 中文类型(移植 FilesView.getFileType)。
 pub fn file_type(filename: &str) -> &'static str {
     let ext = filename.rsplit('.').next().unwrap_or("").to_lowercase();
@@ -167,7 +212,8 @@ pub fn file_type(filename: &str) -> &'static str {
         "doc" | "docx" => "文档",
         "txt" | "md" => "文本",
         "zip" | "rar" | "7z" | "tar" | "gz" => "压缩",
-        "exe" | "msi" | "app" => "程序",
+        "exe" | "msi" | "app" | "apk" | "dmg" | "deb" | "rpm" | "pkg" | "ipa" | "appx"
+        | "msix" => "程序",
         "js" | "ts" | "py" | "java" | "cpp" => "代码",
         _ => "文件",
     }

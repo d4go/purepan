@@ -7,12 +7,13 @@ use std::time::Duration;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme as _, Disableable as _, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::{
-    App, AppContext as _, BorrowAppContext as _, Context, Entity, InteractiveElement as _,
-    IntoElement, ParentElement as _, Render, RenderImage, SharedString, StatefulInteractiveElement as _,
-    Styled as _, Subscription, Task, Window, div, img, px,
+    AnyElement, App, AppContext as _, BorrowAppContext as _, Context, Entity,
+    FontWeight, InteractiveElement as _, IntoElement, ParentElement as _, Render, RenderImage,
+    Styled as _, Subscription, Task, Window, div, img, linear_color_stop, linear_gradient, px,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use purepan_backend::QRCodeStatus;
@@ -37,14 +38,19 @@ pub struct LoginView {
 
     qrcode: Option<purepan_backend::QRCode>,
     qr_image: Option<Arc<RenderImage>>,
+    qr_blur: Option<Arc<RenderImage>>,
     qr_loading: bool,
     qr_error: Option<String>,
     is_scanned: bool,
+    login_success: bool,
+    canceled: bool,
+    cancel_seconds: u32,
     is_expired: bool,
     countdown: u32,
     qr_generation: u64,
     poll_task: Option<Task<()>>,
     countdown_task: Option<Task<()>>,
+    cancel_task: Option<Task<()>>,
 
     cookie_input: Entity<TextareaState>,
     cookie_loading: bool,
@@ -64,7 +70,7 @@ impl LoginView {
         let cookie_input = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .rows(4)
-                .placeholder("粘贴完整 Cookie,例如:BDUSS=xxxx; PTOKEN=yyyy; STOKEN=zzzz")
+                .placeholder("粘贴完整的 Cookie 请求头值")
         });
 
         let mut view = Self {
@@ -73,14 +79,19 @@ impl LoginView {
             active_tab: LoginTab::QrCode,
             qrcode: None,
             qr_image: None,
+            qr_blur: None,
             qr_loading: false,
             qr_error: None,
             is_scanned: false,
+            login_success: false,
+            canceled: false,
+            cancel_seconds: 6,
             is_expired: false,
             countdown: 120,
             qr_generation: 0,
             poll_task: None,
             countdown_task: None,
+            cancel_task: None,
             cookie_input,
             cookie_loading: false,
             cookie_error: None,
@@ -107,10 +118,14 @@ impl LoginView {
         self.qr_loading = true;
         self.qr_error = None;
         self.is_scanned = false;
+        self.login_success = false;
+        self.canceled = false;
+        self.cancel_seconds = 6;
         self.is_expired = false;
         self.qr_generation += 1;
         self.poll_task = None;
         self.countdown_task = None;
+        self.cancel_task = None;
         let generation = self.qr_generation;
         let (rt, api) = Self::backend(cx);
         cx.notify();
@@ -123,12 +138,16 @@ impl LoginView {
                 }
                 this.qr_loading = false;
                 match result {
-                    Ok(qr) => {
-                        this.qr_image = util::decode_data_uri_image(&qr.image_base64);
-                        this.qrcode = Some(qr);
-                        this.start_polling(cx);
-                        this.start_countdown(cx);
-                    }
+                    Ok(qr) => match util::decode_data_uri_image_blurred(&qr.image_base64, 18.0) {
+                        Some((image, blurred)) => {
+                            this.qr_image = Some(image);
+                            this.qr_blur = Some(blurred);
+                            this.qrcode = Some(qr);
+                            this.start_polling(cx);
+                            this.start_countdown(cx);
+                        }
+                        None => this.qr_error = Some("二维码图片无法显示，请重新获取".into()),
+                    },
                     Err(e) => this.qr_error = Some(e.message()),
                 }
                 cx.notify();
@@ -161,7 +180,21 @@ impl LoginView {
                         }
                         match status {
                             Ok(QRCodeStatus::Success { user, .. }) => {
-                                this.on_login_success(user, cx);
+                                // 先展示成功蒙层,再切换主界面,避免扫码确认后画面"闪一下就走"
+                                this.is_scanned = true;
+                                this.login_success = true;
+                                this.countdown_task = None;
+                                cx.notify();
+                                let entity = cx.entity().downgrade();
+                                cx.spawn(async move |_, cx| {
+                                    cx.background_executor()
+                                        .timer(Duration::from_millis(900))
+                                        .await;
+                                    let _ = entity.update(cx, move |this, cx| {
+                                        this.on_login_success(user, cx)
+                                    });
+                                })
+                                .detach();
                                 true
                             }
                             Ok(QRCodeStatus::Expired) => {
@@ -178,6 +211,10 @@ impl LoginView {
                                 this.is_scanned = true;
                                 cx.notify();
                                 false
+                            }
+                            Ok(QRCodeStatus::Canceled) => {
+                                this.on_canceled(cx);
+                                true
                             }
                             Ok(QRCodeStatus::Waiting) => false,
                             // 轮询失败不停止,继续下一轮(与 Vue 一致)
@@ -230,6 +267,39 @@ impl LoginView {
         self.qr_generation += 1;
         self.poll_task = None;
         self.countdown_task = None;
+        self.cancel_task = None;
+    }
+
+    /// 手机端取消登录:优雅提示 + 6 秒后自动刷新二维码。
+    fn on_canceled(&mut self, cx: &mut Context<Self>) {
+        self.stop_qr_timers();
+        self.canceled = true;
+        self.cancel_seconds = 6;
+        cx.notify();
+        self.cancel_task = Some(cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(1))
+                    .await;
+                let keep_going = this
+                    .update(cx, |this, cx| {
+                        if !this.canceled {
+                            return false;
+                        }
+                        this.cancel_seconds = this.cancel_seconds.saturating_sub(1);
+                        if this.cancel_seconds == 0 {
+                            this.generate_qrcode(cx);
+                            return false;
+                        }
+                        cx.notify();
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep_going {
+                    break;
+                }
+            }
+        }));
     }
 
     fn on_login_success(&mut self, user: UserAuth, cx: &mut Context<Self>) {
@@ -268,7 +338,7 @@ impl LoginView {
     }
 
     fn switch_tab(&mut self, tab: LoginTab, cx: &mut Context<Self>) {
-        if self.active_tab == tab {
+        if self.active_tab == tab || self.login_success || self.cookie_loading {
             return;
         }
         self.active_tab = tab;
@@ -296,7 +366,6 @@ impl LoginView {
             let result =
                 api::call_api(&rt, move || async move { api.cookie_login(&cookies).await }).await;
             let _ = this.update(cx, |this, cx| {
-                this.cookie_loading = false;
                 match result {
                     Ok((user, message)) => {
                         cx.update_global::<AuthStore, _>(|s, _| s.user = Some(user));
@@ -316,6 +385,7 @@ impl LoginView {
                         this.finish_login(cx);
                     }
                     Err(e) => {
+                        this.cookie_loading = false;
                         this.cookie_error = Some(e.message());
                         cx.notify();
                     }
@@ -325,189 +395,313 @@ impl LoginView {
         .detach();
     }
 
-    fn render_qrcode(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_qr_overlay(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let theme = cx.theme().clone();
-        if self.qr_loading {
-            return v_flex()
-                .items_center()
-                .gap_3()
-                .child(Spinner::new().with_size(px(28.)))
-                .child("正在生成二维码...")
-                .into_any_element();
-        }
-        if let Some(err) = &self.qr_error {
-            return v_flex()
-                .items_center()
-                .gap_3()
-                .child(Icon::new(IconName::CircleX).size(px(40.)).text_color(theme.danger))
-                .child(err.clone())
-                .child(
-                    Button::new("retry-qr")
+        let (icon, accent, title, detail, action) = if self.login_success {
+            (
+                IconName::Check,
+                theme.success,
+                if self.add_mode {
+                    "账号添加成功"
+                } else {
+                    "登录成功"
+                },
+                Some(
+                    if self.add_mode {
+                        "正在返回账号设置…"
+                    } else {
+                        "正在进入主界面…"
+                    }
+                    .into(),
+                ),
+                None,
+            )
+        } else if self.canceled {
+            (
+                IconName::RefreshCw,
+                theme.muted_foreground,
+                "已取消登录",
+                Some(format!("{} 秒后自动刷新二维码", self.cancel_seconds)),
+                Some(
+                    Button::new("qr-scan-again")
+                        .ghost()
+                        .small()
+                        .label("立即刷新")
+                        .on_click(cx.listener(|this, _, _, cx| this.generate_qrcode(cx))),
+                ),
+            )
+        } else if self.is_expired {
+            (
+                IconName::RefreshCw,
+                theme.muted_foreground,
+                "二维码已过期",
+                None,
+                Some(
+                    Button::new("refresh-qr")
                         .primary()
                         .small()
-                        .label("重新获取")
+                        .label("刷新二维码")
                         .on_click(cx.listener(|this, _, _, cx| this.generate_qrcode(cx))),
-                )
-                .into_any_element();
-        }
+                ),
+            )
+        } else if self.is_scanned {
+            (
+                IconName::Smartphone,
+                theme.primary,
+                "已扫码",
+                Some("请在手机百度 App 上确认登录".into()),
+                None,
+            )
+        } else {
+            return None;
+        };
 
-        let mut image_box = div()
+        Some(
+            v_flex()
+                .absolute()
+                .inset_0()
+                .items_center()
+                .justify_center()
+                .gap(px(10.))
+                .px(px(16.))
+                .text_center()
+                .bg(linear_gradient(
+                    155.,
+                    linear_color_stop(theme.background.opacity(0.9), 0.),
+                    linear_color_stop(theme.background.opacity(0.98), 1.),
+                ))
+                .child(
+                    div()
+                        .size(px(62.))
+                        .rounded_full()
+                        .border_1()
+                        .border_color(accent.opacity(0.2))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .size(px(46.))
+                                .rounded_full()
+                                .bg(accent.opacity(0.14))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(Icon::new(icon).size(px(24.)).text_color(accent)),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(17.))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme.foreground)
+                        .child(title),
+                )
+                .when_some(detail, |overlay, detail| {
+                    overlay.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.muted_foreground)
+                            .child(detail),
+                    )
+                })
+                .when_some(action, |overlay, action| overlay.child(action))
+                .into_any_element(),
+        )
+    }
+
+    fn render_qrcode(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme().clone();
+        let frame = div()
             .relative()
             .size(px(224.))
-            .p_3()
-            .rounded_lg()
+            .flex_shrink_0()
+            .rounded(px(20.))
+            .overflow_hidden()
             .border_1()
-            .border_color(theme.border)
-            .bg(theme.background);
-        if let Some(image) = &self.qr_image {
-            image_box = image_box.child(img(image.clone()).size_full());
-        }
-        if self.is_expired {
-            image_box = image_box.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
+            .border_color(theme.border);
+
+        let mut waiting_for_scan = false;
+        let frame = if self.qr_loading {
+            frame.bg(theme.background).child(
+                v_flex()
+                    .size_full()
                     .items_center()
                     .justify_center()
-                    .gap_2()
-                    .rounded_lg()
-                    .bg(gpui_kit::black().opacity(0.75))
-                    .text_color(gpui_kit::white())
-                    .child(Icon::new(IconName::RefreshCw).size(px(36.)))
-                    .child("二维码已过期")
+                    .gap(px(10.))
+                    .text_size(px(13.))
+                    .text_color(theme.muted_foreground)
+                    .child(Spinner::new().with_size(px(24.)))
+                    .child("正在生成二维码…"),
+            )
+        } else if let Some(err) = &self.qr_error {
+            frame.bg(theme.background).child(
+                v_flex()
+                    .size_full()
+                    .px(px(14.))
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .text_center()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
                     .child(
-                        Button::new("refresh-qr")
+                        Icon::new(IconName::CircleX)
+                            .size(px(26.))
+                            .text_color(theme.danger),
+                    )
+                    .child(err.clone())
+                    .child(
+                        Button::new("retry-qr")
                             .primary()
                             .small()
-                            .label("刷新二维码")
+                            .label("重新获取")
                             .on_click(cx.listener(|this, _, _, cx| this.generate_qrcode(cx))),
                     ),
-            );
-        } else if self.is_scanned {
-            image_box = image_box.child(
-                div()
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .flex_col()
-                    .items_center()
-                    .justify_center()
-                    .gap_2()
-                    .rounded_lg()
-                    .bg(theme.success.opacity(0.15))
-                    .text_color(theme.success)
-                    .child(Icon::new(IconName::CircleCheck).size(px(40.)))
-                    .child("请在手机上确认登录"),
-            );
-        }
-
-        let tip: SharedString = if self.is_scanned {
-            "请在手机百度 APP 中点击\"确认登录\"".into()
+            )
         } else {
-            "请使用百度 APP 扫描二维码登录".into()
+            let overlay = self.render_qr_overlay(cx);
+            waiting_for_scan = overlay.is_none();
+            let image = if waiting_for_scan {
+                &self.qr_image
+            } else {
+                &self.qr_blur
+            };
+            frame
+                .bg(gpui_kit::white())
+                .p(px(12.))
+                .when_some(image.clone(), |frame, image| {
+                    frame.child(img(image).size_full())
+                })
+                .when_some(overlay, |frame, overlay| frame.child(overlay))
         };
 
         v_flex()
             .items_center()
-            .gap_3()
-            .child(image_box)
+            .gap(px(14.))
+            .child(frame)
             .child(
-                h_flex()
-                    .gap_1p5()
+                v_flex()
+                    .h(px(44.))
                     .items_center()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(if self.is_scanned { theme.success.opacity(0.12) } else { theme.primary.opacity(0.1) })
-                    .text_color(if self.is_scanned { theme.success } else { theme.primary })
-                    .child(Icon::new(if self.is_scanned { IconName::Smartphone } else { IconName::QrCode }).size(px(16.)))
-                    .child(tip),
-            )
-            .child(
-                div()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("{}秒后自动刷新", self.countdown)),
+                    .gap(px(4.))
+                    .when(waiting_for_scan, |hint| {
+                        hint.child(div().text_size(px(13.)).child("请使用百度 App 扫码登录"))
+                            .child(
+                                div()
+                                    .text_size(px(11.))
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("二维码将在 {} 秒后过期", self.countdown)),
+                            )
+                    }),
             )
             .into_any_element()
     }
 
     fn render_cookie(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut tips = v_flex()
-            .rounded_md()
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.info.opacity(0.08))
+        let expanded = self.cookie_tips_expanded;
+        let tips = v_flex()
+            .gap(px(6.))
             .child(
-                h_flex()
-                    .id("cookie-tips-header")
-                    .gap_1p5()
-                    .items_center()
-                    .px_3()
-                    .py_2()
-                    .cursor_pointer()
-                    .text_color(theme.primary)
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.cookie_tips_expanded = !this.cookie_tips_expanded;
-                        cx.notify();
-                    }))
-                    .child(Icon::new(IconName::Info).size(px(14.)))
-                    .child(div().flex_1().child("如何获取 Cookie?"))
-                    .child(Icon::new(if self.cookie_tips_expanded { IconName::ChevronUp } else { IconName::ChevronDown }).size(px(14.))),
-            );
-        if self.cookie_tips_expanded {
-            tips = tips.child(
-                v_flex()
-                    .px_3()
-                    .pb_2()
-                    .gap_1()
-                    .text_color(theme.muted_foreground)
-                    .child("1. 浏览器打开 pan.baidu.com 并登录")
-                    .child("2. 按 F12 → Network 标签页")
-                    .child("3. 刷新页面,点击任意请求")
-                    .child("4. 在 Headers → Request Headers 中找到 cookie")
-                    .child("5. 复制完整值,粘贴到下方输入框"),
-            );
-        }
+                h_flex().child(
+                    Button::new("cookie-tips-header")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Info)
+                        .label("如何获取 Cookie？")
+                        .child(
+                            Icon::new(if expanded {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .size(px(12.)),
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.cookie_tips_expanded = !this.cookie_tips_expanded;
+                            cx.notify();
+                        })),
+                ),
+            )
+            .when(expanded, |tips| {
+                tips.child(
+                    v_flex()
+                        .gap(px(6.))
+                        .px(px(12.))
+                        .py(px(10.))
+                        .rounded(px(10.))
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary.opacity(0.55))
+                        .text_size(px(12.))
+                        .text_color(theme.muted_foreground)
+                        .child("1. 在浏览器打开 pan.baidu.com 并登录。")
+                        .child("2. 打开开发者工具的「网络」面板，刷新页面并选中一条网盘请求。")
+                        .child("3. 在「请求标头」中找到 Cookie，复制完整值并粘贴到输入框。"),
+                )
+            });
 
-        let mut section = v_flex().gap_3().child(tips).child(Textarea::new(&self.cookie_input));
-        if let Some(err) = &self.cookie_error {
-            section = section.child(
-                h_flex()
-                    .gap_1p5()
-                    .items_center()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(theme.danger.opacity(0.1))
-                    .text_color(theme.danger)
-                    .child(Icon::new(IconName::CircleX).size(px(13.)))
-                    .child(err.clone()),
-            );
-        }
-        let loading = self.cookie_loading;
-        section = section.child(
-            Button::new("cookie-login")
-                .primary()
-                .loading(loading)
-                .label(if loading { "登录中..." } else { "使用 Cookie 登录" })
-                .on_click(cx.listener(|this, _, _, cx| this.login_with_cookie(cx))),
-        );
-        section.into_any_element()
+        v_flex()
+            .gap(px(12.))
+            .flex_shrink_0()
+            .child(
+                v_flex()
+                    .gap(px(8.))
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("百度网盘 Cookie"),
+                    )
+                    .child(
+                        Textarea::new(&self.cookie_input)
+                            .large()
+                            .disabled(self.cookie_loading),
+                    )
+                    .when_some(self.cookie_error.clone(), |field, err| {
+                        field.child(
+                            h_flex()
+                                .items_start()
+                                .gap(px(6.))
+                                .px(px(10.))
+                                .py(px(8.))
+                                .rounded(px(8.))
+                                .bg(theme.danger.opacity(0.09))
+                                .text_color(theme.danger)
+                                .text_size(px(12.))
+                                .child(Icon::new(IconName::CircleX).size(px(14.)).flex_shrink_0())
+                                .child(div().min_w_0().flex_1().child(err)),
+                        )
+                    }),
+            )
+            .child(
+                Button::new("cookie-login")
+                    .primary()
+                    .w_full()
+                    .loading(self.cookie_loading)
+                    .label(if self.cookie_loading {
+                        "正在登录…"
+                    } else {
+                        "使用 Cookie 登录"
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| this.login_with_cookie(cx))),
+            )
+            .child(tips)
     }
 }
 
 impl Render for LoginView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme().clone();
-        let mut content = v_flex().flex_1().px_6().py_4().gap_4();
+        let finishing = self.login_success || self.cookie_loading;
+        let mut content = v_flex().flex_1().min_h_0().px_6().py_4().gap_4();
 
         if self.add_mode {
             let count = cx.global::<AuthStore>().accounts.len();
             content = content.child(
                 h_flex()
+                    .flex_shrink_0()
                     .items_center()
                     .justify_between()
                     .px_3()
@@ -519,9 +713,11 @@ impl Render for LoginView {
                         Button::new("back-settings")
                             .ghost()
                             .small()
+                            .disabled(finishing)
                             .label("返回")
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.controller.update(cx, |c, cx| c.navigate(Nav::Settings, cx));
+                                this.controller
+                                    .update(cx, |c, cx| c.navigate(Nav::Settings, cx));
                             })),
                     ),
             );
@@ -531,6 +727,7 @@ impl Render for LoginView {
         let tab = self.active_tab;
         content = content.child(
             h_flex()
+                .flex_shrink_0()
                 .gap_1()
                 .p_1()
                 .rounded_lg()
@@ -540,40 +737,52 @@ impl Render for LoginView {
                         .when(tab == LoginTab::QrCode, |b| b.primary())
                         .when(tab != LoginTab::QrCode, |b| b.ghost())
                         .flex_1()
+                        .disabled(finishing)
                         .icon(IconName::QrCode)
                         .label("扫码登录")
-                        .on_click(cx.listener(|this, _, _, cx| this.switch_tab(LoginTab::QrCode, cx))),
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.switch_tab(LoginTab::QrCode, cx)),
+                        ),
                 )
                 .child(
                     Button::new("tab-cookie")
                         .when(tab == LoginTab::Cookie, |b| b.primary())
                         .when(tab != LoginTab::Cookie, |b| b.ghost())
                         .flex_1()
+                        .disabled(finishing)
                         .icon(IconName::KeyRound)
                         .label("Cookie 登录")
-                        .on_click(cx.listener(|this, _, _, cx| this.switch_tab(LoginTab::Cookie, cx))),
+                        .on_click(
+                            cx.listener(|this, _, _, cx| this.switch_tab(LoginTab::Cookie, cx)),
+                        ),
                 ),
         );
 
-        content = content.child(
-            div()
+        let login_content = match tab {
+            LoginTab::QrCode => v_flex()
                 .flex_1()
-                .flex()
-                .flex_col()
+                .min_h_0()
                 .justify_center()
-                .child(match self.active_tab {
-                    LoginTab::QrCode => self.render_qrcode(cx).into_any_element(),
-                    LoginTab::Cookie => self.render_cookie(cx).into_any_element(),
-                }),
-        );
+                .child(self.render_qrcode(cx))
+                .into_any_element(),
+            LoginTab::Cookie => v_flex()
+                .id("cookie-login-scroll")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scrollbar()
+                .child(self.render_cookie(cx))
+                .into_any_element(),
+        };
 
-        content = content.child(
-            div()
-                .text_center()
+        content.child(login_content).child(
+            v_flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap(px(4.))
+                .text_size(px(11.))
                 .text_color(theme.muted_foreground)
-                .child("v0.1.5"),
-        );
-
-        content
+                .child(img(util::app_logo()).size(px(28.)).rounded(px(7.)))
+                .child(concat!("v", env!("CARGO_PKG_VERSION"))),
+        )
     }
 }

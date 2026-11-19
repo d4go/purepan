@@ -1,6 +1,6 @@
 [package]
 name = "purepan-desktop"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2024"
 rust-version = "1.95"
 
@@ -13,8 +13,6 @@ gpui-kit = "0.10.0"
 purepan-backend = { path = "../backend" }
 
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio-tungstenite = "0.28"
 futures = "0.3"
 async-channel = "2"
 

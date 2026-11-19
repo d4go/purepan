@@ -17,7 +17,7 @@ frontend/vite.local.config.ts
 /downloads/
 *.tmp
 
-# 配置与运行时数据
+# 配置与运行时数据（可能包含登录凭据/个人信息，禁止提交）
 /backend/config/
 /backend/wal/
 /backend/logs/
@@ -25,6 +25,13 @@ frontend/vite.local.config.ts
 /backend/auth.json
 /.github/workflows/config/accounts.json
 /.github/workflows/config/accounts.json.*
+/desktop/config/
+/desktop/wal/
+/desktop/logs/
+/desktop/downloads/
+/desktop/ipc.sock
+*.sock
+web_auth_tokens.json
 *.db
 *.db-shm
 *.db-wal

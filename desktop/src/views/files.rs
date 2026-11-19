@@ -1,38 +1,80 @@
-//! 网盘文件浏览页(移植 frontend/src/views/FilesView.vue)。
-//! 表格用 gpui-kit DataTable + 自定义 TableDelegate(多选/排序/无限滚动/右键菜单)。
+//! 网盘文件浏览页:极简卡片网格(悬停多选 / 更多菜单 / 悬浮操作条)。
+//! 数据层仍复用 FilesDelegate(分页 / 搜索 / 预热重试),展示层换成卡片网格。
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::input::{Input, InputEvent, InputState};
-use gpui_kit::component::menu::{PopupMenu, PopupMenuItem};
 use gpui_kit::component::dialog::Dialog;
-use gpui_kit::component::table::{Column, ColumnSort, DataTable, TableDelegate, TableState};
-use gpui_kit::component::tag::Tag;
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::table::{Column, ColumnSort, TableDelegate, TableState};
 use gpui_kit::component::{
-    ActiveTheme as _, Icon, InteractiveElementExt as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+    ActiveTheme as _, Disableable as _, Icon, InteractiveElementExt as _, Sizable as _,
+    WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Context, Div, Entity,
-    InteractiveElement as _, IntoElement, ParentElement as _, Render, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Subscription, Task, WeakEntity, Window, div, px,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Div, Entity, Focusable, FontWeight,
+    InteractiveElement as _, IntoElement, ObjectFit, ParentElement as _, Render, RenderImage,
+    Stateful, StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task,
+    WeakEntity, Window, div, img, px, rgb,
 };
 
 use crate::api::file::{self, FileItemWithEncryption};
 use crate::api::{self, ApiClient};
 use crate::bridge::{EventHub, ToastKind, UiEvent};
-use crate::components::{breadcrumb, toast};
-use crate::state::Backend;
+use crate::components::app_sidebar::Nav;
+use crate::components::dialogs::file_picker::{LocalFilePicker, PickerMode};
+use crate::components::{file_browser, toast};
+use crate::design::{self, Palette};
+use crate::state::task_cache::v_str;
+use crate::state::{AuthStore, Backend, TaskCache};
 use crate::util;
 
 const PAGE_SIZE: u32 = 50;
 const SEARCH_PAGE_SIZE: u32 = 100;
 const MAX_WARMUP_RETRIES: u32 = 120;
+
+pub(crate) fn queue_upload_paths(
+    paths: Vec<PathBuf>,
+    remote_dir: String,
+    uid: u64,
+    window: &Window,
+    cx: &App,
+) {
+    if paths.is_empty() {
+        return;
+    }
+    let backend = cx.global::<Backend>();
+    let (rt, api) = (backend.rt.clone(), backend.api.clone());
+    let total = paths.len();
+    window
+        .spawn(cx, async move |cx| {
+            let target = remote_dir.clone();
+            let result = api::call_api(&rt, move || async move {
+                api.queue_local_paths(paths, &target, uid).await
+            })
+            .await;
+            let (kind, message) = match result {
+                Ok(queued) if queued == total => (
+                    ToastKind::Success,
+                    format!("已加入上传队列 {queued} 项，目标目录 {remote_dir}"),
+                ),
+                Ok(queued) => (
+                    ToastKind::Warning,
+                    format!("已加入上传队列 {queued} 项，{} 项失败", total - queued),
+                ),
+                Err(error) => (ToastKind::Error, error.message()),
+            };
+            let _ = cx.update(|window, cx| toast::show(window, cx, kind, message));
+        })
+        .detach();
+}
 
 // ───────────────────────── 表格 Delegate ─────────────────────────
 
@@ -83,12 +125,16 @@ impl FilesDelegate {
         }
     }
 
-    fn notify_view(&self, cx: &mut App) {
-        let _ = self.view.update(cx, |_, cx| cx.notify());
-    }
-
     /// 加载目录(append=false 切目录/刷新;true 滚动下一页)。
     pub fn load_files(&mut self, dir: &str, append: bool, cx: &mut Context<TableState<Self>>) {
+        if !append {
+            self.warming_up = false;
+            self.warmup_retries = 0;
+        }
+        self.request_files(dir, append, cx);
+    }
+
+    fn request_files(&mut self, dir: &str, append: bool, cx: &mut Context<TableState<Self>>) {
         if append && (self.loading || self.loading_more || !self.hasMore()) {
             return;
         }
@@ -98,10 +144,9 @@ impl FilesDelegate {
             self.loading_more = true;
         } else {
             self.loading = true;
+            self.loading_more = false;
             self.page = 1;
             self.has_more = true;
-            self.warming_up = false;
-            self.warmup_retries = 0;
         }
         let request_page = if append { self.page + 1 } else { 1 };
         let dir = dir.to_string();
@@ -119,9 +164,9 @@ impl FilesDelegate {
                 if d.request_version != version {
                     return;
                 }
+                d.warming_up = false;
                 match result {
                     Ok(data) => {
-                        d.warming_up = false;
                         d.warmup_retries = 0;
                         if append {
                             d.files.extend(data.list);
@@ -145,7 +190,7 @@ impl FilesDelegate {
                                 d.warmup_retries = 0;
                                 d.toast(cx, ToastKind::Error, "客户端初始化超时,请稍后手动刷新重试");
                             } else {
-                                d.schedule_warmup_retry(dir.clone(), cx);
+                                d.schedule_warmup_retry(dir.clone(), version, cx);
                             }
                         } else {
                             d.toast(cx, ToastKind::Error, msg);
@@ -155,18 +200,23 @@ impl FilesDelegate {
                 d.loading = false;
                 d.loading_more = false;
                 cx.notify();
-                d.notify_view(cx);
             });
         })
         .detach();
     }
 
-    fn schedule_warmup_retry(&mut self, dir: String, cx: &mut Context<TableState<Self>>) {
+    fn schedule_warmup_retry(
+        &self,
+        dir: String,
+        version: u64,
+        cx: &mut Context<TableState<Self>>,
+    ) {
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_millis(500)).await;
             let _ = this.update(cx, |state, cx| {
-                if state.delegate().warming_up {
-                    state.delegate_mut().load_files(&dir, false, cx);
+                let d = state.delegate_mut();
+                if d.warming_up && d.request_version == version {
+                    d.request_files(&dir, false, cx);
                 }
             });
         })
@@ -178,6 +228,7 @@ impl FilesDelegate {
             return;
         }
         self.loading_more = true;
+        let version = self.request_version;
         let next_page = self.search_page + 1;
         let key = self.search_keyword.clone();
         let (rt, api) = (self.rt.clone(), self.api.clone());
@@ -190,6 +241,9 @@ impl FilesDelegate {
             .await;
             let _ = this.update(cx, |state, cx| {
                 let d = state.delegate_mut();
+                if d.request_version != version {
+                    return;
+                }
                 d.loading_more = false;
                 if let Ok(data) = result {
                     d.files.extend(data.list);
@@ -198,7 +252,6 @@ impl FilesDelegate {
                     d.apply_sort();
                 }
                 cx.notify();
-                d.notify_view(cx);
             });
         })
         .detach();
@@ -208,9 +261,14 @@ impl FilesDelegate {
         self.is_search = true;
         self.search_keyword = key.to_string();
         self.search_page = 1;
+        self.search_has_more = false;
         self.loading = true;
+        self.loading_more = false;
+        self.warming_up = false;
         self.files.clear();
         self.selected.clear();
+        self.request_version += 1;
+        let version = self.request_version;
         let key = key.to_string();
         let (rt, api) = (self.rt.clone(), self.api.clone());
         cx.notify();
@@ -222,6 +280,9 @@ impl FilesDelegate {
             .await;
             let _ = this.update(cx, |state, cx| {
                 let d = state.delegate_mut();
+                if d.request_version != version {
+                    return;
+                }
                 d.loading = false;
                 match result {
                     Ok(data) => {
@@ -232,7 +293,6 @@ impl FilesDelegate {
                     Err(e) => d.toast(cx, ToastKind::Error, e.message()),
                 }
                 cx.notify();
-                d.notify_view(cx);
             });
         })
         .detach();
@@ -413,15 +473,15 @@ impl TableDelegate for FilesDelegate {
                     .into_any_element()
             }
             1 => {
-                let icon = if f.file.isdir == 1 { IconName::Folder } else { IconName::FileText };
                 let name = util::display_name(&f);
+                let icon = if f.file.isdir == 1 { IconName::Folder } else { design::file_visual(&name, false).0 };
                 let encrypted = f.is_encrypted || f.is_encrypted_folder;
                 h_flex()
                     .gap_2()
                     .items_center()
                     .child(Icon::new(icon).size(px(20.)).text_color(if f.file.isdir == 1 { theme.primary } else { theme.muted_foreground }))
                     .child(div().truncate().child(name))
-                    .when(encrypted, |this| this.child(Tag::new().small().child("🔒")))
+                    .when(encrypted, |this| this.child(div().text_size(px(11.)).child("🔒")))
                     .into_any_element()
             }
             2 => div()
@@ -479,7 +539,38 @@ pub enum FileAction {
     Delete,
 }
 
+fn card_menu(
+    menu: PopupMenu,
+    f: FileItemWithEncryption,
+    view: WeakEntity<FilesView>,
+) -> PopupMenu {
+    let mk = |label: &'static str, icon: IconName, action: FileAction| {
+        let view = view.clone();
+        let f = f.clone();
+        PopupMenuItem::new(label)
+            .icon(icon)
+            .on_click(move |_, window, cx| {
+                let f = f.clone();
+                let _ = view.update(cx, |v, cx| v.handle_file_action(action, f, window, cx));
+            })
+    };
+    menu.item(mk("打开", IconName::FolderOpen, FileAction::Open))
+        .item(mk("下载", IconName::Download, FileAction::Download))
+        .item(mk("分享", IconName::Share2, FileAction::Share))
+        .item(mk("重命名", IconName::Pencil, FileAction::Rename))
+        .item(mk("复制到…", IconName::Copy, FileAction::Copy))
+        .item(mk("移动到…", IconName::Move, FileAction::Move))
+        .item(PopupMenuItem::separator())
+        .item(mk("删除", IconName::Trash, FileAction::Delete))
+}
+
 // ───────────────────────── 页面视图 ─────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ViewMode {
+    Grid,
+    List,
+}
 
 pub struct FilesView {
     pub table: Entity<TableState<FilesDelegate>>,
@@ -489,6 +580,11 @@ pub struct FilesView {
     rename_target: Option<FileItemWithEncryption>,
     delete_targets: Vec<FileItemWithEncryption>,
     busy: bool,
+    hovered: Option<u64>,
+    open_menu: Option<u64>,
+    view_mode: ViewMode,
+    search_open: bool,
+    avatar: Option<Arc<RenderImage>>,
     hub: Entity<EventHub>,
     window_handle: AnyWindowHandle,
     _subscriptions: Vec<Subscription>,
@@ -506,16 +602,22 @@ impl FilesView {
         let new_folder_input = cx.new(|cx| InputState::new(window, cx).placeholder("请输入文件夹名称"));
         let rename_input = cx.new(|cx| InputState::new(window, cx).placeholder("输入新名称"));
 
-        let mut subs = Vec::new();
-        subs.push(cx.subscribe_in(&search_input, window, |this, _, ev, _, cx| {
-            if matches!(ev, InputEvent::PressEnter { .. }) {
-                this.do_search(cx);
+        let mut subs = vec![cx.observe(&table, |_, _, cx| cx.notify())];
+        subs.push(cx.subscribe_in(&search_input, window, |this, _, ev, _window, cx| match ev {
+            InputEvent::PressEnter { .. } => this.do_search(cx),
+            InputEvent::Change => {
+                // 清空输入框(含内置清除按钮)时退出搜索态,恢复目录列表
+                if this.search_input.read(cx).value().trim().is_empty() && this.delegate(cx).is_search {
+                    this.table.update(cx, |state, cx| state.delegate_mut().exit_search(cx));
+                    cx.notify();
+                }
             }
+            _ => {}
         }));
-        // 账号切换 → 回到根目录重取
         subs.push(cx.subscribe(&hub, |this, _, ev, cx| {
             if matches!(ev, UiEvent::AccountChanged { .. }) {
                 this.navigate_to_dir("/".into(), cx);
+                this.load_avatar(cx);
             }
         }));
 
@@ -527,20 +629,59 @@ impl FilesView {
             rename_target: None,
             delete_targets: Vec::new(),
             busy: false,
+            hovered: None,
+            open_menu: None,
+            view_mode: ViewMode::List,
+            search_open: false,
+            avatar: None,
             hub,
             window_handle: window.window_handle(),
             _subscriptions: subs,
             _load_task: None,
         };
         view.navigate_to_dir("/".into(), cx);
+        view.load_avatar(cx);
         view
+    }
+
+    /// 加载当前账号头像(与设置页一致,走后端代理下载)。
+    fn load_avatar(&mut self, cx: &mut Context<Self>) {
+        let Some(url) = cx
+            .global::<AuthStore>()
+            .active_account()
+            .and_then(|a| a.avatar_url.clone())
+        else {
+            return;
+        };
+        let b = cx.global::<Backend>();
+        let (rt, api) = (b.rt.clone(), b.api.clone());
+        cx.spawn(async move |this, cx| {
+            let a = api.clone();
+            let r = api::call_api(&rt, move || async move { a.fetch_avatar(&url).await }).await;
+            if let Ok(bytes) = r {
+                if let Some(image) = util::decode_image_bytes(&bytes) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.avatar = Some(image);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
     }
 
     fn delegate<'a>(&self, cx: &'a App) -> &'a FilesDelegate {
         self.table.read(cx).delegate()
     }
 
+    pub fn upload_target(&self, cx: &App) -> Option<String> {
+        let directory = self.delegate(cx);
+        (!directory.loading && !directory.warming_up).then(|| directory.current_dir.clone())
+    }
+
     pub fn navigate_to_dir(&mut self, dir: String, cx: &mut Context<Self>) {
+        self.hovered = None;
+        self.open_menu = None;
         // 退出搜索态
         self.table.update(cx, |state, cx| {
             let d = state.delegate_mut();
@@ -556,6 +697,8 @@ impl FilesView {
         if key.is_empty() {
             return;
         }
+        self.hovered = None;
+        self.open_menu = None;
         self.table.update(cx, |state, cx| state.delegate_mut().search(&key, cx));
         cx.notify();
     }
@@ -630,7 +773,7 @@ impl FilesView {
                 .width(px(500.))
                 .child(
                     v_flex().gap_3()
-                        .child(h_flex().gap_2().items_center().child("文件夹名").child(Input::new(&input2)))
+                        .child(h_flex().gap_2().items_center().child("文件夹名").child(Input::new(&input2).large()))
                         .child(h_flex().gap_2().child("当前路径").child(dir.clone())),
                 )
                 .footer(
@@ -687,7 +830,7 @@ impl FilesView {
             dialog.title("重命名").width(px(500.))
                 .child(v_flex().gap_3()
                     .child(h_flex().gap_2().child("原名称").child(original.clone()))
-                    .child(h_flex().gap_2().items_center().child("新名称").child(Input::new(&input2)))
+                    .child(h_flex().gap_2().items_center().child("新名称").child(Input::new(&input2).large()))
                     .child(h_flex().gap_2().child("所在目录").child(dir.clone())))
                 .footer(h_flex().gap_2().justify_end()
                     .child(Button::new("rn-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))
@@ -918,54 +1061,33 @@ impl FilesView {
         }).detach();
     }
 
-    // ── 上传 ──
-    fn open_upload_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let view = cx.entity().downgrade();
+    fn open_upload_picker(
+        &mut self,
+        mode: PickerMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(remote_dir) = self.upload_target(cx) else {
+            return;
+        };
+        let Some(uid) = cx.global::<AuthStore>().signed_in_uid() else {
+            return;
+        };
         let on_confirm: std::rc::Rc<dyn Fn(Vec<String>, &mut Window, &mut App)> =
-            std::rc::Rc::new(move |paths, _w, cx| {
-                let _ = view.update(cx, move |v, cx| v.upload_paths(paths, cx));
+            std::rc::Rc::new(move |paths, window, cx| {
+                let paths = paths.into_iter().map(PathBuf::from).collect();
+                queue_upload_paths(paths, remote_dir.clone(), uid, window, cx);
             });
-        let picker = cx.new(|cx| {
-            crate::components::dialogs::file_picker::LocalFilePicker::new(
-                crate::components::dialogs::file_picker::PickerMode::Files,
-                None, on_confirm, window, cx,
-            )
+        let title = match mode {
+            PickerMode::Files => "选择上传文件",
+            PickerMode::Directory => "选择要上传的文件夹",
+        };
+        let picker = cx.new(|cx| LocalFilePicker::new(mode, None, on_confirm, window, cx));
+        window.open_dialog(cx, move |d: Dialog, _, _| {
+            d.title(title).width(px(640.)).child(picker.clone())
         });
-        window.open_dialog(cx, move |d: Dialog, _, _| d.title("选择上传文件").width(px(640.)).child(picker.clone()));
     }
 
-    fn upload_paths(&mut self, paths: Vec<String>, cx: &mut Context<Self>) {
-        if paths.is_empty() { return; }
-        let remote_dir = self.delegate(cx).current_dir.clone();
-        let b = cx.global::<Backend>();
-        let (rt, api) = (b.rt.clone(), b.api.clone());
-        cx.spawn(async move |this, cx| {
-            let mut ok = 0usize;
-            let mut fail = 0usize;
-            for path in &paths {
-                let is_dir = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
-                let (api2, path2, remote2) = (api.clone(), path.clone(), remote_dir.clone());
-                let result = if is_dir {
-                    api::call_api(&rt, move || async move {
-                        api2.create_folder_upload(&path2, &remote2, false, None).await.map(|_| ())
-                    }).await
-                } else {
-                    let remote_path = file::join_path(&remote_dir, &file::basename(path));
-                    api::call_api(&rt, move || async move {
-                        api2.create_upload(&path2, &remote_path, false, None).await.map(|_| ())
-                    }).await
-                };
-                match result { Ok(_) => ok += 1, Err(_) => fail += 1 }
-            }
-            let _ = this.update(cx, |this, cx| {
-                if fail == 0 {
-                    this.toast(cx, ToastKind::Success, format!("已加入上传队列({ok} 项)"));
-                } else {
-                    this.toast(cx, ToastKind::Warning, format!("上传 {ok} 项,失败 {fail} 项"));
-                }
-            });
-        }).detach();
-    }
     // ── 分享 / 转存 ──
     fn open_share_dialog(&mut self, files: Vec<FileItemWithEncryption>, window: &mut Window, cx: &mut Context<Self>) {
         if files.is_empty() { self.toast_sync(window, cx, ToastKind::Warning, "请先选择要分享的文件"); return; }
@@ -984,60 +1106,853 @@ impl FilesView {
         let title = if direct { "分享直下" } else { "转存" };
         window.open_dialog(cx, move |d: Dialog, _, _| d.title(title).width(px(600.)).child(dlg.clone()));
     }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.table.update(cx, |state, cx| {
+            state.delegate_mut().selected.clear();
+            cx.notify();
+        });
+        cx.notify();
+    }
+
+    fn crumb(
+        &self,
+        label: String,
+        path: String,
+        current: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .id(gpui_kit::SharedString::from(format!("crumb:{path}")))
+            .cursor_pointer()
+            .truncate()
+            .max_w(px(220.))
+            .when(current, |d| {
+                d.text_color(p.text).font_weight(FontWeight::MEDIUM)
+            })
+            .when(!current, |d| {
+                d.text_color(p.faint).hover(|s| s.text_color(p.muted))
+            })
+            .on_click(cx.listener(move |this, _, _, cx| this.navigate_to_dir(path.clone(), cx)))
+            .child(label)
+            .into_any_element()
+    }
+
+    fn render_breadcrumb(&self, dir: &str, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let mut row = h_flex().gap(px(6.)).items_center().text_size(px(15.));
+        row = row.child(self.crumb("全部文件".into(), "/".into(), dir == "/", p, cx));
+        let mut acc = String::new();
+        let parts: Vec<&str> = dir.split('/').filter(|s| !s.is_empty()).collect();
+        for (i, part) in parts.iter().enumerate() {
+            acc.push('/');
+            acc.push_str(part);
+            let current = i + 1 == parts.len();
+            row = row.child(
+                Icon::new(IconName::ChevronRight)
+                    .size(px(14.))
+                    .text_color(p.faint),
+            );
+            row = row.child(self.crumb((*part).to_string(), acc.clone(), current, p, cx));
+        }
+        row.into_any_element()
+    }
+
+    fn tool_icon(
+        id: &'static str,
+        icon: IconName,
+        handler: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        Button::new(id)
+            .ghost()
+            .small()
+            .icon(icon)
+            .on_click(cx.listener(move |this, _, window, cx| handler(this, window, cx)))
+            .into_any_element()
+    }
+
+    fn render_create_menu(pending: bool, cx: &Context<Self>) -> AnyElement {
+        let button = Button::new("files-upload-new")
+            .primary()
+            .small()
+            .icon(IconName::Plus)
+            .label("上传 / 新建");
+        if pending {
+            return button.disabled(true).into_any_element();
+        }
+
+        let view = cx.entity().downgrade();
+        button
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                let item =
+                    |label: &'static str,
+                     icon: IconName,
+                     open: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+                        let view = view.clone();
+                        PopupMenuItem::new(label)
+                            .icon(icon)
+                            .on_click(move |_, window, cx| {
+                                let _ = view.update(cx, |this, cx| open(this, window, cx));
+                            })
+                    };
+                menu.item(item(
+                    "上传文件",
+                    IconName::Upload,
+                    |this, window, cx| {
+                        this.open_upload_picker(PickerMode::Files, window, cx);
+                    },
+                ))
+                .item(item(
+                    "上传文件夹",
+                    IconName::FolderUp,
+                    |this, window, cx| {
+                        this.open_upload_picker(PickerMode::Directory, window, cx);
+                    },
+                ))
+                .item(item(
+                    "新建文件夹",
+                    IconName::FolderPlus,
+                    Self::open_new_folder_dialog,
+                ))
+                .item(PopupMenuItem::separator())
+                .item(item(
+                    "转存分享链接",
+                    IconName::FolderInput,
+                    |this, window, cx| {
+                        this.open_transfer_dialog(false, window, cx);
+                    },
+                ))
+                .item(item(
+                    "分享直下",
+                    IconName::Download,
+                    |this, window, cx| {
+                        this.open_transfer_dialog(true, window, cx);
+                    },
+                ))
+            })
+            .into_any_element()
+    }
+
+    fn render_header(
+        &self,
+        dir: &str,
+        is_search: bool,
+        item_count: usize,
+        pending: bool,
+        p: &Palette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let view_is_grid = self.view_mode == ViewMode::Grid;
+        let view_entity = cx.entity().downgrade();
+        let view_btn = Button::new("files-view-mode")
+            .ghost()
+            .small()
+            .icon(if view_is_grid {
+                IconName::LayoutGrid
+            } else {
+                IconName::List
+            })
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                let grid_view = view_entity.clone();
+                let list_view = view_entity.clone();
+                menu.item(
+                    PopupMenuItem::new("大图标")
+                        .icon(IconName::LayoutGrid)
+                        .checked(view_is_grid)
+                        .on_click(move |_, _, cx| {
+                            let _ = grid_view.update(cx, |v, cx| {
+                                v.view_mode = ViewMode::Grid;
+                                cx.notify();
+                            });
+                        }),
+                )
+                .item(
+                    PopupMenuItem::new("列表")
+                        .icon(IconName::List)
+                        .checked(!view_is_grid)
+                        .on_click(move |_, _, cx| {
+                            let _ = list_view.update(cx, |v, cx| {
+                                v.view_mode = ViewMode::List;
+                                cx.notify();
+                            });
+                        }),
+                )
+            });
+
+        let hub = self.hub.clone();
+        let search_btn = Self::tool_icon(
+            "files-search",
+            if self.search_open { IconName::Close } else { IconName::Search },
+            move |this, window, cx| {
+                this.search_open = !this.search_open;
+                if this.search_open {
+                    let handle = this.search_input.read(cx).focus_handle(cx);
+                    window.focus(&handle, cx);
+                } else {
+                    this.search_input.update(cx, |s, cx| s.clean(window, cx));
+                    if this.delegate(cx).is_search {
+                        this.table
+                            .update(cx, |state, cx| state.delegate_mut().exit_search(cx));
+                    }
+                }
+                cx.notify();
+            },
+            cx,
+        );
+
+        let refresh_dir = dir.to_string();
+        let refresh_btn = Self::tool_icon(
+            "files-refresh",
+            IconName::RefreshCw,
+            move |this, _, cx| this.navigate_to_dir(refresh_dir.clone(), cx),
+            cx,
+        );
+
+        let active_transfers = {
+            let cache = cx.global::<TaskCache>();
+            cache
+                .downloads
+                .values()
+                .chain(cache.uploads.values())
+                .filter(|v| {
+                    matches!(
+                        v_str(v, "status").as_str(),
+                        "pending"
+                            | "downloading"
+                            | "uploading"
+                            | "decrypting"
+                            | "encrypting"
+                            | "scanning"
+                            | "checking_rapid"
+                    )
+                })
+                .count()
+        };
+        let hub_transfer = hub.clone();
+        let transfer_btn = div()
+            .relative()
+            .child(
+                Button::new("files-transfers")
+                    .ghost()
+                    .small()
+                    .icon(IconName::CircleArrowDown)
+                    .on_click(cx.listener(move |_, _, _, cx| {
+                        hub_transfer.update(cx, |_, cx| {
+                            cx.emit(UiEvent::Navigate(Nav::Downloads))
+                        });
+                    })),
+            )
+            .when(active_transfers > 0, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(-3.))
+                        .right(px(-3.))
+                        .min_w(px(14.))
+                        .h(px(14.))
+                        .px(px(3.))
+                        .rounded_full()
+                        .bg(p.primary)
+                        .text_color(rgb(0xFFFFFF))
+                        .text_size(px(9.))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(active_transfers.to_string()),
+                )
+            });
+
+        let hub_avatar = hub.clone();
+        let avatar_inner: AnyElement = if let Some(image) = &self.avatar {
+            img(image.clone())
+                .size(px(28.))
+                .rounded_full()
+                .object_fit(ObjectFit::Cover)
+                .border_1()
+                .border_color(p.border)
+                .into_any_element()
+        } else {
+            let username = cx.global::<AuthStore>().username();
+            let initial = username
+                .chars()
+                .next()
+                .map(|c| c.to_uppercase().to_string())
+                .unwrap_or_else(|| "?".into());
+            div()
+                .size(px(28.))
+                .rounded_full()
+                .bg(p.primary_soft)
+                .text_color(p.primary)
+                .text_size(px(12.))
+                .font_weight(FontWeight::SEMIBOLD)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(initial)
+                .into_any_element()
+        };
+        let avatar = div()
+            .id("files-avatar")
+            .size(px(28.))
+            .cursor_pointer()
+            .child(avatar_inner)
+            .on_click(cx.listener(move |_, _, _, cx| {
+                hub_avatar.update(cx, |_, cx| cx.emit(UiEvent::Navigate(Nav::Settings)));
+            }));
+
+        let search_field = self.search_open.then(|| {
+            div().w(px(240.)).child(
+                Input::new(&self.search_input)
+                    .small()
+                    .cleanable(true)
+                    .prefix(Icon::new(IconName::Search).size(px(14.)).text_color(p.faint)),
+            )
+        });
+
+        file_browser::header(
+            self.render_breadcrumb(dir, p, cx),
+            (!pending).then_some(item_count),
+            is_search,
+            h_flex()
+                .gap(px(6.))
+                .items_center()
+                .flex_shrink_0()
+                .when_some(search_field, |this, field| this.child(field))
+                .child(Self::render_create_menu(pending, cx))
+                .child(view_btn)
+                .child(search_btn)
+                .child(refresh_btn)
+                .child(transfer_btn)
+                .child(avatar),
+            p,
+        )
+    }
+
+    fn render_card(&self, f: &FileItemWithEncryption, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let fs_id = f.file.fs_id;
+        let is_dir = f.file.isdir == 1;
+        let name = util::display_name(f);
+        let encrypted = f.is_encrypted || f.is_encrypted_folder;
+        let selected = self.table.read(cx).delegate().selected.contains(&fs_id);
+        let hovered = self.hovered == Some(fs_id);
+        let menu_open = self.open_menu == Some(fs_id);
+        let show_actions = hovered || selected || menu_open;
+
+        let tile = if is_dir {
+            div()
+                .size(px(56.))
+                .rounded(px(14.))
+                .bg(p.folder_tile(false))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    Icon::new(IconName::Folder)
+                        .size(px(28.))
+                        .text_color(rgb(0xFFFFFF).alpha(0.92)),
+                )
+        } else {
+            let (icon, bg, fg) = design::file_visual(&name, p.is_dark);
+            div()
+                .size(px(56.))
+                .rounded(px(14.))
+                .bg(bg)
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(Icon::new(icon).size(px(26.)).text_color(fg))
+        };
+
+        let meta = if is_dir {
+            util::format_relative_time(f.file.server_mtime)
+        } else {
+            format!(
+                "{} · {}",
+                util::format_size(f.file.size),
+                util::format_relative_time(f.file.server_mtime)
+            )
+        };
+        let meta = if encrypted {
+            format!("🔒 {meta}")
+        } else {
+            meta
+        };
+
+        let view_sel = cx.entity().downgrade();
+        let checkbox = Checkbox::new(("card-sel", fs_id))
+            .checked(selected)
+            .on_change(move |checked, _, cx| {
+                let checked = *checked;
+                let _ = view_sel
+                    .update(cx, move |v, cx| v.toggle_select(fs_id, checked, cx));
+            });
+        let f_more = f.clone();
+        let view_more = cx.entity().downgrade();
+        let view_open = cx.entity().downgrade();
+        let open_id = fs_id;
+        let more = Button::new(("card-more", fs_id))
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                card_menu(menu, f_more.clone(), view_more.clone())
+            })
+            .on_open_change(move |open, _, cx| {
+                let open = *open;
+                let _ = view_open.update(cx, |v, cx| {
+                    if open {
+                        v.open_menu = Some(open_id);
+                    } else if v.open_menu == Some(open_id) {
+                        v.open_menu = None;
+                    }
+                    cx.notify();
+                });
+            });
+
+        let view_click = cx.entity().downgrade();
+        let click_id = fs_id;
+        let view_dbl = cx.entity().downgrade();
+        let dbl_is_dir = is_dir;
+        let dbl_path = f.file.path.clone();
+        let dbl_file = f.clone();
+        let view_ctx = cx.entity().downgrade();
+        let ctx_file = f.clone();
+
+        div()
+            .id(("file-card", fs_id))
+            .relative()
+            .w(px(200.))
+            .h(px(176.))
+            .rounded(px(16.))
+            .bg(p.card)
+            .border(px(1.))
+            .border_color(if selected { p.primary } else { p.border })
+            .shadow(p.card_shadow(hovered))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                let next = if *hovered {
+                    Some(fs_id)
+                } else if this.hovered == Some(fs_id) {
+                    None
+                } else {
+                    this.hovered
+                };
+                if this.hovered != next {
+                    this.hovered = next;
+                    cx.notify();
+                }
+            }))
+            .on_click(move |_, _, cx| {
+                let _ = view_click.update(cx, |v, cx| {
+                    v.table.update(cx, |state, cx| {
+                        state.delegate_mut().active_fs_id = Some(click_id);
+                        cx.notify();
+                    });
+                    cx.notify();
+                });
+            })
+            .on_double_click(move |_, window, cx| {
+                if dbl_is_dir {
+                    let path = dbl_path.clone();
+                    let _ = view_dbl.update(cx, move |v, cx| v.navigate_to_dir(path, cx));
+                } else {
+                    let f = dbl_file.clone();
+                    let _ = view_dbl.update(cx, move |v, cx| v.download_files(vec![f], window, cx));
+                }
+            })
+            .child(
+                v_flex()
+                    .size_full()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .px(px(18.))
+                    .child(tile)
+                    .child(
+                        div()
+                            .w_full()
+                            .text_center()
+                            .truncate()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(p.faint)
+                            .child(meta),
+                    ),
+            )
+            .when(show_actions, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(10.))
+                        .left(px(10.))
+                        .p(px(1.))
+                        .rounded(px(6.))
+                        .bg(p.card)
+                        .child(checkbox),
+                )
+            })
+            .when(show_actions, |d| {
+                d.child(div().absolute().top(px(8.)).right(px(8.)).child(more))
+            })
+            .context_menu(move |menu, _, _| {
+                card_menu(menu, ctx_file.clone(), view_ctx.clone())
+            })
+            .into_any_element()
+    }
+
+    fn render_list_row(&self, f: &FileItemWithEncryption, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let fs_id = f.file.fs_id;
+        let is_dir = f.file.isdir == 1;
+        let name = util::display_name(f);
+        let encrypted = f.is_encrypted || f.is_encrypted_folder;
+        let selected = self.table.read(cx).delegate().selected.contains(&fs_id);
+        let hovered = self.hovered == Some(fs_id);
+        // 菜单展开期间保持按钮挂载,否则鼠标移到菜单上会卸载下拉菜单
+        let menu_open = self.open_menu == Some(fs_id);
+        let show_actions = hovered || selected || menu_open;
+        let name = if encrypted { format!("🔒 {name}") } else { name };
+
+        let (icon, color) = if is_dir {
+            (IconName::Folder, rgb(file_browser::FOLDER_ICON_COLOR).into())
+        } else {
+            let (icon, _, fg) = design::file_visual(&name, p.is_dark);
+            (icon, fg)
+        };
+        let size_text = if is_dir { "-".to_string() } else { util::format_size(f.file.size) };
+        let time_text = util::format_relative_time(f.file.server_mtime);
+
+        let view_sel = cx.entity().downgrade();
+        let checkbox = Checkbox::new(("row-sel", fs_id))
+            .checked(selected)
+            .on_change(move |checked, _, cx| {
+                let checked = *checked;
+                let _ = view_sel.update(cx, move |v, cx| v.toggle_select(fs_id, checked, cx));
+            });
+        let f_more = f.clone();
+        let view_more = cx.entity().downgrade();
+        let view_open = cx.entity().downgrade();
+        let open_id = fs_id;
+        let more = Button::new(("row-more", fs_id))
+            .ghost()
+            .small()
+            .icon(IconName::Ellipsis)
+            .dropdown_menu_with_anchor(gpui_kit::Anchor::TopRight, move |menu, _, _| {
+                card_menu(menu, f_more.clone(), view_more.clone())
+            })
+            .on_open_change(move |open, _, cx| {
+                let open = *open;
+                let _ = view_open.update(cx, |v, cx| {
+                    if open {
+                        v.open_menu = Some(open_id);
+                    } else if v.open_menu == Some(open_id) {
+                        v.open_menu = None;
+                    }
+                    cx.notify();
+                });
+            });
+
+        let view_click = cx.entity().downgrade();
+        let click_id = fs_id;
+        let view_dbl = cx.entity().downgrade();
+        let dbl_is_dir = is_dir;
+        let dbl_path = f.file.path.clone();
+        let dbl_file = f.clone();
+        let view_ctx = cx.entity().downgrade();
+        let ctx_file = f.clone();
+
+        div()
+            .id(("file-row-ui", fs_id))
+            .h(px(48.))
+            .px(px(12.))
+            .rounded(px(10.))
+            .cursor_pointer()
+            .when(hovered || selected, |d| d.bg(p.selected_bg))
+            .on_hover(cx.listener(move |this, hovered, _, cx| {
+                let next = if *hovered {
+                    Some(fs_id)
+                } else if this.hovered == Some(fs_id) {
+                    None
+                } else {
+                    this.hovered
+                };
+                if this.hovered != next {
+                    this.hovered = next;
+                    cx.notify();
+                }
+            }))
+            .on_click(move |_, _, cx| {
+                let _ = view_click.update(cx, |v, cx| {
+                    v.table.update(cx, |state, cx| {
+                        state.delegate_mut().active_fs_id = Some(click_id);
+                        cx.notify();
+                    });
+                    cx.notify();
+                });
+            })
+            .on_double_click(move |_, window, cx| {
+                if dbl_is_dir {
+                    let path = dbl_path.clone();
+                    let _ = view_dbl.update(cx, move |v, cx| v.navigate_to_dir(path, cx));
+                } else {
+                    let f = dbl_file.clone();
+                    let _ = view_dbl.update(cx, move |v, cx| v.download_files(vec![f], window, cx));
+                }
+            })
+            .child(
+                h_flex()
+                    .items_center()
+                    .gap(px(10.))
+                    .size_full()
+                    .child(
+                        div().w(px(28.)).child(if show_actions {
+                            checkbox.into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }),
+                    )
+                    .child(Icon::new(icon).size(px(22.)).text_color(color))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(14.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(name),
+                    )
+                    .child(
+                        div()
+                            .w(px(120.))
+                            .text_center()
+                            .text_size(px(12.))
+                            .text_color(p.faint)
+                            .child(size_text),
+                    )
+                    .child(
+                        div()
+                            .w(px(170.))
+                            .pl(px(28.))
+                            .text_size(px(12.))
+                            .text_color(p.faint)
+                            .child(time_text),
+                    )
+                    .child(
+                        div().w(px(36.)).flex().justify_end().child(if show_actions {
+                            more.into_any_element()
+                        } else {
+                            div().into_any_element()
+                        }),
+                    ),
+            )
+            .context_menu(move |menu, _, _| card_menu(menu, ctx_file.clone(), view_ctx.clone()))
+            .into_any_element()
+    }
+
+    fn render_action_bar(&self, count: usize, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let bar = h_flex()
+            .gap(px(4.))
+            .items_center()
+            .h(px(52.))
+            .px(px(14.))
+            .rounded(px(9999.))
+            .bg(p.card)
+            .border(px(1.))
+            .border_color(p.border)
+            .shadow(p.card_shadow(true))
+            .child(
+                div()
+                    .px(px(8.))
+                    .text_size(px(12.))
+                    .text_color(p.muted)
+                    .child(format!("已选择 {count} 项")),
+            )
+            .child(
+                Button::new("fab-download")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Download)
+                    .label("下载")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let files = this.delegate(cx).selected_files();
+                        this.download_files(files, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("fab-share")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Share2)
+                    .label("分享")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let files = this.delegate(cx).selected_files();
+                        this.open_share_dialog(files, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("fab-move")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Move)
+                    .label("移动")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let files = this.delegate(cx).selected_files();
+                        this.open_copy_move_picker(true, files, window, cx);
+                    })),
+            )
+            .when(count == 1, |d| {
+                d.child(
+                    Button::new("fab-rename")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Pencil)
+                        .label("重命名")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if let Some(f) = this.delegate(cx).selected_files().first().cloned() {
+                                this.open_rename_dialog(f, window, cx);
+                            }
+                        })),
+                )
+            })
+            .child(
+                Button::new("fab-delete")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Trash)
+                    .label("删除")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        let files = this.delegate(cx).selected_files();
+                        this.open_delete_confirm(files, window, cx);
+                    })),
+            )
+            .child(
+                Button::new("fab-cancel")
+                    .ghost()
+                    .small()
+                    .label("取消")
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_selection(cx))),
+            );
+
+        h_flex()
+            .absolute()
+            .bottom(px(24.))
+            .left_0()
+            .right_0()
+            .justify_center()
+            .child(bar)
+            .into_any_element()
+    }
 }
 
 impl Render for FilesView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let (dir, is_search, keyword, item_count, sel_count, warming, loading_more, has_more) = {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = design::palette(cx);
+        let (dir, is_search, item_count, sel_count, warming, loading, loading_more, has_more) = {
             let d = self.delegate(cx);
-            (d.current_dir.clone(), d.is_search, d.search_keyword.clone(), d.files.len(), d.selected.len(), d.warming_up, d.loading_more, d.hasMore())
+            (
+                d.current_dir.clone(),
+                d.is_search,
+                d.files.len(),
+                d.selected.len(),
+                d.warming_up,
+                d.loading,
+                d.loading_more,
+                d.hasMore(),
+            )
         };
 
-        let mut toolbar = h_flex().gap_3().items_center().px_4().py_1p5();
-        // 面包屑
-        toolbar = toolbar.child(div().flex_1().child(breadcrumb::render(&dir, |target| {
-            cx.listener(move |this, _, _, cx| this.navigate_to_dir(target.clone(), cx))
-        })));
-        // 搜索框
-        toolbar = toolbar.child(
-            h_flex().gap_1().items_center().w(px(220.))
-                .child(Input::new(&self.search_input).small())
-                .when(is_search || !keyword.is_empty(), |this| this.child(
-                    Button::new("clear-search").ghost().small().icon(IconName::Close)
-                        .on_click(cx.listener(|this, _, window, cx| this.clear_search(window, cx)))
-                )),
-        );
-        // 操作按钮
-        let actions = if sel_count > 0 {
-            h_flex().gap_2()
-                .child(Button::new("batch-dl").small().icon(IconName::Download).label("下载").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.download_files(f, window, cx); })))
-                .child(Button::new("batch-copy").small().icon(IconName::Copy).label("复制").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(false, f, window, cx); })))
-                .child(Button::new("batch-move").small().icon(IconName::Move).label("移动").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_copy_move_picker(true, f, window, cx); })))
-                .child(Button::new("batch-share").small().icon(IconName::Share2).label("分享").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_share_dialog(f, window, cx); })))
-                .child(Button::new("batch-del").danger().small().icon(IconName::Trash).label("删除").on_click(cx.listener(|this, _, window, cx| { let f = this.delegate(cx).selected_files(); this.open_delete_confirm(f, window, cx); })))
-        } else {
-            h_flex().gap_2()
-                .child(Button::new("new-folder").primary().small().icon(IconName::FolderPlus).label("新建").on_click(cx.listener(|this, _, window, cx| this.open_new_folder_dialog(window, cx))))
-                .child(Button::new("upload").success().small().icon(IconName::Upload).label("上传").on_click(cx.listener(|this, _, window, cx| this.open_upload_picker(window, cx))))
-                .child(Button::new("transfer").warning().small().icon(IconName::FolderInput).label("转存").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(false, window, cx))))
-                .child(Button::new("share-direct").warning().small().icon(IconName::Download).label("分享直下").on_click(cx.listener(|this, _, window, cx| this.open_transfer_dialog(true, window, cx))))
-                .child(Button::new("refresh").small().icon(IconName::RefreshCw).label("刷新").on_click(cx.listener(|this, _, _, cx| { let dir = this.delegate(cx).current_dir.clone(); this.navigate_to_dir(dir, cx); })))
-        };
-        toolbar = toolbar.child(actions);
+        let pending = warming || loading;
+        let header = self.render_header(&dir, is_search, item_count, pending, &palette, cx);
 
-        let mut content = v_flex().flex_1().overflow_hidden().child(toolbar);
-        if warming {
-            content = content.child(div().flex_1().flex().items_center().justify_center().child("正在初始化客户端..."));
+        let mut body = div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .flex()
+            .flex_col();
+
+        if pending {
+            let label = if warming {
+                "正在初始化客户端…"
+            } else if is_search {
+                "正在搜索…"
+            } else {
+                "正在加载文件夹…"
+            };
+            body = body.child(file_browser::loading_state(&palette, label));
+        } else if item_count == 0 {
+            let msg = if is_search { "未找到匹配的文件" } else { "当前目录为空" };
+            body = body.child(
+                v_flex()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.))
+                    .text_color(palette.faint)
+                    .child(Icon::new(IconName::FolderOpen).size(px(40.)))
+                    .child(msg)
+                    .when(!is_search, |empty| {
+                        empty.child(div().text_size(px(12.)).child("拖入本地文件或文件夹以上传"))
+                    }),
+            );
         } else {
-            content = content.child(div().flex_1().child(DataTable::new(&self.table).stripe(true)));
+            let files = self.delegate(cx).files.clone();
+            let mut scroll = file_browser::scroll("files-scroll");
+            match self.view_mode {
+                ViewMode::Grid => {
+                    let mut grid = div().flex().flex_wrap().gap(px(24.));
+                    for f in &files {
+                        grid = grid.child(self.render_card(f, &palette, cx));
+                    }
+                    scroll = scroll.child(grid);
+                }
+                ViewMode::List => {
+                    let mut rows = v_flex().gap(px(2.));
+                    rows = rows.child(file_browser::list_header(&palette));
+                    for f in &files {
+                        rows = rows.child(self.render_list_row(f, &palette, cx));
+                    }
+                    scroll = scroll.child(rows);
+                }
+            }
+            if has_more {
+                scroll = scroll.child(
+                    h_flex().justify_center().py(px(24.)).child(
+                        Button::new("files-load-more")
+                            .small()
+                            .label(if loading_more { "加载中…" } else { "加载更多" })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.table.update(cx, |state, cx| {
+                                    let dir = state.delegate().current_dir.clone();
+                                    if state.delegate().is_search {
+                                        state.delegate_mut().load_more_search(cx);
+                                    } else {
+                                        state.delegate_mut().load_files(&dir, true, cx);
+                                    }
+                                });
+                            })),
+                    ),
+                );
+            }
+            body = body.child(scroll);
         }
-        // 状态栏
-        let status = h_flex().justify_between().px_4().py_1p5().text_color(theme.muted_foreground).text_size(px(12.))
-            .child(h_flex().gap_2().child(format!("{item_count} 项")).when(sel_count > 0, |this| this.child(format!("· 已选择 {sel_count} 项"))))
-            .child(h_flex().gap_2().when(is_search, |this| this.child(format!("搜索结果: \"{keyword}\""))).child(dir.clone()));
-        content = content.child(status);
-        let _ = (loading_more, has_more);
-        content
+
+        if !pending && sel_count > 0 {
+            body = body.child(self.render_action_bar(sel_count, &palette, cx));
+        }
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 }

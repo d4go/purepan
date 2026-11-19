@@ -10,4 +10,3 @@ pub mod shares;
 pub mod share_sync;
 pub mod transfers;
 pub mod uploads;
-pub mod web_login;

@@ -237,7 +237,7 @@ impl Render for LocalFilePicker {
             .child(Button::new("fp-fwd").ghost().small().icon(IconName::ArrowRight).disabled(self.forward.is_empty()).on_click(cx.listener(|this, _, _, cx| this.go_forward(cx))))
             .child(Button::new("fp-up").ghost().small().icon(IconName::ArrowUp).disabled(self.parent_path.is_none()).on_click(cx.listener(|this, _, _, cx| this.go_up(cx))))
             .child(Button::new("fp-refresh").ghost().small().icon(IconName::RefreshCw).on_click(cx.listener(|this, _, _, cx| { let p = this.current_path.clone(); this.navigate(p, cx); })))
-            .child(div().flex_1().child(Input::new(&self.path_input).small()));
+            .child(div().flex_1().child(Input::new(&self.path_input).large()));
 
         // 列表
         let picker = cx.entity().downgrade();

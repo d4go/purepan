@@ -1,10 +1,11 @@
-//! 离线下载 API(移植 frontend/src/api/cloudDl.ts)。active-only 语义。
+//! 离线下载 API(进程内直调)。active-only 语义。
 
-use reqwest::Method;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use super::{ApiError, ApiClient};
+use purepan_backend::server::inproc;
+
+use super::{ApiClient, ApiError};
 
 pub use purepan_backend::netdisk::cloud_dl::CloudDlTaskInfo;
 
@@ -43,38 +44,28 @@ pub struct OperationResponse {
 }
 
 impl ApiClient {
-    /// POST /cloud-dl/tasks
     pub async fn cloud_dl_add(&self, req: &AddTaskRequest) -> Result<AddTaskResponse, ApiError> {
-        self.request(Method::POST, "/cloud-dl/tasks", Some(json!(req))).await
+        let body = json!(req);
+        self.request(move |s| inproc::cloud_dl::add(s, body)).await
     }
 
-    /// GET /cloud-dl/tasks
     pub async fn cloud_dl_list(&self) -> Result<TaskListResponse, ApiError> {
-        self.request(Method::GET, "/cloud-dl/tasks", None).await
+        self.request(inproc::cloud_dl::list).await
     }
 
-    /// GET /cloud-dl/tasks/:id
-    pub async fn cloud_dl_query(&self, task_id: u64) -> Result<CloudDlTaskInfo, ApiError> {
-        self.request(Method::GET, &format!("/cloud-dl/tasks/{task_id}"), None).await
-    }
-
-    /// POST /cloud-dl/tasks/:id/cancel
     pub async fn cloud_dl_cancel(&self, task_id: u64) -> Result<OperationResponse, ApiError> {
-        self.request(Method::POST, &format!("/cloud-dl/tasks/{task_id}/cancel"), Some(json!({}))).await
+        let task_id = task_id as i64;
+        self.request(move |s| inproc::cloud_dl::cancel(s, task_id))
+            .await
     }
 
-    /// DELETE /cloud-dl/tasks/:id
     pub async fn cloud_dl_delete(&self, task_id: u64) -> Result<OperationResponse, ApiError> {
-        self.request(Method::DELETE, &format!("/cloud-dl/tasks/{task_id}"), None).await
+        let task_id = task_id as i64;
+        self.request(move |s| inproc::cloud_dl::delete(s, task_id))
+            .await
     }
 
-    /// DELETE /cloud-dl/tasks/clear
     pub async fn cloud_dl_clear(&self) -> Result<ClearTasksResponse, ApiError> {
-        self.request(Method::DELETE, "/cloud-dl/tasks/clear", None).await
-    }
-
-    /// POST /cloud-dl/tasks/refresh
-    pub async fn cloud_dl_refresh(&self) -> Result<TaskListResponse, ApiError> {
-        self.request(Method::POST, "/cloud-dl/tasks/refresh", Some(json!({}))).await
+        self.request(inproc::cloud_dl::clear).await
     }
 }

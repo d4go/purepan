@@ -5,6 +5,7 @@ pub mod events;
 pub mod extractors;
 pub mod handlers;
 pub mod helpers;
+pub mod inproc;
 pub mod middleware;
 pub mod state;
 pub mod websocket;

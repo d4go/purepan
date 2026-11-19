@@ -46,10 +46,10 @@ pub enum ToastKind {
 pub enum UiEvent {
     WsConnection(ConnectionState),
     WsMessage(WsServerMessage),
-    /// 419 刷新失败:需要跳 Web 登录页
-    WebAuthExpired,
     /// 活跃账号变化(视图据此清空重取,对应 Vue 的 multi-account:active-changed)
     AccountChanged { new_uid: Option<u64> },
+    /// 视图请求切换主导航(如文件页头部跳转下载)
+    Navigate(crate::components::app_sidebar::Nav),
     /// 集中提示(后端断连/恢复等),由控制器弹 Notification
     Toast { kind: ToastKind, message: String },
     /// 显示/聚焦主窗口(托盘左键、二次启动)

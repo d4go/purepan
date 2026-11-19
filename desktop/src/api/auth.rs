@@ -1,69 +1,50 @@
-//! 百度账号认证 API(移植 frontend/src/api/auth.ts)。
+//! 百度账号认证 API(进程内直调)。
 
-use reqwest::Method;
-use serde_json::json;
+use purepan_backend::{netdisk::StorageQuota, server::inproc};
 
-use super::{ApiError, ApiClient};
+use super::{ApiClient, ApiError};
 use crate::api::dto::{QRCode, QRCodeStatus, UserAuth};
 
 impl ApiClient {
-    /// POST /auth/qrcode/generate
     pub async fn generate_qrcode(&self) -> Result<QRCode, ApiError> {
-        self.request(Method::POST, "/auth/qrcode/generate", Some(json!({})))
-            .await
+        self.request(inproc::auth::generate_qrcode).await
     }
 
-    /// GET /auth/qrcode/status?sign=&add=&first=
     pub async fn qrcode_status(
         &self,
         sign: &str,
         add_mode: bool,
         first_check: bool,
     ) -> Result<QRCodeStatus, ApiError> {
-        let mut path = format!("/auth/qrcode/status?sign={}", urlencoded(sign));
-        if add_mode {
-            path.push_str("&add=true");
-        }
-        if first_check {
-            path.push_str("&first=true");
-        }
-        self.request(Method::GET, &path, None).await
+        let sign = sign.to_string();
+        self.request(move |s| inproc::auth::qrcode_status(s, sign, add_mode, first_check))
+            .await
     }
 
-    /// GET /auth/user
     pub async fn current_user(&self) -> Result<UserAuth, ApiError> {
-        self.request(Method::GET, "/auth/user", None).await
+        self.request(inproc::auth::current_user).await
     }
 
-    /// POST /auth/cookie/login → (user, message)
+    pub async fn storage_quota(&self, uid: u64) -> Result<StorageQuota, ApiError> {
+        inproc::auth::storage_quota(self.state().await?, uid)
+            .await
+            .map_err(ApiError::from)
+    }
+
+    /// Cookie 登录 → (user, message)
     /// message 含"预热完成"以外内容时 UI 需警告提示。
     pub async fn cookie_login(&self, cookies: &str) -> Result<(UserAuth, String), ApiError> {
-        self.request_with_message(
-            Method::POST,
-            "/auth/cookie/login",
-            Some(json!({ "cookies": cookies })),
-        )
-        .await
+        let state = self.state().await?;
+        let (value, message) = inproc::auth::cookie_login(state, cookies.to_string())
+            .await
+            .map_err(ApiError::from)?;
+        let user = serde_json::from_value(value)
+            .map_err(|e| ApiError::Decode(e.to_string()))?;
+        Ok((user, message))
     }
 
-    /// POST /auth/logout
     pub async fn logout(&self) -> Result<(), ApiError> {
-        self.request::<serde_json::Value>(Method::POST, "/auth/logout", Some(json!({})))
-            .await?;
+        let _: serde_json::Value = self.request(inproc::auth::logout).await?;
         Ok(())
     }
-}
-
-fn urlencoded(s: &str) -> String {
-    // sign 为 URL 安全字符,但稳妥起见做百分号编码
-    let mut out = String::new();
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }

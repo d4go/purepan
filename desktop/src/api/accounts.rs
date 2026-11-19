@@ -1,35 +1,25 @@
-//! 多账号管理 API(移植 frontend/src/api/accounts.ts)。
-//! 注意:这些 handler 返回裸 JSON(不包信封),用 request_flex 兼容两种形态。
+//! 多账号管理 API(进程内直调)。
 
-use reqwest::Method;
-use serde_json::json;
+use purepan_backend::server::inproc;
 
-use super::{ApiError, ApiClient};
+use super::{ApiClient, ApiError};
 use crate::api::dto::{DeleteAccountResponse, ListAccountsResponse, SwitchAccountResponse};
 
 impl ApiClient {
-    /// GET /accounts/list
     pub async fn list_accounts(&self) -> Result<ListAccountsResponse, ApiError> {
-        self.request_flex(Method::GET, "/accounts/list", None).await
+        self.request(inproc::accounts::list).await
     }
 
-    /// POST /accounts/switch
     pub async fn switch_account(&self, uid: u64) -> Result<SwitchAccountResponse, ApiError> {
-        self.request_flex(Method::POST, "/accounts/switch", Some(json!({ "uid": uid })))
-            .await
+        self.request(move |s| inproc::accounts::switch(s, uid)).await
     }
 
-    /// DELETE /accounts/:uid?force=true
     pub async fn delete_account(
         &self,
         uid: u64,
         force: bool,
     ) -> Result<DeleteAccountResponse, ApiError> {
-        self.request_flex(
-            Method::DELETE,
-            &format!("/accounts/{uid}?force={force}"),
-            None,
-        )
-        .await
+        self.request(move |s| inproc::accounts::delete(s, uid, force))
+            .await
     }
 }

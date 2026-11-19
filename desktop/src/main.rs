@@ -5,6 +5,7 @@ mod app;
 mod backend_embed;
 mod bridge;
 mod components;
+mod design;
 mod shell;
 mod state;
 mod theme;
@@ -13,13 +14,13 @@ mod views;
 mod ws;
 
 use gpui_kit::AppContext as _;
-use state::{AuthStore, BackendHealth, TaskCache, WebAuthState};
+use state::{AuthStore, BackendHealth, TaskCache, UiPrefs};
 
 fn main() {
-    // 日志由内嵌后端统一初始化(tracing-appender → logs/),桌面端不再单独设置
+    // 日志由进程内后端统一初始化(tracing-appender → logs/),桌面端不再单独设置
     // 全局 subscriber,避免与后端 init_logging 冲突。
 
-    // 后端所有数据路径都相对 CWD,必须先切换数据目录再启动内嵌服务器
+    // 后端所有数据路径都相对 CWD,必须先切换数据目录再启动内嵌后端
     let data_dir = shell::data_dir::init();
     eprintln!("PurePan 数据目录: {}", data_dir.display());
 
@@ -44,9 +45,9 @@ fn main() {
             theme::init(cx);
             cx.set_global(backend);
             cx.set_global(AuthStore::default());
-            cx.set_global(WebAuthState::default());
             cx.set_global(BackendHealth::default());
             cx.set_global(TaskCache::default());
+            cx.set_global(UiPrefs::default());
 
             let controller = cx.new(|cx| app::AppController::new(cx, ui_rx));
             app::open_initial(cx, controller);

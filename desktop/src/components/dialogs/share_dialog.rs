@@ -105,7 +105,7 @@ impl Render for ShareDialog {
                     .selected_index(Some(self.period))
                     .on_change(cx.listener(|this, idx, _, cx| { this.period = *idx; cx.notify(); })),
             ))
-            .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&self.pwd))
+            .child(h_flex().gap_2().items_center().child("提取码").child(Input::new(&self.pwd).large())
                 .child(Button::new("sh-random").small().label("随机").on_click(cx.listener(|this, _, window, cx| this.random_pwd(window, cx)))))
             .child(h_flex().gap_2().justify_end()
                 .child(Button::new("sh-cancel").label("取消").on_click(|_, w, cx| w.close_dialog(cx)))

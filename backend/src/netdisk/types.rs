@@ -2,6 +2,13 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 网盘空间配额，单位为字节。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StorageQuota {
+    pub total: u64,
+    pub used: u64,
+}
+
 /// 文件信息
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileItem {

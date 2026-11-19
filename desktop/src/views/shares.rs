@@ -1,25 +1,38 @@
-//! 分享管理页(移植 SharesView.vue):分享列表,查看提取码/复制/取消。
+//! 分享管理页(分享设置):总览头部 + 三段式分享卡片(分享图标、状态胶囊、
+//! 链接与浏览数据、操作),查看提取码 / 复制链接 / 取消分享。
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::scroll::ScrollableElement as _;
-use gpui_kit::component::tag::Tag;
-use gpui_kit::component::{ActiveTheme as _, Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
-use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::component::{Icon, Sizable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::{
-    AnyWindowHandle, App, AppContext as _, ClipboardItem, Context, Entity, IntoElement,
-    ParentElement as _, Render, Styled as _, Subscription, Window, div, px,
+    AnyElement, AnyWindowHandle, ClipboardItem, Context, Entity,
+    InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _, Subscription,
+    Window, div, px, rgb,
 };
 
 use crate::api::share::ShareRecordData;
 use crate::api::{self};
 use crate::bridge::{EventHub, ToastKind, UiEvent};
+use crate::components::app_sidebar::Nav;
+use crate::components::task_ui::{circle_button, empty_state, sep_dot, soft_pill, task_card};
 use crate::components::toast;
+use crate::design::{self, Palette};
 use crate::state::Backend;
-use crate::util;
+
+/// 有效期标签:永久 / 到期日期。
+fn format_expiry(expired_type: i32, expired_time: i64) -> String {
+    if expired_type == 0 {
+        return "永久有效".into();
+    }
+    chrono::DateTime::from_timestamp(expired_time, 0)
+        .map(|dt| format!("有效期 {}", dt.with_timezone(&chrono::Local).format("%Y/%m/%d")))
+        .unwrap_or_else(|| "限时".into())
+}
 
 pub struct SharesView {
+    hub: Entity<EventHub>,
     shares: Vec<ShareRecordData>,
     page: u32,
     total: u32,
@@ -33,7 +46,7 @@ impl SharesView {
         let sub = cx.subscribe(&hub, |this, _, ev, cx| {
             if matches!(ev, UiEvent::AccountChanged { .. }) { this.refresh(cx); }
         });
-        let mut v = Self { shares: Vec::new(), page: 1, total: 0, loading: false, window_handle: window.window_handle(), _subscriptions: vec![sub] };
+        let mut v = Self { hub, shares: Vec::new(), page: 1, total: 0, loading: false, window_handle: window.window_handle(), _subscriptions: vec![sub] };
         v.refresh(cx);
         v
     }
@@ -115,43 +128,156 @@ impl SharesView {
             }
         }).detach();
     }
+
+    fn render_row(&self, s: &ShareRecordData, p: &Palette, cx: &mut Context<Self>) -> AnyElement {
+        let id = s.share_id;
+        let link = s.shortlink.clone();
+        let path = s.typical_path.clone();
+        let expired = s.expired_type;
+        let status = s.status;
+
+        let tile = div()
+            .size(px(44.))
+            .rounded(px(12.))
+            .bg(p.primary_soft)
+            .flex()
+            .items_center()
+            .justify_center()
+            .flex_shrink_0()
+            .child(Icon::new(IconName::Share2).size(px(20.)).text_color(p.primary))
+            .into_any_element();
+
+        let mut title = h_flex().gap(px(8.)).items_center().min_w_0().overflow_hidden();
+        title = title.child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_size(px(14.))
+                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                .child(path),
+        );
+        title = title.child(if status == 0 {
+            soft_pill(
+                "正常",
+                if p.is_dark { p.primary.alpha(0.16) } else { rgb(0xD1FAE5).into() },
+                if p.is_dark { rgb(0x34D399).into() } else { rgb(0x059669).into() },
+            )
+        } else {
+            soft_pill("已失效", if p.is_dark { p.danger.alpha(0.16) } else { rgb(0xFEE2E2).into() }, p.danger)
+        });
+        title = title.child(soft_pill(
+            format_expiry(expired, s.expired_time),
+            p.selected_bg,
+            p.muted,
+        ));
+
+        let mut mid = v_flex().flex_1().min_w_0().gap(px(6.)).overflow_hidden().child(title);
+
+        let mut meta = h_flex()
+            .gap(px(6.))
+            .items_center()
+            .min_w_0()
+            .overflow_hidden()
+            .text_size(px(12.))
+            .text_color(p.faint);
+        meta = meta.child(div().truncate().child(link.clone()));
+        meta = meta.child(sep_dot(p));
+        meta = meta.child(format!("{} 次浏览", s.view_count));
+        mid = mid.child(meta);
+
+        let mut actions = h_flex().gap(px(2.)).items_center().flex_shrink_0();
+        let call = |key: &str| gpui_kit::SharedString::from(format!("{key}:{id}"));
+        actions = actions.child(circle_button(p, call("sh-pwd"), IconName::KeyRound, move |this, _, cx| {
+            this.show_detail(id, cx)
+        }, cx));
+        let link_copy = link.clone();
+        actions = actions.child(circle_button(p, call("sh-copy"), IconName::Copy, move |this, window, cx| {
+            this.copy(link_copy.clone(), window, cx)
+        }, cx));
+        actions = actions.child(circle_button(p, call("sh-cancel"), IconName::Trash, move |this, _, cx| {
+            this.cancel(id, cx)
+        }, cx));
+
+        task_card(p, tile, mid.into_any_element(), actions.into_any_element())
+    }
 }
 
 impl Render for SharesView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let toolbar = h_flex().gap_2().items_center().px_4().py_1p5()
-            .child(div().flex_1().text_color(theme.muted_foreground).child(format!("{} 个分享", self.total)))
-            .child(Button::new("sh-refresh").small().icon(IconName::RefreshCw).label("刷新").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))));
+        let p = design::palette(cx);
+        let count = if self.total > 0 { self.total } else { self.shares.len() as u32 };
 
-        let mut list = v_flex().gap_2().p_3().overflow_y_scrollbar();
-        if self.shares.is_empty() {
-            list = list.child(div().py_12().rounded_lg().bg(theme.secondary).text_center().text_color(theme.muted_foreground).child(if self.loading { "加载中..." } else { "暂无分享" }));
-        }
-        for s in &self.shares {
-            let id = s.share_id;
-            let link = s.shortlink.clone();
-            let path = s.typical_path.clone();
-            let views = s.view_count;
-            let expired = s.expired_type;
-            let status = s.status;
-            let id_detail = id;
-            let id_cancel = id;
-            let link_copy = link.clone();
-            list = list.child(
-                h_flex().gap_2().items_center().px_3().py_2().rounded_lg().bg(theme.secondary)
-                    .child(Icon::new(IconName::Share2).size(px(18.)).text_color(theme.primary))
-                    .child(v_flex().flex_1().gap_0p5()
-                        .child(div().truncate().child(path))
-                        .child(div().text_color(theme.muted_foreground).truncate().child(link)))
-                    .child(div().text_color(theme.muted_foreground).child(format!("{views} 次浏览")))
-                    .child(Tag::new().small().child(if status == 0 { "正常" } else { "失效" }))
-                    .child(div().text_color(theme.muted_foreground).child(if expired == 0 { "永久".to_string() } else { util::format_timestamp(s.expired_time) }))
-                    .child(Button::new(format!("sh-pwd-{id}")).ghost().small().icon(IconName::KeyRound).on_click(cx.listener(move |this, _, _, cx| this.show_detail(id_detail, cx))))
-                    .child(Button::new(format!("sh-copy-{id}")).ghost().small().icon(IconName::Copy).on_click(cx.listener(move |this, _, window, cx| this.copy(link_copy.clone(), window, cx))))
-                    .child(Button::new(format!("sh-cancel-{id}")).ghost().small().icon(IconName::Trash).on_click(cx.listener(move |this, _, _, cx| this.cancel(id_cancel, cx)))),
-            );
-        }
-        v_flex().flex_1().overflow_hidden().child(toolbar).child(div().flex_1().child(list))
+        let status_pill = if count > 0 {
+            soft_pill(format!("{count} 个分享"), p.primary_soft, p.primary)
+        } else {
+            soft_pill("暂无分享", p.selected_bg, p.muted)
+        };
+
+        let header = h_flex()
+            .h(px(68.))
+            .px(px(32.))
+            .gap(px(12.))
+            .items_center()
+            .flex_shrink_0()
+            .child(div().text_size(px(18.)).font_weight(gpui_kit::FontWeight::SEMIBOLD).child("分享管理"))
+            .child(status_pill)
+            .child(div().flex_1())
+            .child(
+                h_flex()
+                    .gap(px(6.))
+                    .items_center()
+                    .child(
+                        Button::new("sh-refresh")
+                            .ghost()
+                            .small()
+                            .icon(IconName::RefreshCw)
+                            .label("刷新")
+                            .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                    ),
+            )
+            .into_any_element();
+
+        let body: AnyElement = if self.shares.is_empty() {
+            let loading = self.loading;
+            let hub = self.hub.clone();
+            empty_state(
+                &p,
+                IconName::Share2,
+                if loading { "正在加载分享…" } else { "暂无分享" },
+                if loading { "请稍候" } else { "在文件页选择文件后即可创建分享链接" },
+                (!loading).then(|| {
+                    Button::new("sh-goto-files")
+                        .small()
+                        .icon(IconName::Folder)
+                        .label("去文件页")
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            hub.update(cx, |_, cx| cx.emit(UiEvent::Navigate(Nav::Files)));
+                        }))
+                        .into_any_element()
+                }),
+            )
+        } else {
+            let mut list = v_flex()
+                .id("sh-scroll")
+                .flex_1()
+                .min_h_0()
+                .gap(px(10.))
+                .px(px(32.))
+                .py(px(16.))
+                .overflow_y_scrollbar();
+            for s in &self.shares {
+                list = list.child(self.render_row(s, &p, cx));
+            }
+            list.into_any_element()
+        };
+
+        v_flex()
+            .flex_1()
+            .h_full()
+            .min_w_0()
+            .overflow_hidden()
+            .child(header)
+            .child(body)
     }
 }

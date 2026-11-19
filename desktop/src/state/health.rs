@@ -1,6 +1,6 @@
 use gpui_kit::Global;
 
-/// 后端连通状态(由健康检查轮询维护)。
+/// 后端就绪状态(启动引导维护)。
 #[derive(Default)]
 pub struct BackendHealth {
     pub connected: bool,

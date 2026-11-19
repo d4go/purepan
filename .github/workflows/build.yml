@@ -17,40 +17,46 @@ jobs:
   build:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 90
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
           - name: Windows x64
             runner: windows-latest
-            release_platform: windows
+            platform: windows
+            arch: x64
             rust-target: x86_64-pc-windows-msvc
-            artifact: purepan.exe
           - name: Linux x64
             runner: ubuntu-22.04
-            release_platform: linux
+            platform: linux
+            arch: x64
             rust-target: x86_64-unknown-linux-gnu
-            artifact: purepan
           - name: Linux ARM64
             runner: ubuntu-24.04-arm
-            release_platform: linux
+            platform: linux
+            arch: arm64
             rust-target: aarch64-unknown-linux-gnu
-            artifact: purepan
           - name: macOS Apple Silicon
             runner: macos-latest
-            release_platform: mac
+            platform: macos
+            arch: arm64
             rust-target: aarch64-apple-darwin
-            artifact: purepan
           - name: macOS Intel
             runner: macos-latest
-            release_platform: mac
+            platform: macos
+            arch: x64
             rust-target: x86_64-apple-darwin
-            artifact: purepan
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Read app version
+        shell: bash
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' desktop/Cargo.toml | head -n1)
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
       - name: Install Linux system dependencies (GPUI)
         if: runner.os == 'Linux'
@@ -77,28 +83,118 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          key: ${{ matrix.rust-target }}
 
       - name: Build PurePan desktop
         shell: bash
         run: cargo build --release --locked -p purepan-desktop --target ${{ matrix.rust-target }}
 
-      - name: Stage artifact
+      # ---------- Windows: NSIS 安装包(含图标/开始菜单/卸载) ----------
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
         shell: bash
         run: |
+          set -euo pipefail
+          MAKENSIS="/c/Program Files (x86)/NSIS/makensis.exe"
+          if [ ! -f "$MAKENSIS" ]; then
+            choco install nsis -y --no-progress
+          fi
           mkdir -p dist
-          cp "target/${{ matrix.rust-target }}/release/${{ matrix.artifact }}" "dist/PurePan-${{ matrix.release_platform }}-${{ matrix.rust-target }}${{ runner.os == 'Windows' && '.exe' || '' }}"
+          EXE_WIN=$(cygpath -w "target/${{ matrix.rust-target }}/release/purepan.exe")
+          OUT_WIN=$(cygpath -w "dist/PurePan-${VERSION}-windows-${{ matrix.arch }}-setup.exe")
+          ICON_WIN=$(cygpath -w "desktop/assets/icons/icon.ico")
+          NSI_WIN=$(cygpath -w "packaging/windows/installer.nsi")
+          "$MAKENSIS" /V2 "/DVERSION=$VERSION" "/DSOURCE_EXE=$EXE_WIN" "/DICON_FILE=$ICON_WIN" "/DOUT_FILE=$OUT_WIN" "$NSI_WIN"
+          ls -l dist
+
+      # ---------- macOS: .app 包(icns 从内置图标生成) ----------
+      - name: Build macOS app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          APP="dist/PurePan.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp "target/${{ matrix.rust-target }}/release/purepan" "$APP/Contents/MacOS/PurePan"
+          chmod +x "$APP/Contents/MacOS/PurePan"
+
+          ICONSET="dist/PurePan.iconset"
+          rm -rf "$ICONSET" && mkdir -p "$ICONSET"
+          SRC="desktop/assets/icons/icon.png"
+          for size in 16 32 128 256 512; do
+            sips -z "$size" "$size" "$SRC" --out "$ICONSET/icon_${size}x${size}.png" >/dev/null
+          done
+          sips -z 32 32 "$SRC" --out "$ICONSET/icon_16x16@2x.png" >/dev/null
+          sips -z 64 64 "$SRC" --out "$ICONSET/icon_32x32@2x.png" >/dev/null
+          sips -z 256 256 "$SRC" --out "$ICONSET/icon_128x128@2x.png" >/dev/null
+          sips -z 512 512 "$SRC" --out "$ICONSET/icon_256x256@2x.png" >/dev/null
+          sips -z 1024 1024 "$SRC" --out "$ICONSET/icon_512x512@2x.png" >/dev/null
+          iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/PurePan.icns"
+          rm -rf "$ICONSET"
+
+          sed "s/__VERSION__/${VERSION}/g" packaging/macos/Info.plist > "$APP/Contents/Info.plist"
+          codesign --force --deep --sign - "$APP" || true
+
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "dist/PurePan-${VERSION}-macos-${{ matrix.arch }}.zip"
+          ls -l dist
+
+      # ---------- Linux: 归档(含 desktop 文件与图标) ----------
+      - name: Package Linux archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          PKG="dist/PurePan"
+          rm -rf "$PKG"
+          mkdir -p "$PKG/usr/bin" "$PKG/usr/share/applications" "$PKG/usr/share/icons/hicolor/256x256/apps"
+          cp "target/${{ matrix.rust-target }}/release/purepan" "$PKG/usr/bin/purepan"
+          chmod +x "$PKG/usr/bin/purepan"
+          cp desktop/assets/icons/256x256.png "$PKG/usr/share/icons/hicolor/256x256/apps/purepan.png"
+          cp packaging/linux/purepan.desktop "$PKG/usr/share/applications/purepan.desktop"
+          tar -czf "dist/PurePan-${VERSION}-linux-${{ matrix.arch }}.tar.gz" -C "$PKG" .
+          ls -l dist
 
       - name: Upload workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PurePan-${{ matrix.release_platform }}-${{ matrix.rust-target }}
-          path: dist/*
+          name: PurePan-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/*.tar.gz
+          if-no-files-found: error
 
-      - name: Upload release asset
-        if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: PurePan-*
+          merge-multiple: true
+          path: dist
+
+      - name: Prepare release notes from tag annotation
+        shell: bash
+        run: |
+          git fetch --tags --force origin "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}"
+          git tag -l --format='%(contents)' "${GITHUB_REF_NAME}" > release-body.md
+          cat release-body.md
+
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          draft: true
+          name: PurePan ${{ github.ref_name }}
+          body_path: release-body.md
+          draft: false
           files: dist/*
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

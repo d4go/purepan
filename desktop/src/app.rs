@@ -1,37 +1,38 @@
 //! 应用控制器(常驻,跨窗口重建存活)+ 每窗口 UI 壳 AppShell。
 //!
-//! 控制器持有:屏幕状态机、导航、事件泵(WS→Global/视图)、健康轮询、
-//! 令牌主动刷新、启动引导。窗口在 登录(400×600)↔ 主界面(1280×860)
-//! 切换时重建(Global 状态存活),对齐 Vue 的 windowManager 行为。
+//! 控制器持有:屏幕状态机、导航、事件泵(进程内事件→Global/视图)、启动引导。
+//! 窗口在 登录(400×600)↔ 主界面(1280×860) 切换时重建(Global 状态存活)。
 
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::status_bar::StatusBar;
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, TitleBar, WindowExt as _, h_flex};
+use gpui_kit::component::{Sizable as _, TitleBar, WindowExt as _};
 use gpui_kit::{
     AnyView, AnyWindowHandle, App, AppContext as _, BorrowAppContext as _, Bounds, Context, Entity,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window, WindowBounds,
-    WindowOptions, div, px, size,
+    ExternalPaths, InteractiveElement as _, IntoElement, ParentElement as _, Render, Styled as _,
+    Subscription, Task, Window, WindowBounds, WindowOptions, div, px, size,
 };
 use purepan_backend::server::events::TaskEvent;
 use purepan_backend::server::websocket::WsServerMessage;
 
 use crate::api::{self, ApiClient};
+use crate::backend_embed::BackendStatus;
 use crate::bridge::{ConnectionState, EventHub, ToastKind, UiEvent};
 use crate::components::dialogs::transfer_dialog::TransferDialog;
-use crate::components::{app_sidebar, app_sidebar::Nav, app_title_bar, toast};
-use crate::state::{AuthStore, Backend, BackendHealth, WebAuthState};
-use crate::views::{login::LoginView, placeholder::Placeholder, web_login::WebLoginView};
+use crate::components::app_sidebar::{self, Nav, StorageStatus};
+use crate::components::{app_title_bar, toast};
+use crate::design;
+use crate::state::{AuthStore, Backend, BackendHealth};
+use crate::views::files::{FilesView, queue_upload_paths};
+use crate::views::{login::LoginView, placeholder::Placeholder};
 use crate::{bridge, shell};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
     Boot,
-    WebLogin,
     Login,
     Main,
 }
@@ -45,14 +46,15 @@ pub struct AppController {
     pub hub: Entity<EventHub>,
     rt: tokio::runtime::Handle,
     api: Arc<ApiClient>,
-    http: reqwest::Client,
-    health_url: String,
+    status: tokio::sync::watch::Receiver<BackendStatus>,
     ws: crate::ws::WsHandle,
     booted: bool,
     last_active_uid: Option<u64>,
+    storage_uid: Option<u64>,
+    storage: StorageStatus,
+    storage_task: Option<Task<()>>,
+    _storage_account_subscription: Subscription,
     _pump: Task<()>,
-    _health: Task<()>,
-    _refresh: Task<()>,
     _clipboard: Task<()>,
 }
 
@@ -61,65 +63,15 @@ impl AppController {
         let b = cx.global::<Backend>();
         let rt = b.rt.clone();
         let api = b.api.clone();
-        let http = b.http.clone();
+        let status = b.status.clone();
         let ws = b.ws.clone();
-        let health_url = format!("{}/health", b.base_url);
         let hub = cx.new(|_| EventHub);
 
-        // 事件泵:WS/ApiClient → Global 状态 + 广播给视图
+        // 事件泵:进程内事件 → Global 状态 + 广播给视图
         let pump = cx.spawn(async move |this, cx| {
             while let Ok(ev) = ui_rx.recv().await {
                 if this.update(cx, |this, cx| this.handle_event(ev, cx)).is_err() {
                     break;
-                }
-            }
-        });
-
-        // 健康轮询(2s),断连/恢复各提示一次(启动完成后才提示)
-        let health = cx.spawn({
-            let (rt, http, url) = (rt.clone(), http.clone(), health_url.clone());
-            async move |this, cx| {
-                loop {
-                    let (client, u) = (http.clone(), url.clone());
-                    let ok = bridge::call(&rt, move || async move {
-                        client
-                            .get(&u)
-                            .timeout(Duration::from_secs(2))
-                            .send()
-                            .await
-                            .map(|r| r.status().is_success())
-                            .unwrap_or(false)
-                    })
-                    .await
-                    .unwrap_or(false);
-                    let _ = this.update(cx, |this, cx| {
-                        let was = cx.global::<BackendHealth>().connected;
-                        cx.update_global::<BackendHealth, _>(|h, _| h.connected = ok);
-                        if this.booted {
-                            if was && !ok {
-                                this.toast(cx, ToastKind::Error, "无法连接后端服务,正在尝试重连…");
-                            } else if !was && ok {
-                                this.toast(cx, ToastKind::Success, "后端服务已恢复连接");
-                            }
-                        }
-                        cx.notify();
-                    });
-                    cx.background_executor().timer(Duration::from_secs(2)).await;
-                }
-            }
-        });
-
-        // 令牌主动刷新(过期前 5 分钟,30s 检查一次)
-        let refresh = cx.spawn({
-            let (rt, api) = (rt.clone(), api.clone());
-            async move |_this, cx| {
-                loop {
-                    cx.background_executor().timer(Duration::from_secs(30)).await;
-                    let api2 = api.clone();
-                    let _ = bridge::call(&rt, move || async move {
-                        api2.refresh_if_expiring().await;
-                    })
-                    .await;
                 }
             }
         });
@@ -170,6 +122,7 @@ impl AppController {
                 }
             }
         });
+        let storage_account_subscription = cx.observe_global::<AuthStore>(Self::sync_storage_account);
 
         Self {
             screen: Screen::Boot,
@@ -180,76 +133,103 @@ impl AppController {
             hub,
             rt,
             api,
-            http,
-            health_url,
+            status,
             ws,
             booted: false,
             last_active_uid: None,
+            storage_uid: None,
+            storage: StorageStatus::Unavailable,
+            storage_task: None,
+            _storage_account_subscription: storage_account_subscription,
             _pump: pump,
-            _health: health,
-            _refresh: refresh,
             _clipboard: clipboard,
         }
     }
 
-    /// 开窗前同步探测登录态(内嵌后端通常 <1s,最多等 5s),
-    /// 保证第一帧窗口就是正确尺寸,不会出现大框闪一下再变登录框。
+    fn sync_storage_account(&mut self, cx: &mut Context<Self>) {
+        let uid = cx.global::<AuthStore>().signed_in_uid();
+        if uid == self.storage_uid {
+            return;
+        }
+        self.storage_uid = uid;
+        self.storage = if uid.is_some() {
+            StorageStatus::Loading
+        } else {
+            StorageStatus::Unavailable
+        };
+        self.storage_task = uid.map(|uid| {
+            let (rt, api) = (self.rt.clone(), self.api.clone());
+            cx.spawn(async move |this, cx| {
+                // 登录后后台预热可能因百度会话尚未生效而失败，后端会在容量接口
+                // 内按需补预热；这里多留几次短间隔重试，让空间尽早显示出来。
+                let mut startup_retries = Some([2, 4, 8, 15].into_iter());
+                loop {
+                    let api = api.clone();
+                    let result =
+                        api::call_api(&rt, move || async move { api.storage_quota(uid).await })
+                            .await;
+                    let (status, delay) = match result {
+                        Ok(quota) => {
+                            startup_retries = None;
+                            (StorageStatus::Ready(quota), 60)
+                        }
+                        Err(_) => match startup_retries.as_mut().and_then(Iterator::next) {
+                            Some(delay) => (StorageStatus::Loading, delay),
+                            None => (StorageStatus::Unavailable, 30),
+                        },
+                    };
+                    let active = this
+                        .update(cx, |this, cx| {
+                            if cx.global::<AuthStore>().signed_in_uid() != Some(uid) {
+                                return false;
+                            }
+                            if this.storage != status {
+                                this.storage = status;
+                                cx.notify();
+                            }
+                            true
+                        })
+                        .unwrap_or(false);
+                    if !active {
+                        break;
+                    }
+                    cx.background_executor()
+                        .timer(Duration::from_secs(delay))
+                        .await;
+                }
+            })
+        });
+        cx.notify();
+    }
+
+    /// 开窗前同步探测登录态与主题配置(内嵌后端通常 <1s,最多等 5s),
+    /// 保证第一帧窗口就是正确尺寸与配色,不会出现大框闪一下再变登录框。
     fn probe_boot(&mut self, cx: &mut Context<Self>) -> Screen {
-        let rt = self.rt.clone();
-        let http = self.http.clone();
-        let url = self.health_url.clone();
+        let mut status = self.status.clone();
         let api = self.api.clone();
 
-        let (tokens, status, accounts, user) = rt.block_on(async move {
-            let start = Instant::now();
-            let mut delay = Duration::from_millis(100);
-            let healthy = loop {
-                let ok = http
-                    .get(&url)
-                    .timeout(Duration::from_secs(1))
-                    .send()
-                    .await
-                    .map(|r| r.status().is_success())
-                    .unwrap_or(false);
-                if ok {
-                    break true;
-                }
-                if start.elapsed() > Duration::from_secs(5) {
-                    break false;
-                }
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(1));
-            };
-            if !healthy {
-                return (None, None, None, None);
+        let (ready, accounts, user, theme_setting) = self.rt.block_on(async move {
+            let ready = tokio::time::timeout(Duration::from_secs(5), wait_ready(&mut status))
+                .await
+                .unwrap_or(false);
+            if !ready {
+                return (false, None, None, None);
             }
-            let tokens = api.tokens_snapshot().await;
-            let status = api.web_status().await.ok();
             let accounts = api.list_accounts().await.ok();
             let user = if accounts.is_none() {
                 api.current_user().await.ok()
             } else {
                 None
             };
-            (Some(tokens), status, accounts, user)
+            let theme_setting = api.get_config().await.ok().map(|c| c.ui.theme);
+            (true, accounts, user, theme_setting)
         });
 
-        let now = chrono::Utc::now().timestamp();
-        let token_valid = tokens
-            .as_ref()
-            .map(|t| {
-                t.access_token.is_some()
-                    && t.access_expires_at.map(|e| e > now).unwrap_or(false)
-            })
-            .unwrap_or(false);
-        cx.update_global::<WebAuthState, _>(|s, _| {
-            if let Some(status) = &status {
-                s.auth_config = Some(status.clone());
-                s.is_authenticated = !status.enabled || token_valid;
-            } else if token_valid {
-                s.is_authenticated = true;
-            }
-        });
+        if let Some(setting) = theme_setting {
+            crate::theme::apply_setting(setting, cx);
+        }
+
+        cx.update_global::<BackendHealth, _>(|h, _| h.connected = ready);
         match accounts {
             Some(resp) => {
                 cx.update_global::<AuthStore, _>(|s, _| {
@@ -265,10 +245,7 @@ impl AppController {
             }
         }
 
-        let web = cx.global::<WebAuthState>();
-        let screen = if web.is_auth_enabled() && !web.is_authenticated {
-            Screen::WebLogin
-        } else if !cx.global::<AuthStore>().is_logged_in() {
+        let screen = if !cx.global::<AuthStore>().is_logged_in() {
             Screen::Login
         } else {
             Screen::Main
@@ -281,56 +258,28 @@ impl AppController {
 
     /// 启动引导任务:窗口已按探测定好的屏幕打开,这里继续等待后端就绪并校准状态。
     fn spawn_boot(&mut self, cx: &mut Context<Self>) {
-        let (rt, api, http, url) = (
-            self.rt.clone(),
-            self.api.clone(),
-            self.http.clone(),
-            self.health_url.clone(),
-        );
+        let (rt, api, mut status) = (self.rt.clone(), self.api.clone(), self.status.clone());
         cx.spawn(async move |this, cx| {
-            // 1. 等待后端就绪(最多 30s,100ms→1s 退避)
-            let start = Instant::now();
-            let mut delay = Duration::from_millis(100);
-            loop {
-                let (client, u) = (http.clone(), url.clone());
-                let ok = bridge::call(&rt, move || async move {
-                    client
-                        .get(&u)
-                        .timeout(Duration::from_secs(2))
-                        .send()
-                        .await
-                        .map(|r| r.status().is_success())
-                        .unwrap_or(false)
-                })
-                .await
-                .unwrap_or(false);
-                if ok || start.elapsed() > Duration::from_secs(30) {
-                    break;
-                }
-                cx.background_executor().timer(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(1));
+            // 1. 等待后端就绪(最多 30s)
+            let ready = bridge::call(&rt, move || async move {
+                tokio::time::timeout(Duration::from_secs(30), wait_ready(&mut status))
+                    .await
+                    .unwrap_or(false)
+            })
+            .await
+            .unwrap_or(false);
+
+            if !ready {
+                let _ = this.update(cx, |this, cx| {
+                    cx.update_global::<BackendHealth, _>(|h, _| h.connected = false);
+                    this.booted = true;
+                    this.toast(cx, ToastKind::Error, "后端初始化失败或超时,请查看日志");
+                    this.transition(Screen::Login, cx);
+                });
+                return;
             }
 
-            // 2. 本地令牌 → 初始 Web 认证态
-            let tokens = bridge::call(&rt, {
-                let api = api.clone();
-                move || async move { api.tokens_snapshot().await }
-            })
-            .await
-            .unwrap_or_default();
-            let now = chrono::Utc::now().timestamp();
-            let token_valid = tokens
-                .access_token
-                .is_some()
-                && tokens.access_expires_at.map(|e| e > now).unwrap_or(false);
-
-            // 3. Web 认证状态 + 百度账号(并行语义,顺序调用即可)
-            let status = api::call_api(&rt, {
-                let api = api.clone();
-                move || async move { api.web_status().await }
-            })
-            .await
-            .ok();
+            // 2. 百度账号
             let accounts = api::call_api(&rt, {
                 let api = api.clone();
                 move || async move { api.list_accounts().await }
@@ -347,15 +296,20 @@ impl AppController {
                 None
             };
 
+            // 3. 主题配置(探测阶段后端未就绪时,这里兜底校准一次)
+            let theme_setting = api::call_api(&rt, {
+                let api = api.clone();
+                move || async move { api.get_config().await }
+            })
+            .await
+            .ok()
+            .map(|c| c.ui.theme);
+
             let plan = this.update(cx, |this, cx| {
-                cx.update_global::<WebAuthState, _>(|s, _| {
-                    if let Some(status) = status {
-                        s.auth_config = Some(status.clone());
-                        s.is_authenticated = !status.enabled || token_valid;
-                    } else if token_valid {
-                        s.is_authenticated = true;
-                    }
-                });
+                cx.update_global::<BackendHealth, _>(|h, _| h.connected = true);
+                if let Some(setting) = theme_setting {
+                    crate::theme::apply_setting(setting, cx);
+                }
                 match accounts {
                     Ok(resp) => cx.update_global::<AuthStore, _>(|s, _| {
                         s.accounts = resp.accounts;
@@ -371,13 +325,10 @@ impl AppController {
                 this.booted = true;
                 this.last_active_uid = cx.global::<AuthStore>().active_uid;
 
-                let web = cx.global::<WebAuthState>();
-                let screen = if web.is_auth_enabled() && !web.is_authenticated {
-                    Screen::WebLogin
-                } else if !cx.global::<AuthStore>().is_logged_in() {
-                    Screen::Login
-                } else {
+                let screen = if cx.global::<AuthStore>().is_logged_in() {
                     Screen::Main
+                } else {
+                    Screen::Login
                 };
                 if this.window.is_some() {
                     this.transition(screen, cx);
@@ -429,15 +380,8 @@ impl AppController {
                 }
                 self.hub.update(cx, |_, cx| cx.emit(UiEvent::WsMessage(msg)));
             }
-            UiEvent::WebAuthExpired => {
-                cx.update_global::<WebAuthState, _>(|s, _| {
-                    s.is_authenticated = false;
-                    s.reset_login_flow();
-                });
-                self.toast(cx, ToastKind::Error, "Web 认证令牌已过期,请重新登录");
-                self.transition(Screen::WebLogin, cx);
-            }
             UiEvent::AccountChanged { .. } => {}
+            UiEvent::Navigate(_) => {}
             UiEvent::Toast { kind, message } => self.toast(cx, kind, message),
             UiEvent::ActivateWindow => {
                 if let Some(handle) = self.window {
@@ -497,9 +441,8 @@ impl AppController {
             cx.notify();
             return;
         }
-        // 400×600 的屏幕之间(启动占位/登录/Web 登录)复用窗口,避免无谓闪烁
-        let same_size = matches!(old_screen, Screen::Boot | Screen::Login | Screen::WebLogin)
-            && matches!(screen, Screen::Login | Screen::WebLogin);
+        // 400×600 的屏幕之间(启动占位/登录)复用窗口,避免无谓闪烁
+        let same_size = old_screen == Screen::Boot && screen == Screen::Login;
         if same_size {
             cx.notify();
             return;
@@ -535,50 +478,6 @@ impl AppController {
         self.transition(Screen::Login, cx);
     }
 
-    /// Web 认证成功后:重取账号 → 进入登录页或主界面。
-    pub fn proceed_after_web_auth(&mut self, cx: &mut Context<Self>) {
-        let (rt, api) = (self.rt.clone(), self.api.clone());
-        cx.spawn(async move |this, cx| {
-            let accounts = api::call_api(&rt, {
-                let api = api.clone();
-                move || async move { api.list_accounts().await }
-            })
-            .await;
-            let user_fallback = if accounts.is_err() {
-                api::call_api(&rt, {
-                    let api = api.clone();
-                    move || async move { api.current_user().await }
-                })
-                .await
-                .ok()
-            } else {
-                None
-            };
-            let _ = this.update(cx, |this, cx| {
-                match accounts {
-                    Ok(resp) => cx.update_global::<AuthStore, _>(|s, _| {
-                        s.accounts = resp.accounts;
-                        s.active_uid = resp.active_uid;
-                        s.accounts_loaded = true;
-                    }),
-                    Err(_) => {
-                        if let Some(user) = user_fallback {
-                            cx.update_global::<AuthStore, _>(|s, _| s.user = Some(user));
-                        }
-                    }
-                }
-                this.last_active_uid = cx.global::<AuthStore>().active_uid;
-                let screen = if cx.global::<AuthStore>().is_logged_in() {
-                    Screen::Main
-                } else {
-                    Screen::Login
-                };
-                this.transition(screen, cx);
-            });
-        })
-        .detach();
-    }
-
     pub fn toast(&self, cx: &mut Context<Self>, kind: ToastKind, message: impl Into<String>) {
         let message = message.into();
         if let Some(handle) = self.window {
@@ -594,23 +493,35 @@ pub struct AppShell {
     controller: Entity<AppController>,
     views: HashMap<Nav, AnyView>,
     login: Option<Entity<LoginView>>,
-    web_login: Option<Entity<WebLoginView>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl AppShell {
     fn new(
         controller: Entity<AppController>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let sub = cx.observe(&controller, |_, _, cx| cx.notify());
+        let observe = cx.observe(&controller, |_, _, cx| cx.notify());
+        // System 主题模式下跟随系统外观变化;固定亮/暗时忽略。
+        let appearance_sub = window.observe_window_appearance(|window, cx| {
+            crate::theme::sync_if_system(window, cx);
+        });
+        let hub = controller.read(cx).hub.clone();
+        let nav_sub = cx.subscribe(&hub, {
+            let controller = controller.clone();
+            move |_, _, ev, cx| {
+                if let UiEvent::Navigate(nav) = ev {
+                    let nav = *nav;
+                    controller.update(cx, |c, cx| c.navigate(nav, cx));
+                }
+            }
+        });
         Self {
             controller,
             views: HashMap::new(),
             login: None,
-            web_login: None,
-            _subscriptions: vec![sub],
+            _subscriptions: vec![observe, nav_sub, appearance_sub],
         }
     }
 
@@ -619,7 +530,7 @@ impl AppShell {
             let view: AnyView = match nav {
                 Nav::Files => {
                     let hub = self.controller.read(cx).hub.clone();
-                    cx.new(|cx| crate::views::files::FilesView::new(hub, window, cx)).into()
+                    cx.new(|cx| FilesView::new(hub, window, cx)).into()
                 }
                 Nav::Local => {
                     let hub = self.controller.read(cx).hub.clone();
@@ -665,22 +576,50 @@ impl AppShell {
         }
         self.views[&nav].clone()
     }
+
+    fn on_file_drop(&mut self, files: &ExternalPaths, window: &mut Window, cx: &mut Context<Self>) {
+        if files.paths().is_empty() || window.has_active_dialog(cx) {
+            return;
+        }
+        let Some(uid) = cx.global::<AuthStore>().signed_in_uid() else {
+            return;
+        };
+        let remote_dir = if self.controller.read(cx).nav == Nav::Files {
+            let target = self
+                .views
+                .get(&Nav::Files)
+                .cloned()
+                .and_then(|view| view.downcast::<FilesView>().ok())
+                .and_then(|view| view.read(cx).upload_target(cx));
+            let Some(target) = target else {
+                toast::show(
+                    window,
+                    cx,
+                    ToastKind::Warning,
+                    "目录正在加载，请稍后再拖入文件",
+                );
+                return;
+            };
+            target
+        } else {
+            "/".to_string()
+        };
+        queue_upload_paths(files.paths().to_vec(), remote_dir, uid, window, cx);
+    }
 }
 
 impl Render for AppShell {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme().clone();
-        let (screen, nav, ws_state) = {
-            let c = self.controller.read(cx);
-            (c.screen, c.nav, c.ws_state)
-        };
+        let palette = design::palette(cx);
+        let screen = self.controller.read(cx).screen;
+        let nav = self.controller.read(cx).nav;
 
         let mut root = div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme.background)
-            .text_color(theme.foreground)
+            .bg(palette.canvas)
+            .text_color(palette.text)
             .child(app_title_bar::render());
 
         match screen {
@@ -707,63 +646,56 @@ impl Render for AppShell {
                 }
                 root = root.child(self.login.clone().unwrap());
             }
-            Screen::WebLogin => {
-                if self.web_login.is_none() {
-                    let controller = self.controller.clone();
-                    self.web_login = Some(cx.new(|cx| {
-                        WebLoginView::new(controller, window, cx)
-                    }));
-                }
-                root = root.child(self.web_login.clone().unwrap());
-            }
             Screen::Main => {
                 let controller = self.controller.clone();
-                root = root
-                    .child(
-                        // 不能用 h_flex():它默认 items_center,内容页会按固有高度居中,
-                        // 表格的 flex_1 收缩为 0(行不渲染)。
-                        div()
-                            .flex()
-                            .flex_row()
-                            .flex_1()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .child(app_sidebar::build(nav, move |n| {
-                                let controller = controller.clone();
-                                move |_, _, cx| {
-                                    controller.update(cx, |c, cx| c.navigate(n, cx));
-                                }
-                            }))
-                            .child(self.main_view(nav, window, cx)),
-                    )
-                    .child(
-                        StatusBar::new()
-                            .left({
-                                let connected = cx.global::<BackendHealth>().connected;
-                                h_flex()
-                                    .gap_1p5()
-                                    .items_center()
-                                    .child(
-                                        div()
-                                            .size(px(8.))
-                                            .rounded_full()
-                                            .bg(if connected { theme.success } else { theme.danger }),
-                                    )
-                                    .child(if connected { "后端已连接" } else { "后端未连接" })
-                            })
-                            .right(format!(
-                                "{} · v0.1.5",
-                                match ws_state {
-                                    ConnectionState::Connected => "实时同步",
-                                    ConnectionState::Connecting => "连接中",
-                                    ConnectionState::Disconnected => "离线",
-                                }
-                            )),
-                    );
+                let storage = controller.read(cx).storage;
+                let sidebar = app_sidebar::build(nav, &palette, storage, |nav| {
+                    let controller = controller.clone();
+                    move |_, _, cx| {
+                        controller.update(cx, |c, cx| c.navigate(nav, cx));
+                    }
+                });
+                let drop_background = palette.primary_soft;
+                root = root.child(
+                    div()
+                        .id("file-drop-target")
+                        .flex()
+                        .flex_row()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .drag_over::<ExternalPaths>(move |style, _, _, _| style.bg(drop_background))
+                        .on_drop(cx.listener(Self::on_file_drop))
+                        .child(sidebar)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .h_full()
+                                .overflow_hidden()
+                                .child(self.main_view(nav, window, cx)),
+                        ),
+                );
             }
         }
 
         root
+    }
+}
+
+/// 等待后端进入 Ready；Failed 或通知通道关闭视为失败。
+async fn wait_ready(status: &mut tokio::sync::watch::Receiver<BackendStatus>) -> bool {
+    loop {
+        let current = status.borrow_and_update().clone();
+        match current {
+            BackendStatus::Ready(_) => return true,
+            BackendStatus::Failed(_) => return false,
+            BackendStatus::Starting => {
+                if status.changed().await.is_err() {
+                    return false;
+                }
+            }
+        }
     }
 }
 
@@ -772,7 +704,10 @@ impl Render for AppShell {
 pub fn open_initial(cx: &mut App, controller: Entity<AppController>) {
     let screen = controller.update(cx, |c, cx| c.probe_boot(cx));
     let (handle, _) = open_app_window(cx, screen, controller.clone());
-    controller.update(cx, |c, _| c.window = Some(handle));
+    controller.update(cx, |c, cx| {
+        c.window = Some(handle);
+        c.sync_storage_account(cx);
+    });
     controller.update(cx, |c, cx| c.spawn_boot(cx));
 }
 
@@ -782,7 +717,7 @@ fn open_app_window(
     controller: Entity<AppController>,
 ) -> (AnyWindowHandle, Entity<AppShell>) {
     let options = match screen {
-        Screen::Boot | Screen::Login | Screen::WebLogin => WindowOptions {
+        Screen::Boot | Screen::Login => WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
                 size(px(400.), px(600.)),
@@ -797,7 +732,7 @@ fn open_app_window(
         _ => WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
-                size(px(1280.), px(860.)),
+                size(px(960.), px(640.)),
                 cx,
             ))),
             window_min_size: Some(size(px(960.), px(640.))),
