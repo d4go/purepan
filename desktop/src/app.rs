@@ -401,6 +401,7 @@ impl AppController {
                 self.hub.update(cx, |_, cx| cx.emit(UiEvent::WsMessage(msg)));
             }
             UiEvent::AccountChanged { .. } => {}
+            UiEvent::DownloadDirChanged => {}
             UiEvent::Navigate(_) => {}
             UiEvent::Toast { kind, message } => self.toast(cx, kind, message),
             UiEvent::ActivateWindow => self.restore_window(cx),

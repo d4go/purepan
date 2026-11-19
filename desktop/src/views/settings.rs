@@ -298,8 +298,14 @@ impl SettingsView {
 
     fn save(&mut self, cx: &mut Context<Self>) {
         let rd = |e: &Entity<InputState>| e.read(cx).value().trim().to_string();
+        let new_dir = rd(&self.download_dir);
+        let new_dir_state = new_dir.clone();
+        let dir_changed = self.config["download"]["download_dir"]
+            .as_str()
+            .map(str::trim)
+            != Some(new_dir.as_str());
         let mut cfg = self.config.clone();
-        cfg["download"]["download_dir"] = json!(rd(&self.download_dir));
+        cfg["download"]["download_dir"] = json!(new_dir);
         cfg["download"]["ask_each_time"] = json!(self.ask_each_time);
         if let Ok(n) = rd(&self.dl_threads).parse::<u64>() { cfg["download"]["max_global_threads"] = json!(n); }
         if let Ok(n) = rd(&self.dl_concurrent).parse::<u64>() { cfg["download"]["max_concurrent_tasks"] = json!(n); }
@@ -322,6 +328,12 @@ impl SettingsView {
                 match r {
                     Ok(_) => {
                         this.dirty = false;
+                        this.config["download"]["download_dir"] = json!(new_dir_state);
+                        if dir_changed {
+                            // 本地文件视图是缓存复用的，需通知它重新解析下载根目录。
+                            let hub = this.controller.read(cx).hub.clone();
+                            hub.update(cx, |_, cx| cx.emit(UiEvent::DownloadDirChanged));
+                        }
                         this.toast(cx, ToastKind::Success, "设置已保存");
                     }
                     Err(e) => this.toast(cx, ToastKind::Error, e.message()),
