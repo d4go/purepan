@@ -103,6 +103,7 @@ jobs:
           EXE_WIN=$(cygpath -w "target/${{ matrix.rust-target }}/release/purepan.exe")
           OUT_WIN=$(cygpath -w "dist/PurePan-${VERSION}-windows-${{ matrix.arch }}-setup.exe")
           ICON_WIN=$(cygpath -w "desktop/assets/icons/icon.ico")
+          NSI_WIN=$(cygpath -w "packaging/windows/installer.nsi")
           # Git Bash 会把 /V2、/Dxxx 当成路径转换；改用生成脚本传入全部定义，
           # 并以相对路径调用 makensis，避免参数被改写。
           cat > installer-generated.nsi <<EOF
@@ -110,7 +111,7 @@ jobs:
           !define SOURCE_EXE "$EXE_WIN"
           !define ICON_FILE "$ICON_WIN"
           !define OUT_FILE "$OUT_WIN"
-          !include "packaging/windows/installer.nsi"
+          !include "$NSI_WIN"
           EOF
           "$MAKENSIS" installer-generated.nsi
           rm -f installer-generated.nsi
