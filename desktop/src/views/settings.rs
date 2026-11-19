@@ -834,7 +834,7 @@ impl Render for SettingsView {
                     div()
                         .text_size(px(13.))
                         .text_color(p.muted)
-                        .child("v0.1.5"),
+                        .child(format!("v{}", env!("CARGO_PKG_VERSION"))),
                 ),
         );
 

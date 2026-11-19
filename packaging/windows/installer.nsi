@@ -1,7 +1,8 @@
-Unicode true
+﻿Unicode true
 !include "MUI2.nsh"
 
-; 通过 makensis /D 传入: VERSION / SOURCE_EXE / ICON_FILE / OUT_FILE
+; Values are provided by the generated wrapper script:
+; VERSION / SOURCE_EXE / ICON_FILE / OUT_FILE
 !ifndef VERSION
   !define VERSION "0.0.0"
 !endif
@@ -26,7 +27,7 @@ BrandingText "PurePan"
 
 VIProductVersion "${VERSION}.0"
 VIAddVersionKey "ProductName" "PurePan"
-VIAddVersionKey "FileDescription" "PurePan 安装程序"
+VIAddVersionKey "FileDescription" "PurePan Installer"
 VIAddVersionKey "FileVersion" "${VERSION}"
 VIAddVersionKey "ProductVersion" "${VERSION}"
 VIAddVersionKey "LegalCopyright" "PurePan"
@@ -38,7 +39,7 @@ UninstallIcon "${ICON_FILE}"
 !define MUI_UNICON "${ICON_FILE}"
 !define MUI_ABORTWARNING
 !define MUI_FINISHPAGE_RUN "$INSTDIR\purepan.exe"
-!define MUI_FINISHPAGE_RUN_TEXT "运行 PurePan"
+!define MUI_FINISHPAGE_RUN_TEXT "Run PurePan"
 
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY

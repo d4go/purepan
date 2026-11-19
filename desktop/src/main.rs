@@ -38,9 +38,19 @@ fn main() {
 
     let backend = backend_embed::spawn(ui_tx);
 
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::AllAssets)
-        .run(move |cx| {
+    // macOS 点击程序坞图标会触发 reopen:窗口被关闭后按当前屏幕重建,
+    // 避免进程还活着却无法再打开界面。
+    let controller_slot: std::rc::Rc<std::cell::RefCell<Option<gpui_kit::Entity<app::AppController>>>> =
+        std::rc::Rc::new(std::cell::RefCell::new(None));
+    let reopen_slot = std::rc::Rc::clone(&controller_slot);
+
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::AllAssets);
+    application.on_reopen(move |cx| {
+        if let Some(controller) = reopen_slot.borrow().clone() {
+            controller.update(cx, |c, cx| c.restore_window(cx));
+        }
+    });
+    application.run(move |cx| {
             gpui_kit::init(cx);
             theme::init(cx);
             cx.set_global(backend);
@@ -50,6 +60,7 @@ fn main() {
             cx.set_global(UiPrefs::default());
 
             let controller = cx.new(|cx| app::AppController::new(cx, ui_rx));
+            *controller_slot.borrow_mut() = Some(controller.clone());
             app::open_initial(cx, controller);
-        });
+    });
 }
