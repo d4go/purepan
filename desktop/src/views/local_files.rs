@@ -88,8 +88,13 @@ impl LocalFilesView {
             _ => {}
         }));
         subs.push(cx.subscribe(&hub, |this, _, ev, cx| {
-            if matches!(ev, UiEvent::AccountChanged { .. }) {
+            if matches!(
+                ev,
+                UiEvent::AccountChanged { .. } | UiEvent::DownloadDirChanged
+            ) {
                 this.base_dir.clear();
+                this.current_dir.clear();
+                this.entries.clear();
                 this.navigate(String::new(), cx);
             }
         }));

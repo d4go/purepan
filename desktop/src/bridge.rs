@@ -48,6 +48,8 @@ pub enum UiEvent {
     WsMessage(WsServerMessage),
     /// 活跃账号变化(视图据此清空重取,对应 Vue 的 multi-account:active-changed)
     AccountChanged { new_uid: Option<u64> },
+    /// 下载目录已保存生效(本地文件视图据此回到新的根目录)
+    DownloadDirChanged,
     /// 视图请求切换主导航(如文件页头部跳转下载)
     Navigate(crate::components::app_sidebar::Nav),
     /// 集中提示(后端断连/恢复等),由控制器弹 Notification
