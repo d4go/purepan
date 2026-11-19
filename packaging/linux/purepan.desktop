@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PurePan
+GenericName=Cloud Drive Client
+Comment=百度网盘第三方桌面客户端
+Exec=purepan
+Icon=purepan
+Terminal=false
+Categories=Network;FileTransfer;Utility;
+Keywords=pan;netdisk;baidu;
+StartupWMClass=PurePan

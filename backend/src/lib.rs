@@ -56,7 +56,7 @@ pub mod share_sync;
 pub mod server_setup;
 
 // 导出服务器启动函数
-pub use server_setup::start_server;
+pub use server_setup::{bootstrap, start_server, Bootstrap};
 
 // 导出常用类型
 pub use auth::{LoginRequest, LoginResponse, QRCode, QRCodeStatus, UserAuth};

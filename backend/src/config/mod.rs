@@ -284,18 +284,35 @@ impl Default for CloseBehavior {
     }
 }
 
+/// 外观主题
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeSetting {
+    /// 始终浅色
+    Light,
+    /// 始终深色
+    Dark,
+    /// 跟随系统
+    #[default]
+    System,
+}
+
 /// UI 配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiConfig {
     /// 窗口关闭按钮行为
     #[serde(default = "default_close_behavior")]
     pub close_behavior: CloseBehavior,
+    /// 外观主题(亮色 / 深色 / 跟随系统)
+    #[serde(default)]
+    pub theme: ThemeSetting,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
             close_behavior: default_close_behavior(),
+            theme: ThemeSetting::default(),
         }
     }
 }

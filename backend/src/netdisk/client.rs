@@ -1,13 +1,13 @@
 // 网盘客户端实现
 
 use crate::auth::constants::USER_AGENT as WEB_USER_AGENT; // 导入登录时的 UA,确保一致
-use crate::auth::constants::{API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
+use crate::auth::constants::{API_QUOTA, API_USER_INFO, BAIDU_APP_ID, CLIENT_TYPE, USER_AGENT};
 use crate::auth::UserAuth;
 use crate::common::ProxyConfig;
 use crate::netdisk::{
     CreateFileResponse, FileListResponse, FileManagerResponse, FileManagerTaskQueryResponse,
     FileOperationErrorPayload, FileOperationItem, FileOperationOutcome, FileOperationSuccess,
-    LocateDownloadResponse, PrecreateResponse, RapidUploadResponse, RenameItem,
+    LocateDownloadResponse, PrecreateResponse, RapidUploadResponse, RenameItem, StorageQuota,
     UploadChunkResponse, UploadErrorKind,
 };
 use crate::sign::LocateSign;
@@ -912,6 +912,135 @@ impl NetdiskClient {
     /// 获取用户BDUSS
     pub fn bduss(&self) -> &str {
         &self.user_auth.bduss
+    }
+
+    /// 是否已持有预热后的 Web 会话 Cookie（空间配额等接口依赖 PANPSC）。
+    pub async fn is_warmed(&self) -> bool {
+        if self.panpsc_cookie.lock().await.is_some() {
+            return true;
+        }
+        // 服务端也可能在普通请求里下发 PANPSC，以 Cookie Jar 为准兜底。
+        let url = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+        self.cookie_jar
+            .cookies(&url)
+            .and_then(|header| header.to_str().ok().map(str::to_owned))
+            .is_some_and(|cookies| {
+                cookies.split(';').any(|pair| {
+                    pair.trim()
+                        .strip_prefix("PANPSC=")
+                        .is_some_and(|value| !value.is_empty())
+                })
+            })
+    }
+
+    /// 使用当前网盘会话读取实时空间配额。
+    ///
+    /// 配额接口依赖 PANPSC。刚扫码登录时 `/disk/home` 页面预热可能被风控
+    /// 重定向到登录页，客户端就会一直缺 PANPSC；列表接口只依赖 BDUSS，
+    /// 同样会下发 PANPSC，这里在缺失时用它兜底。
+    pub async fn get_storage_quota(&self) -> Result<StorageQuota> {
+        if !self.is_warmed().await {
+            self.refresh_panpsc_via_api().await?;
+        }
+
+        match self.request_storage_quota().await {
+            Ok(quota) => Ok(quota),
+            Err(first_error) => {
+                // PANPSC 可能已被服务端轮换或清空，刷新后重试一次。
+                match self.refresh_panpsc_via_api().await {
+                    Ok(()) => self.request_storage_quota().await,
+                    Err(_) => Err(first_error),
+                }
+            }
+        }
+    }
+
+    /// 通过列表接口刷新 PANPSC（不依赖 /disk/home 页面预热）。
+    async fn refresh_panpsc_via_api(&self) -> Result<()> {
+        let response = self
+            .client
+            .get("https://pan.baidu.com/api/list")
+            .query(&[
+                ("dir", "/".to_string()),
+                ("order", "name".to_string()),
+                ("start", "0".to_string()),
+                ("limit", "1".to_string()),
+                ("web", "1".to_string()),
+                ("clienttype", "0".to_string()),
+                ("app_id", BAIDU_APP_ID.to_string()),
+            ])
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .timeout(std::time::Duration::from_secs(15))
+            .send()
+            .await
+            .context("请求列表接口以获取 PANPSC 失败")?;
+
+        let base = "https://pan.baidu.com".parse::<reqwest::Url>().unwrap();
+        for header in response.headers().get_all("set-cookie") {
+            let Ok(raw) = header.to_str() else { continue };
+            let Some(rest) = raw.strip_prefix("PANPSC=") else {
+                continue;
+            };
+            let value = rest.split(';').next().unwrap_or("");
+            if value.is_empty() {
+                continue;
+            }
+            *self.panpsc_cookie.lock().await = Some(value.to_string());
+            self.cookie_jar.add_cookie_str(
+                &format!("PANPSC={value}; Domain=pan.baidu.com; Path=/; Secure"),
+                &base,
+            );
+        }
+
+        let data: Value = response.json().await.context("解析列表接口响应失败")?;
+        let errno = data["errno"].as_i64().unwrap_or(-1);
+        anyhow::ensure!(errno == 0, "列表接口返回错误 (errno={errno})");
+        anyhow::ensure!(self.is_warmed().await, "列表接口未下发 PANPSC");
+        Ok(())
+    }
+
+    async fn request_storage_quota(&self) -> Result<StorageQuota> {
+        let mut request = self
+            .client
+            .get(API_QUOTA)
+            .query(&[
+                ("app_id", BAIDU_APP_ID),
+                ("clienttype", CLIENT_TYPE),
+                ("web", 1),
+            ])
+            .header("User-Agent", &self.web_user_agent)
+            .header("Referer", "https://pan.baidu.com/disk/home")
+            .timeout(std::time::Duration::from_secs(10));
+        if let Some(token) = self.bdstoken.lock().await.as_deref() {
+            request = request.query(&[("bdstoken", token)]);
+        }
+
+        let response = match request.send().await {
+            Ok(response) => {
+                self.record_proxy_success();
+                response
+            }
+            Err(error) => {
+                let error = anyhow::Error::from(error.without_url()).context("获取网盘空间失败");
+                self.record_proxy_failure(&error);
+                return Err(error);
+            }
+        };
+        let data: Value = response
+            .error_for_status()
+            .map_err(reqwest::Error::without_url)?
+            .json()
+            .await
+            .map_err(reqwest::Error::without_url)
+            .context("解析网盘空间响应失败")?;
+        let errno = data["errno"].as_i64().context("网盘空间响应缺少 errno")?;
+        anyhow::ensure!(errno == 0, "获取网盘空间失败 (errno={errno})");
+
+        Ok(StorageQuota {
+            total: data["total"].as_u64().context("网盘空间响应缺少总容量")?,
+            used: data["used"].as_u64().context("网盘空间响应缺少已用容量")?,
+        })
     }
 
     /// 获取文件列表

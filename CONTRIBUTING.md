@@ -126,33 +126,26 @@ cargo clippy
 cargo fmt
 ```
 
-#### 前端开发
+#### 桌面端开发（GPUI）
+
+桌面端位于 `desktop/`，使用 Rust + gpui-kit，内嵌后端。
 
 ```bash
-cd frontend
-
-# 安装依赖
-npm install
-
-# 运行开发服务器
-npm run dev
+# 运行桌面端（debug，数据目录为 desktop/）
+cargo run -p purepan-desktop
 
 # 构建生产版本
-npm run build
+cargo build --release -p purepan-desktop
 
-# 类型检查
-npm run type-check
+# 检查整个工作区
+cargo check --workspace
+
+# 代码检查 / 格式化
+cargo clippy --workspace
+cargo fmt --all
 ```
 
-#### Docker 开发
-
-```bash
-# 启动开发环境
-./scripts/dev.sh
-
-# 或使用 docker-compose
-docker-compose -f docker-compose.dev.yml up
-```
+Linux 需安装 GPUI 系统依赖：`libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1`，并在图形会话（Wayland/X11）下运行。
 
 ### 开发工作流
 

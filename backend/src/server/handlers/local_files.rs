@@ -24,6 +24,8 @@ pub struct LocalFileListQuery {
     pub sort_field: SortField,
     #[serde(default)]
     pub sort_order: SortOrder,
+    #[serde(default)]
+    pub keyword: Option<String>,
 }
 
 fn default_page_size() -> usize {
@@ -57,7 +59,7 @@ pub async fn list_local_files(
         page_size: query.page_size,
         sort_field: query.sort_field,
         sort_order: query.sort_order,
-        keyword: None,
+        keyword: query.keyword.filter(|k| !k.trim().is_empty()),
     };
 
     match service.list_directory(&req) {

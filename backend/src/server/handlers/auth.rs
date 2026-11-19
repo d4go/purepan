@@ -6,7 +6,6 @@ use crate::server::{broadcast_account_list_changed, set_active_uid, AppState};
 use axum::{
     extract::{Query, State},
     http::StatusCode,
-    response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -231,7 +230,7 @@ pub async fn qrcode_status(
 /// 多账号场景下返回的就是当前 active_uid 对应的账号。
 pub async fn get_current_user(
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Json<ApiResponse<UserAuth>> {
     info!("🔍 API: 获取当前用户信息");
 
     // 从 active_uid → AccountManager 取活跃账号
@@ -239,7 +238,7 @@ pub async fn get_current_user(
         Some(u) => u,
         None => {
             warn!("❌ 未找到活跃账号，用户未登录");
-            return Ok(Json(ApiResponse::error(401, "Not logged in".to_string())));
+            return Json(ApiResponse::error(401, "Not logged in".to_string()));
         }
     };
 
@@ -268,20 +267,20 @@ pub async fn get_current_user(
                 }
             }
 
-            Ok(Json(ApiResponse::success(user)))
+            Json(ApiResponse::success(user))
         }
         Ok(false) => {
             // BDUSS 已失效。这里只标记 401，账号删除/切换由调用方按需触发。
             warn!("BDUSS 已失效 uid={}", user.uid);
-            Ok(Json(ApiResponse::error(
+            Json(ApiResponse::error(
                 401,
                 "Session expired, please login again".to_string(),
-            )))
+            ))
         }
         Err(e) => {
             // 验证失败（可能是网络问题），暂时允许通过
             warn!("BDUSS 验证失败: {}，暂时允许通过", e);
-            Ok(Json(ApiResponse::success(user)))
+            Json(ApiResponse::success(user))
         }
     }
 }
@@ -292,7 +291,7 @@ pub async fn get_current_user(
 ///
 /// 通过 `delete_account_helper(force = true)` 编排关闭活跃账号的所有
 /// per-uid Manager + 移除 client_pool + 删除 AccountManager 条目 + 广播事件。
-pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, StatusCode> {
+pub async fn logout(State(state): State<AppState>) -> Json<ApiResponse<()>> {
     info!("API: 用户登出");
 
     // 1. 清除持久化 session（文件 + 内存缓存）— legacy 字段保留
@@ -323,14 +322,14 @@ pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, 
     match clear_result {
         Ok(_) => {
             info!("登出成功");
-            Ok(Json(ApiResponse::<()>::success(())))
+            Json(ApiResponse::<()>::success(()))
         }
         Err(e) => {
             error!("登出失败: {}", e);
-            Ok(Json(ApiResponse::<()>::error(
+            Json(ApiResponse::<()>::error(
                 500,
                 format!("Failed to logout: {}", e),
-            )))
+            ))
         }
     }
 }
@@ -344,14 +343,14 @@ pub async fn logout(State(state): State<AppState>) -> Result<impl IntoResponse, 
 pub async fn cookie_login(
     State(state): State<AppState>,
     Json(req): Json<CookieLoginApiRequest>,
-) -> Result<impl IntoResponse, StatusCode> {
+) -> Json<ApiResponse<UserAuth>> {
     info!("API: Cookie 登录");
 
     if req.cookies.trim().is_empty() {
-        return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+        return Json(ApiResponse::<crate::auth::UserAuth>::error(
             400,
             "cookies 字段不能为空".to_string(),
-        )));
+        ));
     }
 
     // 读取当前代理配置
@@ -369,10 +368,10 @@ pub async fn cookie_login(
         Ok(a) => a,
         Err(e) => {
             error!("创建 Cookie 登录客户端失败: {}", e);
-            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+            return Json(ApiResponse::<crate::auth::UserAuth>::error(
                 500,
                 format!("创建客户端失败: {}", e),
-            )));
+            ));
         }
     };
 
@@ -381,10 +380,10 @@ pub async fn cookie_login(
         Ok(u) => u,
         Err(e) => {
             error!("Cookie 登录失败: {}", e);
-            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+            return Json(ApiResponse::<crate::auth::UserAuth>::error(
                 400,
                 format!("{}", e),
-            )));
+            ));
         }
     };
 
@@ -398,10 +397,10 @@ pub async fn cookie_login(
         let mut session = state.session_manager.lock().await;
         if let Err(e) = session.save_session(&user).await {
             error!("保存会话失败: {}", e);
-            return Ok(Json(ApiResponse::<crate::auth::UserAuth>::error(
+            return Json(ApiResponse::<crate::auth::UserAuth>::error(
                 500,
                 format!("保存会话失败: {}", e),
-            )));
+            ));
         }
         *state.current_user.write().await = Some(user.clone());
         info!("✅ 会话保存成功");
@@ -457,7 +456,7 @@ pub async fn cookie_login(
             has_ptoken, final_user.panpsc.is_some());
     }
 
-    Ok(Json(ApiResponse::success_with_message(final_user, message)))
+    Json(ApiResponse::success_with_message(final_user, message))
 }
 
 // ============================================================================
