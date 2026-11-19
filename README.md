@@ -3,10 +3,8 @@
 <div align="center">
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)
-![Rust](https://img.shields.io/badge/Rust-1.87-orange.svg)
-![Vue](https://img.shields.io/badge/Vue-3.5+-green.svg)
-![Tauri](https://img.shields.io/badge/Tauri-2.x-purple.svg)
-![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)
+![Rust](https://img.shields.io/badge/Rust-1.95%2B-orange.svg)
+![GPUI](https://img.shields.io/badge/UI-GPUI%20%2B%20gpui--kit-blueviolet.svg)
 
 🚀 基于 Rust 的高性能百度网盘客户端 | High-performance Baidu Netdisk client built with Rust
 
@@ -18,7 +16,9 @@
 
 ## 📖 简介
 
-PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方客户端，提供简洁的界面和高效的上传/下载功能。
+PurePan 是一个使用 Rust 和 GPUI（gpui-kit 组件库）构建的现代化百度网盘第三方桌面客户端，提供简洁的界面和高效的上传/下载功能。
+
+桌面端与后端运行在**同一进程**中：UI 通过进程内门面（`backend/src/server/inproc`）直接调用后端逻辑，不启动本地 HTTP 服务、不经过 WebSocket 或令牌认证。`purepan-backend` 仍可作为独立 HTTP/WebSocket 服务单独部署。
 
 ## ⭐ 支持项目发展
 
@@ -66,10 +66,6 @@ PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方�
 - ✅ 会话持久化
 - ✅ 自动登录状态验证
 - ✅ 失效自动跳转登录页
-- ✅ **Web 访问认证**（可选，保护 Web 界面访问）
-    - 密码保护：防止未授权访问
-    - TOTP 双因素认证：支持 Google Authenticator 等应用
-    - 恢复码机制：丢失 TOTP 设备时的备用登录方式
 
 ### 📁 文件管理
 - ✅ 浏览网盘文件和目录
@@ -102,9 +98,9 @@ PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方�
 - ✅ 秒传标识：支持后端秒传时，在任务上展示"秒传"标记
 - ✅ **上传最近目录记忆**（自动记录最近使用的上传目录）
 
-### 🎨 客户端 界面
-- ✅ 现代化 Vue 3 + Element Plus UI
-- ✅ 响应式设计
+### 🎨 客户端界面
+- ✅ 基于 GPUI + gpui-kit 的原生桌面 UI
+- ✅ 窗口自适应布局
 - ✅ 实时状态更新
 - ✅ 友好的用户体验
 
@@ -132,19 +128,18 @@ PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方�
 - ✅ 多种链接格式支持：HTTP/HTTPS、磁力链接（magnet）、ed2k 链接
 - ✅ 磁力链接自动标准化（Base32 转十六进制）
 - ✅ 任务管理：添加、查询、取消、删除离线下载任务
-- ✅ 实时进度显示：通过 WebSocket 实时推送任务状态和进度更新
+- ✅ 实时进度显示：实时推送任务状态和进度更新（桌面端进程内订阅，独立后端模式为 WebSocket）
 - ✅ **自动下载功能**：任务完成后可自动下载到本地，支持配置保存路径和每次询问路径选项
 - ✅ 智能轮询机制：根据任务进度预测完成时间，动态调整轮询间隔（最小 3 分钟，最大 60 分钟）
 - ✅ 任务详情查看：支持查看任务的完整信息，包括文件列表、保存路径、源链接等
 
-### 🐳 部署支持
-- ✅ Docker 一键部署
-- ✅ Docker Compose 支持
-- ✅ 多阶段构建优化
+### 🖥️ 运行模式
+- ✅ 桌面端（GPUI）与后端同进程运行，进程内直接调用，无本地端口与令牌认证
+- ✅ `purepan-backend` 可独立运行，提供 HTTP API + WebSocket 实时推送
 
 ### 📡 实时与持久化能力
 - ✅ 任务持久化与断点恢复
-- ✅ WebSocket 实时推送
+- ✅ 实时事件推送（桌面端进程内订阅，独立后端模式为 WebSocket）
 - ✅ 日志持久化与滚动
 
 ### 🌐 网络代理
@@ -186,8 +181,8 @@ PurePan 是一个使用 Rust 和 Tauri 构建的现代化百度网盘第三方�
 - ✅ 跨平台支持（Windows、Linux、macOS）
 
 **下载：**
-- 推荐从 [`decrypt-cli-v0.1.2` 专用发布页](https://github.com/komorebiCarry/BaiduPCS-Rust/releases/tag/decrypt-cli-v0.1.2) 直接下载对应平台的 `decrypt-cli` 可执行文件
-- 也可以在项目的 [Releases 页面](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 中查看全部版本
+- 可从 [Releases 页面](https://github.com/d4go/purepan/releases) 查看发布的构建产物
+- 也可以从源码构建：`cargo build --release -p decrypt-cli`
 
 <details>
 <summary>📖 <b>decrypt-cli 使用说明</b>（点击展开）</summary>
@@ -286,9 +281,9 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 2. **扫描二维码**
     - 打开应用
-    - 页面会自动显示登录二维码
+    - 登录页会自动显示登录二维码
     - 打开百度网盘 APP，点击"扫一扫"功能
-    - 扫描网页上显示的二维码
+    - 扫描应用中显示的二维码
 
 3. **确认登录**
     - 扫描成功后，APP 会弹出确认登录提示
@@ -296,16 +291,16 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
     - **重要：确认后，APP 不能关闭或切换到后台**，否则登录会失败
 
 4. **等待登录完成**
-    - 网页会自动轮询登录状态（通常 1-2 秒）
-    - 登录成功后会自动跳转到文件管理页面
+    - 应用会自动轮询登录状态（通常 1-2 秒）
+    - 登录成功后会自动进入文件管理界面
 
 #### ⚠️ 重要提示
 
-- **APP 必须保持打开状态**：确认登录后，不要立即在 APP 中点击确认，先稍等片刻，等待网页显示"扫码成功"后，再按提示继续操作。
-- APP 不能关闭、不能退出、不能切换到后台，必须保持在前台运行，直到网页显示登录成功
-- **原因说明**：网页需要通过轮询机制查询登录状态，如果 APP 关闭，百度服务器可能无法正确返回登录状态，导致登录失败
+- **APP 必须保持打开状态**：确认登录后，不要立即在 APP 中点击确认，先稍等片刻，等待应用显示"扫码成功"后，再按提示继续操作。
+- APP 不能关闭、不能退出、不能切换到后台，必须保持在前台运行，直到应用显示登录成功
+- **原因说明**：应用需要通过轮询机制查询登录状态，如果 APP 关闭，百度服务器可能无法正确返回登录状态，导致登录失败
 - **登录失败处理**：如果等待一段时间后仍无法登录，请：
-    1. 刷新网页，重新获取二维码
+    1. 返回登录页重新获取二维码
     2. 重新执行上述操作步骤
     3. 确保 APP 在确认登录后保持打开状态
 
@@ -317,283 +312,100 @@ decrypt-cli decrypt --key-file encryption.json --in file.dat --out file.txt --ke
 
 </details>
 
-### 使用 Docker（推荐）
+### 从源码构建
 
-#### 方式一：使用预构建镜像（最简单）
+PurePan 使用 Cargo workspace 管理三个 crate：
 
-**使用 docker run（推荐）**：
+- `purepan-desktop`：GPUI 桌面端（二进制 `purepan`），与后端同进程运行
+- `purepan-backend`：后端核心库，也可作为独立 HTTP/WebSocket 服务运行
+- `decrypt-cli`：独立解密工具
 
-```bash
-# 1. 创建必要的目录
-mkdir -p baidupcs-rust/{config,downloads,data,logs,wal}
-cd baidupcs-rust
-
-# 2. 运行容器（使用预构建镜像）
-docker run -d \
-  --name PurePan \
-  -p 18888:18888 \
-  -v $(pwd)/config:/app/config \
-  -v $(pwd)/downloads:/app/downloads \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/logs:/app/logs \
-  -v $(pwd)/wal:/app/wal \
-  --restart unless-stopped \
-  komorebicarry/baidupcs-rust:latest
-
-# 3. 访问应用
-open http://localhost:18888
-```
-
-**使用 docker-compose：**
-
-```bash
-# 1. 创建必要的目录
-mkdir -p baidupcs-rust/{config,downloads,data,logs,wal}
-cd baidupcs-rust
-
-# 2. 下载 docker-compose 配置文件
-# 从项目仓库下载 docker-compose.image.yml 文件
-
-# 3. 启动服务（使用预构建镜像）
-docker-compose -f docker-compose.image.yml up -d
-
-# 4. 访问应用
-open http://localhost:18888
-```
-
-#### 方式二：从源码构建
-
-```bash
-# 1. 克隆项目
-git clone https://github.com/d4go/purepan.git
-cd purepan
-
-# 2. 构建并启动服务
-docker-compose up -d
-
-# 3. 访问应用
-open http://localhost:18888
-```
-
-<details>
-<summary><b>📋 Docker 详细说明</b>（点击展开）</summary>
-
-**说明**：
-- Docker 容器内，后端 API 服务和前端静态文件服务运行在同一个进程中
-- 只需要暴露一个端口（18888）即可访问完整应用
-- 前端页面和 API 调用都通过 `http://localhost:18888` 访问
-- 前端在容器内部通过 `http://localhost:18888/api/v1` 调用后端 API
-- **挂载目录说明**：
-    - `config`：配置文件目录，包含以下重要文件：
-        - `encryption.json`：加密密钥文件
-        - `baidu-pcs.db`：SQLite 数据库（历史记录、加密映射表等）
-        - `autobackup_configs.json`：自动备份配置
-    - `downloads`：下载文件保存目录
-    - `data`：会话数据目录（登录信息、会话持久化）
-    - `logs`：日志文件目录（应用运行日志，支持滚动）
-    - `wal`：WAL 目录（任务持久化数据，支持断点恢复）
-- ⚠️ **重要提示**：如果启用了客户端侧加密功能，请务必备份以下文件：
-    - `config/encryption.json`：加密密钥，**丢失后将无法解密已加密的文件**！
-    - `config/baidu-pcs.db`：包含加密文件映射表，用于解密时查找原始文件名
-- 预构建镜像自动发布在以下位置：
-    - [GitHub Container Registry](https://github.com/komorebiCarry/BaiduPCS-Rust/pkgs/container/baidupcs-rust) - `ghcr.io/komorebicarry/baidupcs-rust:latest`（推荐，无需额外注册）
-    - [Docker Hub](https://hub.docker.com/r/komorebicarry/baidupcs-rust) - `komorebicarry/baidupcs-rust:latest`（可选，需要配置 secrets）
-- 当创建 Git 标签（如 `v1.0.0`）时，GitHub Actions 会自动构建并推送 Docker 镜像
-- **Linux 用户推荐使用 Docker Hub 镜像**（更通用，无需登录）：`komorebicarry/baidupcs-rust:latest`
-- **如果镜像拉取较慢**，也可以从 [GitHub Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面直接下载 Docker 镜像文件（`BaiduPCS-Rust-{版本号}-docker.tar.gz`），然后使用以下命令加载：
-  ```bash
-  # 下载镜像文件后，加载镜像
-  docker load < BaiduPCS-Rust-v1.7.0-docker.tar.gz
-  
-  # 加载后可以使用镜像运行容器
-  docker run -d \
-    --name PurePan \
-    -p 18888:18888 \
-    -v $(pwd)/config:/app/config \
-    -v $(pwd)/downloads:/app/downloads \
-    -v $(pwd)/data:/app/data \
-    -v $(pwd)/logs:/app/logs \
-    -v $(pwd)/wal:/app/wal \
-    --restart unless-stopped \
-    baidupcs-rust:v1.7.0
-  ```
-
-**docker-compose 文件说明**：
-
-本项目提供三个 Docker Compose 配置文件，适用于不同场景：
-
-| 文件 | 用途 | 适用场景 |
-|------|------|----------|
-| `docker-compose.yml` | 从源码构建 | 本地源码构建部署 |
-| `docker-compose.dev.yml` | 开发环境 | 前后端分离热重载开发 |
-| `docker-compose.image.yml` | 预构建镜像 | 生产环境直接使用官方镜像 |
-
-**docker-compose.dev.yml（开发环境）**：
-- 后端服务使用 `cargo watch` 实现热重载，代码变更自动重新编译
-- 前端服务使用 Vite 开发服务器，支持 HMR 热更新
-- 后端端口 `18888`，前端端口 `5173`
-- 需要 `backend/Dockerfile.dev` 和 `frontend/Dockerfile.dev`
-
-```bash
-# 启动开发环境
-docker-compose -f docker-compose.dev.yml up -d
-```
-
-**docker-compose.image.yml（预构建镜像）**：
-- 直接使用官方预构建镜像，无需本地编译
-- 适合快速部署到生产环境
-- 支持健康检查、资源限制和自动重启
-
-```bash
-# 使用预构建镜像
-docker-compose -f docker-compose.image.yml up -d
-```
-
-</details>
-
-### 手动安装
+无需 Node.js / 浏览器运行时。
 
 #### 前提条件
 
-- Rust 1.87（项目通过 `rust-toolchain.toml` 固定为 1.87.0，本地 / Docker / CI 保持一致）
-- Node.js 18+
-- npm 或 pnpm
+- Rust stable（>= 1.95，建议最新 stable，`rustup`；`backend/rust-toolchain.toml` 已指向 stable）
+- 系统依赖：
+  - **Linux**：`libfontconfig-dev libwayland-dev libxkbcommon-x11-dev libx11-xcb-dev libssl-dev libzstd-dev libvulkan1`，以及可用的 Vulkan 驱动；图形会话（Wayland/X11）
+  - **macOS**：Xcode Command Line Tools（macOS 15+）
+  - **Windows**：Visual Studio 2022 C++ 生成工具 + CMake（MSVC 工具链）
 
-#### 后端
-
-```bash
-cd backend
-cargo build --release
-cargo run --release
-```
-
-#### 前端
+#### 开发模式
 
 ```bash
-cd frontend
-npm install
-npm run build
-# 或者开发模式
-npm run dev
+cargo run -p purepan-desktop
 ```
 
-访问 http://localhost:5173（开发模式）或 http://localhost:18888（生产模式）
+#### 构建
+
+```bash
+# 构建整个 workspace
+cargo build
+
+# 仅桌面端（debug / release）
+cargo build -p purepan-desktop
+cargo build --release -p purepan-desktop
+
+# 独立后端服务
+cargo run -p purepan-backend
+```
+
+二进制位于 `target/{debug,release}/purepan`（Windows 为 `purepan.exe`），独立后端为 `purepan-backend`。
+
+#### 数据目录
+
+- **debug**：`desktop/`（crate 目录），配置位于 `desktop/config/app.toml`
+- **release**：系统数据目录下的 `com.d4go.PurePan`（Linux 为 `~/.local/share/`，macOS 为 `~/Library/Application Support/`，Windows 为 `%APPDATA%`）
+- 可用 `PUREPAN_DATA_DIR` 环境变量覆盖
+
+> ⚠️ 数据目录中的 `accounts.json`、`session.json` 含百度账号凭据，已在 `.gitignore` 中忽略，请勿提交。
 
 ---
-
-## 🖥️ Tauri 桌面端构建
-
-项目支持使用 [Tauri 2.x](https://tauri.app/) 构建跨平台桌面应用。
-
-### 前提条件
-
-- 安装 Rust 工具链（1.87+）
-- 安装 Node.js 18+ 和 npm
-- 安装系统依赖（根据平台）：
-  - **Windows**：Microsoft Visual C++ Build Tools
-  - **Linux**：`libgtk-3-dev`, `libwebkit2gtk-4.0-dev` 等
-  - **macOS**：Xcode Command Line Tools
-
-### 安装 Tauri CLI
-
-```bash
-cargo install tauri-cli
-```
-
-### 安装前端依赖
-
-```bash
-cd frontend
-npm install
-```
-
-### 开发模式
-
-```bash
-# 在项目根目录执行
-cargo tauri dev
-```
-
-这会同时启动前端开发服务器和 Tauri 桌面窗口，支持热重载。
-
-### 生产构建
-
-```bash
-# 在项目根目录执行
-cargo tauri build
-```
-
-构建完成后，安装包位于 `src-tauri/target/release/bundle/` 目录下：
-- **Windows**：`.msi` 和 `.exe` 安装程序
-- **Linux**：`.deb`、`.rpm` 和 `.AppImage`
-- **macOS**：`.dmg` 和 `.app`
-
-### 项目配置
-
-Tauri 配置文件位于 `src-tauri/tauri.conf.json`，主要配置项：
-- 应用窗口尺寸、标题等外观属性
-- 前端构建产物路径（`frontendDist`）
-- 开发服务器 URL
-- 打包图标和分发目标
-
----
-
 ## 📝 平台支持说明
 
 ### 测试平台
 
-本项目主要在以下平台进行测试：
-
-- ✅ **Windows** - 主要开发和测试平台
-- ✅ **Docker** - 容器化部署，支持跨平台运行
+- ✅ **macOS (Apple Silicon)** - 主要开发与测试环境
+- ✅ **GitHub Actions CI** - Windows x64 / Linux x64 / Linux ARM64 / macOS Apple Silicon / macOS Intel
 
 ### 其他平台
 
-虽然项目理论上支持 Linux、macOS 等其他平台，但**目前不会进行主动测试**。如果您在其他平台使用遇到问题，欢迎提交 Issue。
+虽然项目理论上支持 Linux、macOS、Windows 等平台，但部分平台未做主动测试。如果您在使用中遇到问题，欢迎提交 Issue。
 
 ### 多平台打包
 
 项目使用 **GitHub Actions** 进行自动化多平台构建和打包，支持：
 
-- Windows (x86_64)
-- Linux (x86_64, ARM64)
-- macOS (x86_64, ARM64)
+- Windows (x86_64)：NSIS 安装包（含应用图标、开始菜单快捷方式与卸载程序）
+- Linux (x86_64, ARM64)：tar.gz 归档（含 `.desktop` 文件与图标）
+- macOS (Apple Silicon, Intel)：`.app` 应用包（含 icns 图标，打包为 zip）
 
-预编译的二进制文件可在 [Releases](https://github.com/komorebiCarry/BaiduPCS-Rust/releases) 页面下载。
+所有产物均内置应用图标。预编译安装包可在 [Releases](https://github.com/d4go/purepan/releases) 页面下载。
 
 ---
 
 ## 🛠️ 技术栈
 
-### 后端
+### 后端（purepan-backend）
 
-- **语言**: Rust 1.87
-- **框架**: Axum 0.7（Web 框架）
+- **语言**: Rust 1.95+（stable）
+- **Web 框架**: Axum 0.7（仅独立后端模式）
 - **异步运行时**: Tokio
 - **HTTP 客户端**: Reqwest
 - **序列化**: Serde + Serde JSON
 - **日志**: Tracing
 
-### 前端
+### 桌面端（purepan-desktop）
 
-- **框架**: Vue 3.5+（Composition API）
-- **语言**: TypeScript 5.6+
-- **构建工具**: Vite 6
-- **UI 库**: Element Plus 2.9+
-- **状态管理**: Pinia
-- **路由**: Vue Router 4
-- **HTTP 客户端**: Axios
+- **UI**: GPUI + gpui-kit
+- **调用方式**: 进程内直调（`backend/src/server/inproc`），无本地 HTTP / WebSocket 客户端
+- **实时事件**: 直接订阅后端 `WsManager`
+- **状态管理**: GPUI Global / Entity + UiEvent 事件泵
 
-### 桌面端
+### 构建与发布
 
-- **框架**: Tauri 2.x
-- **构建工具**: Cargo + Tauri CLI
-
-### 部署
-
-- **容器化**: Docker + Docker Compose
-- **多阶段构建**: 优化镜像大小
-- **健康检查**: 自动故障检测
+- **Cargo workspace**: backend / desktop / decrypt-cli
+- **CI**: GitHub Actions 多平台构建与打包
 
 ---
 
@@ -601,61 +413,46 @@ Tauri 配置文件位于 `src-tauri/tauri.conf.json`，主要配置项：
 <summary><b>📁 项目结构</b>（点击展开）</summary>
 
 ```
-BaiduPCS-Rust/
-├── backend/                # Rust 后端
+purepan/
+├── backend/                     # 后端核心库 + 独立 HTTP/WebSocket 服务
 │   ├── src/
-│   │   ├── auth/          # 认证模块
-│   │   ├── netdisk/       # 网盘 API
-│   │   ├── downloader/    # 下载引擎
-│   │   ├── uploader/      # 上传引擎
-│   │   ├── transfer/      # 转存模块（分享链接转存）
-│   │   ├── common/        # 公共模块（CDN刷新检测等）
-│   │   ├── filesystem/    # 文件系统访问模块
-│   │   ├── config/        # 配置管理
-│   │   ├── server/        # Web 服务器
-│   │   └── sign/          # 签名算法
+│   │   ├── auth/                # 认证模块
+│   │   ├── netdisk/             # 网盘 API
+│   │   ├── downloader/          # 下载引擎
+│   │   ├── uploader/            # 上传引擎
+│   │   ├── transfer/            # 转存
+│   │   ├── share_sync/          # 分享同步
+│   │   ├── autobackup/          # 自动备份
+│   │   ├── encryption/          # 客户端加密
+│   │   ├── filesystem/          # 本地文件系统访问
+│   │   ├── persistence/         # 任务持久化
+│   │   ├── server/              # axum 路由 / AppState / 事件
+│   │   │   ├── handlers/        # HTTP handlers
+│   │   │   ├── inproc/          # 桌面端进程内直调门面
+│   │   │   └── websocket/       # WS 协议 + 进程内事件订阅
+│   │   └── server_setup.rs      # 启动引导（桌面端复用）
+│   ├── rust-toolchain.toml
 │   └── Cargo.toml
-├── frontend/               # Vue 3 前端
+├── desktop/                     # GPUI 桌面端（二进制 purepan）
 │   ├── src/
-│   │   ├── views/         # 页面组件
-│   │   ├── components/    # 公共组件
-│   │   ├── api/           # API 封装
-│   │   ├── stores/        # Pinia 状态
-│   │   └── router/        # 路由配置
-│   └── package.json
-├── src-tauri/              # Tauri 桌面端
-│   ├── src/
-│   │   ├── ipc.rs         # IPC 通信层
-│   │   └── main.rs        # 桌面端入口
-│   ├── Cargo.toml
-│   └── tauri.conf.json    # Tauri 配置
-├── decrypt-cli/            # 独立解密 CLI 工具
-│   ├── src/
-│   │   ├── cli.rs         # CLI 参数解析
-│   │   ├── decrypt_engine.rs # 解密引擎
-│   │   ├── file_parser.rs    # 文件解析
-│   │   └── key_loader.rs  # 密钥加载
-│   └── Cargo.toml
-├── config/                 # 配置文件目录
-│   ├── app.toml           # 应用主配置
-│   ├── app.toml.example   # 配置模板
-│   └── ...                # 加密密钥、数据库等运行时文件
-├── scripts/                # 构建脚本
-│   ├── build.sh
-│   ├── deploy.sh
-│   ├── dev.sh
-│   └── test.sh
-├── tests/                  # 测试脚本
-│   ├── integration_test.sh
-│   └── performance_test.sh
-├── Dockerfile              # Docker 镜像
-├── docker-compose.yml      # 生产环境（源码构建）
-├── docker-compose.dev.yml  # 开发环境
-├── docker-compose.image.yml # 预构建镜像
-├── rustfmt.toml            # Rust 代码格式配置
-├── .gitignore              # Git 忽略文件
-├── LICENSE                 # Apache License 2.0
-└── README.md               # 项目说明
+│   │   ├── api/                 # 进程内 API 封装
+│   │   ├── views/               # 页面
+│   │   ├── components/          # 通用组件
+│   │   ├── state/               # 全局状态
+│   │   ├── shell/               # 数据目录 / 单实例 / 托盘
+│   │   ├── backend_embed.rs     # 后端引导与事件桥
+│   │   └── main.rs
+│   ├── config/                  # 开发环境配置与运行时数据（凭据文件已忽略）
+│   └── assets/
+├── decrypt-cli/                 # 独立解密 CLI
+├── config/                      # 配置模板（app.toml.example 等）
+├── scripts/                     # share-sync 诊断脚本
+├── tests/                       # 集成 / 性能测试脚本
+├── Cargo.toml                   # workspace 定义
+├── rustfmt.toml                 # Rust 代码格式配置
+├── .gitignore
+├── LICENSE                      # Apache License 2.0
+└── README.md
 ```
 
 </details>
@@ -664,12 +461,16 @@ BaiduPCS-Rust/
 
 ## ⚙️ 配置
 
-配置文件位于 `config/app.toml`:
+配置文件位置：
+
+- **桌面端（开发）**：`desktop/config/app.toml`
+- **桌面端（release）**：系统数据目录下的 `config/app.toml`（见「数据目录」）
+- **独立后端**：工作目录下的 `config/app.toml`
 
 ```toml
 [server]
 host = "127.0.0.1"
-port = 8080
+port = 18888
 cors_origins = ["*"]
 
 [download]
@@ -679,6 +480,8 @@ max_concurrent_tasks = 2
 chunk_size_mb = 10
 max_retries = 3
 ```
+
+> `[server]` 段仅在独立后端模式下生效；桌面端不监听端口。
 
 <details>
 <summary><b>📋 配置参数说明</b>（点击展开）</summary>
@@ -716,13 +519,13 @@ max_concurrent_tasks = 2    # 可根据需求调整
 
 ---
 
-## 🔐 Web 认证配置
+## 🔐 独立后端 Web 认证（可选）
 
-Web 认证用于保护部署在公网环境或共享网络中的 Web 管理界面，防止未授权访问。
+仅适用于以 `purepan-backend` 独立运行 HTTP/WebSocket 服务的场景，用于保护 API 访问。GPUI 桌面端为进程内直调，不经过该认证。
 
 ### 配置文件
 
-在 `config/app.toml` 中配置 `[web_auth]` 段：
+在独立后端的工作目录 `config/app.toml` 中配置 `[web_auth]` 段：
 
 ```toml
 [web_auth]
@@ -742,28 +545,15 @@ mode = "none"
 | `totp` | 仅 TOTP 双因素认证 |
 | `password_totp` | 密码 + TOTP 双因素认证 |
 
-### 启用步骤
+### TOTP 与恢复码
 
-1. 在系统设置 → Web 访问认证页面中，先设置认证密码
-2. 选择认证模式（如 `password_totp`）
-3. 保存设置后，系统自动启用认证
-
-### TOTP 双因素认证
-
-- 启用 `totp` 或 `password_totp` 模式后，系统会生成 TOTP 密钥二维码
+- 启用 `totp` 或 `password_totp` 后，通过后端 `/api/v1/web-auth` 接口完成密码设置、TOTP 绑定与恢复码生成
 - 使用 Google Authenticator、Microsoft Authenticator 等应用扫描二维码
-- 每次登录时，除了密码还需输入六位动态验证码
-
-### 恢复码
-
-- 启用 TOTP 后，系统会生成一组**恢复码**
-- 当 TOTP 设备丢失或无法使用时，可使用恢复码登录
-- 每个恢复码只能使用一次
-- 建议将恢复码妥善保存到安全位置
+- 每个恢复码只能使用一次，建议妥善保存
 
 ### 紧急恢复
 
-如果因配置错误导致无法登录，可直接编辑 `config/app.toml`，将 `enabled` 设为 `false` 临时禁用认证：
+如果因配置错误导致无法访问，可直接编辑 `config/app.toml`，将 `enabled` 设为 `false` 临时禁用认证：
 
 ```toml
 [web_auth]
@@ -771,38 +561,38 @@ enabled = false
 mode = "none"
 ```
 
-重启应用后即可无认证访问，然后在界面上重新配置。
+重启后端后即可无认证访问。
 
 ---
 
 ## 🧪 测试
 
 ```bash
-# 运行所有测试
-./scripts/test.sh
+# 全部单元测试
+cargo test --workspace
 
-# 后端测试
-cd backend
-cargo test
+# 仅后端
+cargo test -p purepan-backend
 
-# 集成测试
+# 集成 / 性能测试脚本
 ./tests/integration_test.sh
-
-# 性能测试
 ./tests/performance_test.sh
 ```
 
+`scripts/` 下另有 share-sync 诊断脚本（Python），用于排查订阅、运行记录与快照状态。
+
 ---
 
-## 📈 性能指标
+## 📈 性能参考
 
-| 指标 | 数值 |
-|------|------|
-| Docker 镜像大小 | ~150MB |
-| 启动时间 | 5-10 秒 |
+| 指标 | 参考值 |
+|------|--------|
+| 应用启动时间 | 5-10 秒 |
 | 内存占用（空闲） | 100-200MB |
 | 内存占用（下载） | 200-500MB |
 | 并发下载分片 | 最多 16 个 |
+
+> 数值随平台、网络环境与任务规模变化，仅供参考。
 
 ---
 
@@ -812,9 +602,8 @@ cargo test
 - [x] ✅ 认证模块（二维码登录）
 - [x] ✅ 文件浏览
 - [x] ✅ 下载引擎（多线程 + 断点续传）
-- [x] ✅ Web 服务器（RESTful API）
-- [x] ✅ 前端界面（Vue 3）
-- [x] ✅ Docker 部署
+- [x] ✅ Web 服务器（RESTful API，独立后端模式）
+- [x] ✅ GPUI 桌面端界面（gpui-kit）
 - [x] ✅ 文件夹下载（目录下载）
 - [x] ✅ 批量下载（多文件选择下载）
 - [x] ✅ 批量上传（多文件/文件夹上传）
@@ -825,16 +614,15 @@ cargo test
 - [x] ✅ 上传下载最近目录记忆
 - [x] ✅ 下载文件资源管理器
 - [x] ✅ 任务持久化
-- [x] ✅ WebSocket 实时推送与心跳/重连
+- [x] ✅ 实时事件推送（桌面端进程内订阅 / 独立后端 WebSocket）
 - [x] ✅ 日志持久化与滚动
-- [x] ✅ 移动端适配
 - [x] ✅ 自动备份
 - [x] ✅ 客户端侧加密（支持普通上传和自动备份）
-- [x] ✅ Web 访问认证（密码保护 + TOTP 双因素认证）
+- [x] ✅ 独立后端 Web 访问认证（密码保护 + TOTP 双因素认证）
 - [x] ✅ 离线下载功能（支持 HTTP/HTTPS/磁力链接/ed2k，自动下载，智能轮询）
 - [x] ✅ 网络代理支持（HTTP/SOCKS5 代理，支持认证、测试连接、运行状态监控、自动回退）
 - [x] ✅ 批量任务操作（下载/上传任务批量暂停/继续/清除）
-- [x] ✅ Tauri 桌面端支持
+- [x] ✅ 桌面端进程内直调后端（无本地 HTTP / WebSocket 客户端依赖）
 - [ ] 📝 下载/上传 SSD 缓冲区（针对 NAS 用户：① 减少 HDD 活跃时间，让硬盘更多休眠；② 提升传输效率，仅网速 > 磁盘速度时有效）
 
 ---
@@ -852,7 +640,7 @@ cargo test
 ### 开发规范
 
 - **Rust**: 遵循 Rust 官方代码风格（使用 `cargo fmt` 和 `cargo clippy`）
-- **TypeScript**: 遵循 Vue 3 最佳实践
+- **UI**: GPUI / gpui-kit 改动需在真实窗口中验证交互
 - **提交信息**: 遵循 [Conventional Commits](https://www.conventionalcommits.org/) 规范（`feat`/`fix`/`docs`/`chore` 等）；PR 标题与每个 commit 都会被 CI 校验
 
 ---
@@ -874,15 +662,14 @@ cargo test
 - [qjfoidnh/BaiduPCS-Go](https://github.com/qjfoidnh/BaiduPCS-Go) - 本项目的重要参考
 - [GangZhuo/BaiduPCS](https://github.com/GangZhuo/BaiduPCS) - 原始项目灵感来源
 - [Rust 社区](https://www.rust-lang.org/)
-- [Vue.js 社区](https://vuejs.org/)
-- [Element Plus](https://element-plus.org/)
-- [tauri 社区](https://v2.tauri.org.cn/)
+- [GPUI](https://gpui.rs/)
+- [gpui-kit](https://gpui-kit.com/)
 ---
 
 <div align="center">
 
 **⭐ 如果这个项目对你有帮助，请给一个 Star！**
 
-Made with ❤️ by Rust + Tauri + Vue 3
+Made with ❤️ by Rust + GPUI
 
 </div>

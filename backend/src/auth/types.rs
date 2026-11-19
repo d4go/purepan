@@ -330,6 +330,8 @@ pub enum QRCodeStatus {
     Success { user: UserAuth, token: String },
     /// 二维码已过期
     Expired,
+    /// 用户在手机端取消/拒绝登录
+    Canceled,
     /// 登录失败
     Failed { reason: String },
 }
