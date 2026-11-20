@@ -405,7 +405,15 @@ impl AppController {
             UiEvent::Navigate(_) => {}
             UiEvent::Toast { kind, message } => self.toast(cx, kind, message),
             UiEvent::ActivateWindow => self.restore_window(cx),
-            UiEvent::Quit => cx.quit(),
+            UiEvent::Quit => {
+                if let Some(handle) = self.window {
+                    let _ = handle.update(cx, |_, window, cx| {
+                        shell::window::quit_with_confirm(window, cx)
+                    });
+                } else {
+                    cx.quit();
+                }
+            }
         }
     }
 
@@ -628,14 +636,20 @@ impl Render for AppShell {
         let palette = design::palette(cx);
         let screen = self.controller.read(cx).screen;
         let nav = self.controller.read(cx).nav;
+        // 窗口 chrome 底色:登录/启动窗为 canvas(与登录框同色);
+        // 主窗为 chrome 色,顶栏/侧栏/内容区外沿连为一体,内容面板浮于其上。
+        let frame_bg = match screen {
+            Screen::Boot | Screen::Login => palette.canvas,
+            _ => palette.chrome,
+        };
 
         let mut root = div()
             .flex()
             .flex_col()
             .size_full()
-            .bg(palette.canvas)
+            .bg(frame_bg)
             .text_color(palette.text)
-            .child(app_title_bar::render());
+            .child(app_title_bar::render(frame_bg));
 
         match screen {
             Screen::Boot => {
@@ -684,10 +698,17 @@ impl Render for AppShell {
                         .child(sidebar)
                         .child(
                             div()
+                                .id("content-panel")
                                 .flex_1()
                                 .min_w_0()
-                                .h_full()
+                                .mr(px(6.))
+                                .mb(px(6.))
                                 .overflow_hidden()
+                                .bg(palette.canvas)
+                                .rounded(px(12.))
+                                .drag_over::<ExternalPaths>(
+                                    move |style, _, _, _| style.bg(drop_background),
+                                )
                                 .child(self.main_view(nav, window, cx)),
                         ),
                 );

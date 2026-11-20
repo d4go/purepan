@@ -9,6 +9,9 @@ use gpui_kit::{
 
 pub struct Palette {
     pub canvas: Hsla,
+    /// 窗口 chrome 底色(实色):sidebar 叠加 canvas 的合成色,
+    /// 主窗顶栏/侧栏/内容区外沿统一用它,内容面板浮于其上。
+    pub chrome: Hsla,
     pub sidebar: Hsla,
     pub card: Hsla,
     pub border: Hsla,
@@ -26,6 +29,7 @@ impl Palette {
     fn light() -> Self {
         Self {
             canvas: rgb(0xFCFDFF).into(),
+            chrome: rgb(0xF6F8FD).into(),
             sidebar: rgb(0xF4F7FC).alpha(0.78).into(),
             card: rgb(0xFFFFFF).into(),
             border: rgb(0x0F172A).alpha(0.06).into(),
@@ -43,6 +47,7 @@ impl Palette {
     fn dark() -> Self {
         Self {
             canvas: rgb(0x16181D).into(),
+            chrome: rgb(0x1B1D21).into(),
             sidebar: rgb(0x1C1E22).alpha(0.85).into(),
             card: rgb(0x20232A).into(),
             border: rgb(0xFFFFFF).alpha(0.08).into(),
