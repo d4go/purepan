@@ -128,7 +128,7 @@ where
         .w(px(220.))
         .h_full()
         .flex_shrink_0()
-        .bg(p.sidebar)
+        // 背景由 AppShell 的 chrome 底色透出,与顶栏/内容区外沿同色连为一体。
         .px(px(16.))
         .py(px(24.))
         .gap(px(20.))
